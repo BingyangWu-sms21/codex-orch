@@ -1,0 +1,147 @@
+body {
+  font-family: sans-serif;
+  margin: 0;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+a {
+  color: #93c5fd;
+  text-decoration: none;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.6rem;
+  border-bottom: 1px solid #334155;
+  vertical-align: top;
+}
+
+pre,
+textarea,
+input,
+select,
+button {
+  font: inherit;
+}
+
+textarea,
+input,
+select {
+  width: 100%;
+  box-sizing: border-box;
+  background: #020617;
+  color: #e2e8f0;
+  border: 1px solid #334155;
+  border-radius: 0.35rem;
+  padding: 0.55rem;
+}
+
+button {
+  background: #2563eb;
+  color: white;
+  border: 0;
+  border-radius: 0.35rem;
+  padding: 0.65rem 1rem;
+  cursor: pointer;
+}
+
+button.danger {
+  background: #dc2626;
+}
+
+.site-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1.2rem 1.5rem;
+  border-bottom: 1px solid #1e293b;
+  background: #020617;
+}
+
+.nav-links {
+  display: flex;
+  gap: 1rem;
+}
+
+.flash.error {
+  margin: 1rem 1.5rem 0;
+  padding: 0.8rem 1rem;
+  background: #7f1d1d;
+  border-radius: 0.35rem;
+}
+
+.page-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1rem;
+  padding: 1rem 1.5rem 1.5rem;
+}
+
+.card {
+  background: #111827;
+  border: 1px solid #1f2937;
+  border-radius: 0.6rem;
+  padding: 1rem;
+}
+
+.stack-form {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.board {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  padding: 1rem 1.5rem 1.5rem;
+}
+
+.board-column {
+  min-height: 360px;
+}
+
+.task-card {
+  display: grid;
+  gap: 0.25rem;
+  margin-bottom: 0.75rem;
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  background: #020617;
+  border: 1px solid #1e293b;
+}
+
+.graph-canvas {
+  height: 70vh;
+  background: #020617;
+  border-radius: 0.5rem;
+}
+
+.code-block {
+  white-space: pre-wrap;
+  background: #020617;
+  padding: 1rem;
+  border-radius: 0.5rem;
+}
+
+.chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.chip {
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: #1e293b;
+}
+
+.muted {
+  color: #94a3b8;
+}

@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-grid">
+  <section class="card">
+    <h2>Available presets</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Id</th>
+          <th>Source</th>
+          <th>Title</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for preset_id, resolved in presets.items() %}
+        <tr>
+          <td>{{ preset_id }}</td>
+          <td>{{ resolved.source }}</td>
+          <td>{{ resolved.preset.title }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Preview or apply</h2>
+    <form method="post" action="/presets/preview" class="stack-form">
+      <label>Preset id <input name="preset_id" value="{{ selected_preset_id or '' }}" required /></label>
+      <label>Variables (`key=value` per line)
+        <textarea name="variables" rows="8">{{ variables_text or '' }}</textarea>
+      </label>
+      <button type="submit">Preview</button>
+    </form>
+
+    <form method="post" action="/presets/apply" class="stack-form">
+      <label>Preset id <input name="preset_id" value="{{ selected_preset_id or '' }}" required /></label>
+      <label>Variables (`key=value` per line)
+        <textarea name="variables" rows="8">{{ variables_text or '' }}</textarea>
+      </label>
+      <label><input type="checkbox" name="overwrite" /> Overwrite existing tasks</label>
+      <button type="submit">Apply</button>
+    </form>
+  </section>
+
+  {% if preview_tasks_json %}
+  <section class="card">
+    <h2>Preview result</h2>
+    <pre class="code-block">{{ preview_tasks_json }}</pre>
+  </section>
+  {% endif %}
+</main>
+{% endblock %}

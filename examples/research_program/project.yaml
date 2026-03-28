@@ -1,0 +1,9 @@
+name: research-program
+workspace: /home/wubingyang/github/codex-orch
+description: Example program for codex-orch.
+default_agent: default
+default_sandbox: workspace-write
+max_concurrency: 2
+user_inputs:
+  brief: inputs/brief.md
+  constraints: inputs/constraints.md

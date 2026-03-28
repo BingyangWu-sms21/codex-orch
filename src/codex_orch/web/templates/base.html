@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>codex-orch</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div>
+        <h1>codex-orch</h1>
+        <p class="muted">{{ program_dir }}</p>
+      </div>
+      <nav class="nav-links">
+        <a href="/tasks">Tasks</a>
+        <a href="/board">Board</a>
+        <a href="/graph">Graph</a>
+        <a href="/presets">Presets</a>
+        <a href="/runs">Runs</a>
+        <a href="/assistant">Assistant</a>
+        <a href="/manual-gates">Manual Gates</a>
+      </nav>
+    </header>
+
+    {% if error %}
+    <section class="flash error">{{ error }}</section>
+    {% endif %}
+
+    {% block content %}{% endblock %}
+  </body>
+</html>

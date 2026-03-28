@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-grid">
+  <section class="card">
+    <h2>Manual gate {{ gate_record.gate.gate_id }}</h2>
+    <p><strong>Run:</strong> <a href="/runs/{{ gate_record.run_id }}">{{ gate_record.run_id }}</a></p>
+    <p><strong>Task:</strong> {{ gate_record.task_id }}</p>
+    <p><strong>Status:</strong> {{ gate_record.gate.status.value }}</p>
+    <p><strong>Reason:</strong> {{ gate_record.gate.reason.value }}</p>
+    <p><strong>Node dir:</strong> <code>{{ gate_record.node_dir }}</code></p>
+  </section>
+
+  {% if gate_record.human_request %}
+  <section class="card">
+    <h3>Human request</h3>
+    <p><strong>Question</strong></p>
+    <pre>{{ gate_record.human_request.question }}</pre>
+    <p><strong>Assistant summary</strong></p>
+    <pre>{{ gate_record.human_request.assistant_summary }}</pre>
+    <p><strong>Assistant rationale</strong></p>
+    <pre>{{ gate_record.human_request.assistant_rationale }}</pre>
+
+    {% if gate_record.human_request.citations %}
+    <p><strong>Citations</strong></p>
+    <ul>
+      {% for citation in gate_record.human_request.citations %}
+      <li><code>{{ citation }}</code></li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if gate_record.human_request.context_artifacts %}
+    <p><strong>Artifacts</strong></p>
+    <ul>
+      {% for artifact in gate_record.human_request.context_artifacts %}
+      <li><code>{{ artifact }}</code></li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h3>Human response</h3>
+    {% if gate_record.human_response %}
+    <pre>{{ gate_record.human_response.answer }}</pre>
+    {% else %}
+    <p class="muted">No human response recorded yet.</p>
+    {% endif %}
+
+    <form method="post" action="/manual-gates/{{ gate_record.gate.gate_id }}/respond" class="stack-form">
+      <label>Answer
+        <textarea name="answer" rows="6">{% if gate_record.human_response %}{{ gate_record.human_response.answer }}{% endif %}</textarea>
+      </label>
+      <button type="submit">Save human response</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h3>Resolve gate</h3>
+    {% if gate_record.human_response %}
+    <div class="button-row">
+      <form method="post" action="/manual-gates/{{ gate_record.gate.gate_id }}/approve">
+        <button type="submit">Approve and resume run</button>
+      </form>
+      <form method="post" action="/manual-gates/{{ gate_record.gate.gate_id }}/reject">
+        <button type="submit">Reject and fail run</button>
+      </form>
+    </div>
+    {% else %}
+    <p class="muted">Record a human response before approving or rejecting the gate.</p>
+    {% endif %}
+  </section>
+</main>
+{% endblock %}

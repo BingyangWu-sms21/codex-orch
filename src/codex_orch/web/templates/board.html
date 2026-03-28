@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="board">
+  {% for status in task_statuses %}
+  <section class="card board-column">
+    <h2>{{ status }}</h2>
+    {% for task in columns.get(status, []) %}
+    <article class="task-card">
+      <a href="/tasks/{{ task.id }}"><strong>{{ task.title }}</strong></a>
+      <div class="muted">{{ task.id }}</div>
+      <div>{{ task.agent }}</div>
+      <div class="muted">{{ task.labels | join(", ") }}</div>
+    </article>
+    {% endfor %}
+  </section>
+  {% endfor %}
+</main>
+{% endblock %}

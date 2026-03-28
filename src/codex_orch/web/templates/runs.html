@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-grid">
+  <section class="card">
+    <h2>Start run</h2>
+    <form method="post" action="/runs" class="stack-form">
+      <label>Roots (comma separated task ids)
+        <input name="roots" />
+      </label>
+      <label>Labels (comma separated)
+        <input name="labels" />
+      </label>
+      <label>User inputs (`key=value` per line)
+        <textarea name="inputs" rows="6"></textarea>
+      </label>
+      <button type="submit">Start run</button>
+    </form>
+
+    <h3>Available tasks</h3>
+    <div class="chip-list">
+      {% for task in tasks %}
+      <span class="chip">{{ task.id }}</span>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Runs</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Run id</th>
+          <th>Status</th>
+          <th>Roots</th>
+          <th>Activity</th>
+          <th>Prefect</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in runs %}
+        {% set activity = run_activity[run.id] %}
+        <tr>
+          <td><a href="/runs/{{ run.id }}">{{ run.id }}</a></td>
+          <td>{{ run.status.value }}</td>
+          <td>{{ run.roots | join(", ") }}</td>
+          <td>
+            <div>running={{ activity.running_nodes | length }}</div>
+            <div>{% if activity.last_progress_at %}{{ activity.last_progress_at }}{% else %}-{% endif %}</div>
+            <div>{% if activity.last_event_summary %}{{ activity.last_event_summary }}{% else %}-{% endif %}</div>
+          </td>
+          <td>
+            {% if run.prefect_flow_run_id %}
+            <div>{{ run.prefect_flow_run_id }}</div>
+            {% if prefect_ui_url %}
+            <a href="{{ prefect_ui_url }}" target="_blank" rel="noreferrer">Open UI</a>
+            {% endif %}
+            {% else %}
+            -
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</main>
+{% endblock %}

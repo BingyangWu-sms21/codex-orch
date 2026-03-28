@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-grid">
+  <section class="card">
+    <h2>{{ task.id }}</h2>
+    <pre class="code-block">{{ task_yaml }}</pre>
+    <form method="post" action="/tasks/{{ task.id }}/delete">
+      <button type="submit" class="danger">Delete task</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Edit task</h2>
+    <form method="post" action="/tasks/{{ task.id }}" class="stack-form">
+      <label>Id <input name="id" value="{{ task.id }}" required /></label>
+      <label>Title <input name="title" value="{{ task.title }}" required /></label>
+      <label>Agent <input name="agent" value="{{ task.agent }}" required /></label>
+      <label>Status
+        <select name="status">
+          {% for status in task_statuses %}
+          <option value="{{ status }}" {% if task.status.value == status %}selected{% endif %}>{{ status }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Description <textarea name="description" rows="3">{{ task.description }}</textarea></label>
+      <label>Labels (comma separated) <input name="labels" value="{{ task.labels | join(', ') }}" /></label>
+      <label>Publish files <textarea name="publish" rows="3">{{ task.publish | join('\n') }}</textarea></label>
+      <label>Model <input name="model" value="{{ task.model or '' }}" /></label>
+      <label>Sandbox <input name="sandbox" value="{{ task.sandbox or '' }}" /></label>
+      <label>Workspace override <input name="workspace" value="{{ task.workspace or '' }}" /></label>
+      <label>Extra writable roots <textarea name="extra_writable_roots" rows="3">{{ task.extra_writable_roots | join('\n') }}</textarea></label>
+      <label>Result schema path <input name="result_schema" value="{{ task.result_schema or '' }}" /></label>
+      <label>Compose (YAML list)
+        <textarea name="compose" rows="12">{{ compose_text }}</textarea>
+      </label>
+      <button type="submit">Save</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Incoming edges</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Source</th>
+          <th>Kind</th>
+          <th>Consume</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for edge in incoming_edges %}
+        <tr>
+          <td>{{ edge.source }}</td>
+          <td>{{ edge.kind }}</td>
+          <td>{{ edge.consume | join(', ') }}</td>
+          <td>
+            <form method="post" action="/edges/delete">
+              <input type="hidden" name="source" value="{{ edge.source }}" />
+              <input type="hidden" name="target" value="{{ edge.target }}" />
+              <input type="hidden" name="kind" value="{{ edge.kind }}" />
+              <button type="submit">Remove</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <h3>Add edge</h3>
+    <form method="post" action="/edges" class="stack-form">
+      <label>Source
+        <select name="source">
+          {% for candidate in all_tasks %}
+          <option value="{{ candidate.id }}">{{ candidate.id }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <input type="hidden" name="target" value="{{ task.id }}" />
+      <label>Kind
+        <select name="kind">
+          <option value="order">order</option>
+          <option value="context">context</option>
+        </select>
+      </label>
+      <label>Consume files (context only) <textarea name="consume" rows="3"></textarea></label>
+      <button type="submit">Add edge</button>
+    </form>
+  </section>
+</main>
+{% endblock %}

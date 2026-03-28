@@ -1,0 +1,40 @@
+id: review_bundle
+title: Review bundle
+description: Create a review flow for a target topic.
+variables:
+  topic:
+    description: Short topic slug.
+    required: true
+tasks:
+  - id: review-${topic}
+    title: Review ${topic}
+    agent: reviewer
+    status: ready
+    labels:
+      - review
+      - ${topic}
+    compose:
+      - kind: literal
+        text: Review the target ${topic} and list the biggest risks.
+    publish:
+      - final.md
+  - id: summarize-${topic}
+    title: Summarize review ${topic}
+    agent: default
+    status: ready
+    labels:
+      - review
+      - ${topic}
+    depends_on:
+      - task: review-${topic}
+        kind: context
+        consume:
+          - final.md
+    compose:
+      - kind: literal
+        text: Produce a concise summary for ${topic}.
+      - kind: from_dep
+        task: review-${topic}
+        path: final.md
+    publish:
+      - final.md

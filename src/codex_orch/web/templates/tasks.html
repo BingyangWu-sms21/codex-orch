@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="page-grid">
+  <section class="card">
+    <h2>Create task</h2>
+    <form method="post" action="/tasks" class="stack-form">
+      <label>Id <input name="id" required /></label>
+      <label>Title <input name="title" required /></label>
+      <label>Agent <input name="agent" value="{{ project.default_agent if project else 'default' }}" required /></label>
+      <label>Status
+        <select name="status">
+          {% for status in task_statuses %}
+          <option value="{{ status }}">{{ status }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Description <textarea name="description" rows="3"></textarea></label>
+      <label>Labels (comma separated) <input name="labels" /></label>
+      <label>Publish files (one per line or comma separated) <textarea name="publish" rows="3">final.md</textarea></label>
+      <label>Model <input name="model" /></label>
+      <label>Sandbox <input name="sandbox" value="{{ project.default_sandbox if project else 'workspace-write' }}" /></label>
+      <label>Workspace override <input name="workspace" /></label>
+      <label>Extra writable roots (one per line) <textarea name="extra_writable_roots" rows="3"></textarea></label>
+      <label>Result schema path <input name="result_schema" /></label>
+      <label>Compose (YAML list)
+        <textarea name="compose" rows="10">{{ compose_example }}</textarea>
+      </label>
+      <button type="submit">Create task</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Tasks</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Id</th>
+          <th>Status</th>
+          <th>Agent</th>
+          <th>Labels</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for task in tasks %}
+        <tr>
+          <td><a href="/tasks/{{ task.id }}">{{ task.id }}</a></td>
+          <td>{{ task.status.value }}</td>
+          <td>{{ task.agent }}</td>
+          <td>{{ task.labels | join(", ") }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</main>
+{% endblock %}
