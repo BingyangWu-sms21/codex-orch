@@ -304,7 +304,8 @@ def test_run_service_resumes_after_manual_gate_approval(tmp_path: Path) -> None:
         )
     )
 
-    service = RunService(store, FakeRunner())
+    runner = FakeRunner()
+    service = RunService(store, runner)
     snapshot = service.create_snapshot(roots=["refactor"], labels=[], user_inputs=None)
     request = store.create_assistant_request(
         run_id=snapshot.id,
@@ -313,7 +314,7 @@ def test_run_service_resumes_after_manual_gate_approval(tmp_path: Path) -> None:
         question="Should I delete the legacy wrapper?",
         decision_kind=DecisionKind.POLICY,
         options=["delete", "keep_wrapper"],
-        context_artifacts=[],
+        context_artifacts=["docs/legacy-wrapper.md"],
         requested_control_actions=[],
         priority=RequestPriority.HIGH,
     )
@@ -353,6 +354,96 @@ def test_run_service_resumes_after_manual_gate_approval(tmp_path: Path) -> None:
     assert resumed_snapshot.nodes["refactor"].status.value == "done"
     updated_gate = store.find_manual_gate_by_request_id(request.request_id)
     assert updated_gate.gate.status is ManualGateStatus.APPLIED
+    prompt = runner.prompts["refactor"]
+    assert "## Human-Approved Continuation Context" in prompt
+    assert "Apply this decision only to this task continuation." in prompt
+    assert "### Original Question\nShould I delete the legacy wrapper?" in prompt
+    assert "### Assistant Summary\nI need a human decision." in prompt
+    assert "### Assistant Rationale\nThe boundary is ambiguous." in prompt
+    assert "### Human Answer\nDelete it." in prompt
+    assert "- ~/.codex/AGENTS.md" in prompt
+    assert "- `docs/legacy-wrapper.md`" in prompt
+
+
+def test_run_service_does_not_inject_manual_gate_packet_into_downstream_task(
+    tmp_path: Path,
+) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="analyze",
+            title="Analyze",
+            agent="explorer",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/analyze.md"}],
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="implement",
+            title="Implement",
+            agent="worker",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "analyze", "kind": "context", "consume": ["final.md"]}],
+            compose=[
+                {"kind": "file", "path": "prompts/implement.md"},
+                {"kind": "from_dep", "task": "analyze", "path": "final.md"},
+            ],
+            publish=["final.md"],
+        )
+    )
+
+    runner = FakeRunner()
+    service = RunService(store, runner)
+    snapshot = service.create_snapshot(roots=["implement"], labels=[], user_inputs=None)
+    request = store.create_assistant_request(
+        run_id=snapshot.id,
+        task_id="analyze",
+        request_kind=RequestKind.CLARIFICATION,
+        question="Should I delete the legacy wrapper?",
+        decision_kind=DecisionKind.POLICY,
+        options=["delete", "keep_wrapper"],
+        context_artifacts=["docs/legacy-wrapper.md"],
+        requested_control_actions=[],
+        priority=RequestPriority.HIGH,
+    )
+    store.save_assistant_response_by_request_id(
+        request.request_id,
+        resolution_kind=ResolutionKind.HANDOFF_TO_HUMAN,
+        answer="I need a human decision.",
+        rationale="The boundary is ambiguous.",
+        confidence=ConfidenceLevel.MEDIUM,
+        citations=["~/.codex/AGENTS.md"],
+        proposed_guidance_updates=[],
+        proposed_control_actions=[],
+    )
+
+    waiting_snapshot = asyncio.run(service.run_snapshot(snapshot.id))
+    assert waiting_snapshot.status.value == "waiting"
+    assert waiting_snapshot.nodes["analyze"].status.value == "waiting"
+    assert waiting_snapshot.nodes["implement"].status.value == "pending"
+
+    store.save_human_response_by_request_id(
+        request.request_id,
+        answer="Delete it.",
+    )
+    store.update_manual_gate_status_by_request_id(
+        request.request_id,
+        ManualGateStatus.APPROVED,
+    )
+
+    resumed_snapshot = asyncio.run(service.resume_run(snapshot.id))
+    assert resumed_snapshot.status.value == "done"
+    assert resumed_snapshot.nodes["analyze"].status.value == "done"
+    assert resumed_snapshot.nodes["implement"].status.value == "done"
+
+    analyze_prompt = runner.prompts["analyze"]
+    implement_prompt = runner.prompts["implement"]
+    assert "## Human-Approved Continuation Context" in analyze_prompt
+    assert "Delete it." in analyze_prompt
+    assert "## Human-Approved Continuation Context" not in implement_prompt
+    assert "Delete it." not in implement_prompt
 
 
 def test_run_service_fails_after_manual_gate_rejection(tmp_path: Path) -> None:

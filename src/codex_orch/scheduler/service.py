@@ -452,6 +452,13 @@ class RunService:
             user_inputs=user_inputs,
             dependency_node_dirs=dependency_dirs,
         )
+        manual_gate_appendix = self._manual_gate_prompt_appendix(run_id, task.id)
+        if manual_gate_appendix is not None:
+            prompt = (
+                f"{prompt}\n\n{manual_gate_appendix}"
+                if prompt
+                else manual_gate_appendix
+            )
         node_dir = self.store.get_node_dir(run_id, task.id)
         project_workspace_dir = self._resolve_project_workspace_dir(project)
         workspace_dir = self._resolve_task_workspace_dir(project, task)
@@ -745,6 +752,45 @@ class RunService:
             request.request_id,
             ManualGateStatus.APPLIED,
         )
+
+    def _manual_gate_prompt_appendix(self, run_id: str, task_id: str) -> str | None:
+        gate = self.store.maybe_get_manual_gate(run_id, task_id)
+        if gate is None:
+            return None
+        if gate.status not in {
+            ManualGateStatus.APPROVED,
+            ManualGateStatus.APPLIED,
+        }:
+            return None
+        human_request = self.store.maybe_get_human_request(run_id, task_id)
+        human_response = self.store.maybe_get_human_response(run_id, task_id)
+        if human_request is None or human_response is None:
+            return None
+
+        sections = [
+            "## Human-Approved Continuation Context",
+            (
+                "Apply this decision only to this task continuation. "
+                "The human answer is authoritative."
+            ),
+            f"### Original Question\n{human_request.question.rstrip()}",
+            f"### Assistant Summary\n{human_request.assistant_summary.rstrip()}",
+            f"### Assistant Rationale\n{human_request.assistant_rationale.rstrip()}",
+            f"### Human Answer\n{human_response.answer.rstrip()}",
+        ]
+        if human_request.citations:
+            sections.append(
+                "### Citations\n"
+                + "\n".join(f"- {citation}" for citation in human_request.citations)
+            )
+        if human_request.context_artifacts:
+            sections.append(
+                "### Context Artifacts\n"
+                + "\n".join(
+                    f"- `{artifact}`" for artifact in human_request.context_artifacts
+                )
+            )
+        return "\n\n".join(sections)
 
     def _wait_reason_message(self, reason: RunNodeWaitReason) -> str:
         if reason is RunNodeWaitReason.ASSISTANT_PENDING:
