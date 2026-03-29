@@ -4,7 +4,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from string import Template
 
-from codex_orch.domain import DependencyEdge, PresetSpec, TaskSpec, TaskStatus
+from codex_orch.domain import (
+    ComposeStepKind,
+    DependencyEdge,
+    DependencyKind,
+    PresetSpec,
+    TaskSpec,
+    TaskStatus,
+)
 from codex_orch.store import ProjectStore
 
 
@@ -63,8 +70,7 @@ class TaskPoolService:
 
     def validate_graph(self) -> None:
         tasks = self.store.load_task_map()
-        self._validate_dependencies_exist(tasks)
-        self._validate_cycles(tasks)
+        self._validate_task_graph(tasks)
 
     def preview_preset(
         self,
@@ -79,11 +85,7 @@ class TaskPoolService:
             if not isinstance(rendered, dict):
                 raise ValueError("rendered preset task must be an object")
             rendered_tasks.append(TaskSpec.model_validate(rendered))
-        self._validate_dependencies_exist(
-            {task.id: task for task in rendered_tasks},
-            allow_external=False,
-        )
-        self._validate_cycles({task.id: task for task in rendered_tasks})
+        self._validate_task_graph({task.id: task for task in rendered_tasks})
         return rendered_tasks
 
     def apply_preset(
@@ -176,6 +178,54 @@ class TaskPoolService:
                 if dependency.task not in tasks and not allow_external:
                     raise ValueError(
                         f"task {task.id} depends on missing task {dependency.task}"
+                    )
+
+    def _validate_task_graph(
+        self,
+        tasks: dict[str, TaskSpec],
+        *,
+        allow_external: bool = False,
+    ) -> None:
+        self._validate_dependencies_exist(tasks, allow_external=allow_external)
+        self._validate_compose_dependencies(tasks)
+        self._validate_cycles(tasks)
+
+    def _validate_compose_dependencies(self, tasks: dict[str, TaskSpec]) -> None:
+        for task in tasks.values():
+            dependency_tasks = {dependency.task for dependency in task.depends_on}
+            context_dependencies: dict[str, DependencyEdge] = {}
+            for dependency in task.depends_on:
+                if dependency.kind is not DependencyKind.CONTEXT:
+                    continue
+                if dependency.task in context_dependencies:
+                    raise ValueError(
+                        f"task {task.id} has multiple context dependencies on task "
+                        f"{dependency.task}"
+                    )
+                context_dependencies[dependency.task] = dependency
+
+            for step in task.compose:
+                if (
+                    step.kind is not ComposeStepKind.FROM_DEP
+                    or step.task is None
+                    or step.path is None
+                ):
+                    continue
+                if step.task not in dependency_tasks:
+                    raise ValueError(
+                        f"task {task.id} compose.from_dep references undeclared "
+                        f"dependency {step.task}"
+                    )
+                dependency = context_dependencies.get(step.task)
+                if dependency is None:
+                    raise ValueError(
+                        f"task {task.id} compose.from_dep {step.task}:{step.path} "
+                        "requires a context dependency"
+                    )
+                if step.path not in dependency.consume:
+                    raise ValueError(
+                        f"task {task.id} compose.from_dep {step.task}:{step.path} "
+                        "must be listed in the matching context dependency consume"
                     )
 
     def _validate_cycles(self, tasks: dict[str, TaskSpec]) -> None:

@@ -10,6 +10,7 @@ from codex_orch.store.project_store import (
     AssistantRequestRecord,
     ManualGateRecord,
     ProjectStore,
+    ResolvedAssistantProfile,
     ResolvedPreset,
 )
 
@@ -19,6 +20,7 @@ __all__ = [
     "AssistantRequestRecord",
     "ManualGateRecord",
     "ProjectStore",
+    "ResolvedAssistantProfile",
     "ResolvedPreset",
     "ensure_global_layout",
     "ensure_program_layout",

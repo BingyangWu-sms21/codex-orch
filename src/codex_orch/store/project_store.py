@@ -10,6 +10,7 @@ import yaml
 
 from codex_orch.domain import (
     ApprovalMode,
+    AssistantProfileSpec,
     AssistantControlAction,
     AssistantRequest,
     AssistantResponse,
@@ -47,6 +48,14 @@ from codex_orch.store.layout import (
 class ResolvedPreset:
     source: str
     preset: PresetSpec
+
+
+@dataclass(frozen=True)
+class ResolvedAssistantProfile:
+    profile_dir: Path
+    instructions_path: Path
+    workspace_dir: Path
+    spec: AssistantProfileSpec
 
 
 @dataclass(frozen=True)
@@ -214,6 +223,76 @@ class ProjectStore:
         path = target_dir / f"{preset_id}.yaml"
         if path.exists():
             path.unlink()
+
+    def get_profile_dir(self, profile_id: str) -> Path:
+        return self.global_paths.profiles_dir / profile_id
+
+    def get_profile_spec_path(self, profile_id: str) -> Path:
+        return self.get_profile_dir(profile_id) / "profile.yaml"
+
+    def get_profile_instructions_path(self, profile_id: str) -> Path:
+        return self.get_profile_dir(profile_id) / "instructions.md"
+
+    def get_profile_workspace_dir(self, profile_id: str) -> Path:
+        workspace_dir = self.get_profile_dir(profile_id) / "workspace"
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        return workspace_dir
+
+    def load_assistant_profile(self, profile_id: str) -> ResolvedAssistantProfile:
+        path = self.get_profile_spec_path(profile_id)
+        if not path.exists():
+            raise KeyError(f"assistant profile {profile_id} does not exist")
+        payload = _read_yaml(path)
+        if payload is None:
+            raise ValueError(f"profile file {path} is empty")
+        spec = AssistantProfileSpec.model_validate(payload)
+        if spec.id != profile_id:
+            raise ValueError(
+                f"profile file {path} has id {spec.id}, expected {profile_id}"
+            )
+        instructions_path = self.get_profile_instructions_path(profile_id)
+        if not instructions_path.exists():
+            raise KeyError(
+                f"assistant profile {profile_id} is missing instructions.md"
+            )
+        return ResolvedAssistantProfile(
+            profile_dir=self.get_profile_dir(profile_id),
+            instructions_path=instructions_path,
+            workspace_dir=self.get_profile_workspace_dir(profile_id),
+            spec=spec,
+        )
+
+    def maybe_get_run_task(self, run_id: str, task_id: str) -> TaskSpec | None:
+        try:
+            snapshot = self.get_run(run_id)
+        except KeyError:
+            return None
+        node = snapshot.nodes.get(task_id)
+        if node is None:
+            return None
+        return node.task
+
+    def resolve_assistant_profile_id(self, run_id: str, task_id: str) -> str | None:
+        run_task = self.maybe_get_run_task(run_id, task_id)
+        if run_task is not None:
+            return run_task.assistant_profile
+        try:
+            task = self.get_task(task_id)
+        except KeyError:
+            return None
+        if task.assistant_profile is not None:
+            return task.assistant_profile
+        return self.load_project().default_assistant_profile
+
+    def resolve_assistant_profile(
+        self,
+        run_id: str,
+        task_id: str,
+    ) -> ResolvedAssistantProfile | None:
+        profile_id = self.resolve_assistant_profile_id(run_id, task_id)
+        if profile_id is None:
+            return None
+        return self.load_assistant_profile(profile_id)
 
     def load_default_user_inputs(self) -> dict[str, str]:
         project = self.load_project()

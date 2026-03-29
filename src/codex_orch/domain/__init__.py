@@ -1,5 +1,7 @@
 from codex_orch.domain.assistant import (
     ApprovalMode,
+    AssistantBackendKind,
+    AssistantProfileSpec,
     AssistantControlAction,
     AssistantRequest,
     AssistantResponse,
@@ -42,6 +44,8 @@ from codex_orch.domain.models import (
 
 __all__ = [
     "ApprovalMode",
+    "AssistantBackendKind",
+    "AssistantProfileSpec",
     "AssistantControlAction",
     "AssistantRequest",
     "AssistantResponse",

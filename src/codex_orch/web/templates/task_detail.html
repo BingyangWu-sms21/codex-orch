@@ -16,6 +16,7 @@
       <label>Id <input name="id" value="{{ task.id }}" required /></label>
       <label>Title <input name="title" value="{{ task.title }}" required /></label>
       <label>Agent <input name="agent" value="{{ task.agent }}" required /></label>
+      <label>Assistant profile <input name="assistant_profile" value="{{ task.assistant_profile or '' }}" /></label>
       <label>Status
         <select name="status">
           {% for status in task_statuses %}

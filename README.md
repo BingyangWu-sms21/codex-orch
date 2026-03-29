@@ -12,6 +12,7 @@ concurrency, and run metadata.
 
 - File-backed task pool with CRUD operations
 - Two dependency kinds: `order` and `context`
+- `compose.from_dep` reads only from explicitly consumed `context` artifacts
 - Global presets under `~/.codex-orch/` plus per-program presets
 - Prefect-backed run snapshots and resumable execution
 - Published-artifact handoff between tasks

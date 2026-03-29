@@ -8,6 +8,7 @@ from pathlib import Path
 import typer
 import yaml
 
+from codex_orch.assistant import AssistantWorkerService, CodexCliAssistantBackend
 from codex_orch.api.app import DEFAULT_WEB_PORT, serve
 from codex_orch.domain import (
     ApprovalMode,
@@ -73,6 +74,15 @@ def _task_pool(program_dir: Path) -> TaskPoolService:
 
 def _run_service(program_dir: Path) -> RunService:
     return RunService(_store(program_dir), CodexExecRunner())
+
+
+def _assistant_worker_service(program_dir: Path) -> AssistantWorkerService:
+    store = _store(program_dir)
+    return AssistantWorkerService(
+        store,
+        backend=CodexCliAssistantBackend(),
+        run_service=RunService(store, CodexExecRunner()),
+    )
 
 
 def _print_json(payload: object) -> None:
@@ -181,6 +191,7 @@ def project_init(
     workspace: Path,
     description: str = "",
     default_agent: str = "default",
+    default_assistant_profile: str | None = None,
     default_sandbox: str = "workspace-write",
     max_concurrency: int = 2,
 ) -> None:
@@ -190,6 +201,7 @@ def project_init(
         workspace=str(workspace.resolve()),
         description=description,
         default_agent=default_agent,
+        default_assistant_profile=default_assistant_profile,
         default_sandbox=default_sandbox,
         max_concurrency=max_concurrency,
     )
@@ -515,6 +527,34 @@ def assistant_request_show(
         _print_json(payload)
         return
     typer.echo(yaml.safe_dump(payload, sort_keys=False))
+
+
+@assistant_app.command("worker")
+def assistant_worker(
+    program_dir: Path,
+    once: bool = typer.Option(False, "--once"),
+    poll_interval_sec: float = typer.Option(5.0, "--poll-interval-sec"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    worker = _assistant_worker_service(program_dir)
+    if once:
+        stats = worker.run_once()
+        payload = {
+            "scanned": stats.scanned,
+            "processed": stats.processed,
+            "auto_replied": stats.auto_replied,
+            "handed_off": stats.handed_off,
+            "skipped_no_profile": stats.skipped_no_profile,
+            "failed": stats.failed,
+        }
+        if as_json:
+            _print_json(payload)
+            return
+        typer.echo(
+            " ".join(f"{key}={value}" for key, value in payload.items())
+        )
+        return
+    worker.serve_forever(poll_interval_sec=poll_interval_sec)
 
 
 @assistant_app.command("respond")

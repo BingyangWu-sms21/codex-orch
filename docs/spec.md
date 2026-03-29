@@ -43,6 +43,13 @@ kinds:
 - `order`: execution order only
 - `context`: execution order plus explicit artifact consumption
 
+Prompt composition can also consume dependency artifacts with
+`compose.kind == from_dep`, but only under an explicit `context` dependency:
+
+- `from_dep.task` must name a task in `depends_on`
+- that dependency must be `context`
+- `from_dep.path` must be listed in the matching dependency edge's `consume`
+
 ## Run snapshots
 
 When a run starts, `codex-orch` resolves a subgraph from the task pool,

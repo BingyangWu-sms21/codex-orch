@@ -832,6 +832,11 @@ class RunService:
 
     def _materialize_task(self, project: ProjectSpec, task: TaskSpec) -> TaskSpec:
         updates: dict[str, object] = {}
+        if (
+            task.assistant_profile is None
+            and project.default_assistant_profile is not None
+        ):
+            updates["assistant_profile"] = project.default_assistant_profile
         if task.sandbox is None:
             updates["sandbox"] = project.default_sandbox
         if task.model is None and project.default_model is not None:

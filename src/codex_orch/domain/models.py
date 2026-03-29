@@ -90,6 +90,7 @@ class ProjectSpec(BaseModel):
     workspace: str
     description: str = ""
     default_agent: str = "default"
+    default_assistant_profile: str | None = None
     default_model: str | None = None
     default_sandbox: str = "workspace-write"
     max_concurrency: int = 2
@@ -104,6 +105,15 @@ class ProjectSpec(BaseModel):
             raise ValueError("max_concurrency must be >= 1")
         if not self.workspace.strip():
             raise ValueError("workspace must not be empty")
+        if self.default_assistant_profile is not None:
+            object.__setattr__(
+                self,
+                "default_assistant_profile",
+                _validate_path_reference(
+                    self.default_assistant_profile,
+                    field_name="default_assistant_profile",
+                ),
+            )
         if self.node_wall_timeout_sec is not None and self.node_wall_timeout_sec <= 0:
             raise ValueError("node_wall_timeout_sec must be > 0")
         if self.node_idle_timeout_sec is not None and self.node_idle_timeout_sec <= 0:
@@ -185,6 +195,7 @@ class TaskSpec(BaseModel):
     id: str
     title: str
     agent: str
+    assistant_profile: str | None = None
     status: TaskStatus = TaskStatus.DRAFT
     description: str = ""
     labels: list[str] = Field(default_factory=list)
@@ -201,6 +212,15 @@ class TaskSpec(BaseModel):
     def validate_task(self) -> TaskSpec:
         validated_publish = [_validate_relative_file_path(path) for path in self.publish]
         object.__setattr__(self, "publish", validated_publish)
+        if self.assistant_profile is not None:
+            object.__setattr__(
+                self,
+                "assistant_profile",
+                _validate_path_reference(
+                    self.assistant_profile,
+                    field_name="assistant_profile",
+                ),
+            )
         if self.workspace is not None:
             object.__setattr__(
                 self,

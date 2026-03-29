@@ -8,6 +8,7 @@
       <label>Id <input name="id" required /></label>
       <label>Title <input name="title" required /></label>
       <label>Agent <input name="agent" value="{{ project.default_agent if project else 'default' }}" required /></label>
+      <label>Assistant profile <input name="assistant_profile" value="{{ project.default_assistant_profile if project else '' }}" /></label>
       <label>Status
         <select name="status">
           {% for status in task_statuses %}

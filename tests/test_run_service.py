@@ -4,6 +4,8 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from codex_orch.domain import (
     ConfidenceLevel,
     DecisionKind,
@@ -87,6 +89,41 @@ def test_run_service_materializes_context_dependencies(tmp_path: Path) -> None:
     ).read_text(encoding="utf-8")
     assert "analysis result" in implement_final
     assert "brief input" in implement_final
+
+
+def test_create_snapshot_rejects_invalid_from_dep_contract(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="analyze",
+            title="Analyze",
+            agent="explorer",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/analyze.md"}],
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="implement",
+            title="Implement",
+            agent="worker",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "analyze", "kind": "order", "consume": []}],
+            compose=[
+                {"kind": "file", "path": "prompts/implement.md"},
+                {"kind": "from_dep", "task": "analyze", "path": "final.md"},
+            ],
+            publish=["final.md"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="requires a context dependency"):
+        RunService(store, FakeRunner()).create_snapshot(
+            roots=["implement"],
+            labels=[],
+            user_inputs=None,
+        )
 
 
 def test_create_snapshot_materializes_workspace_and_writable_roots(tmp_path: Path) -> None:

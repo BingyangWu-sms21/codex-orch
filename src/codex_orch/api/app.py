@@ -534,6 +534,15 @@ def _task_from_form(
         "agent",
         existing.agent if existing is not None else project.default_agent,
     )
+    assistant_profile = _nullable(
+        _form_value(
+            form,
+            "assistant_profile",
+            existing.assistant_profile
+            if existing is not None and existing.assistant_profile is not None
+            else "",
+        )
+    )
     status_raw = _form_value(
         form,
         "status",
@@ -590,6 +599,7 @@ def _task_from_form(
         id=task_id,
         title=title,
         agent=agent,
+        assistant_profile=assistant_profile,
         status=TaskStatus(status_raw),
         description=description,
         labels=labels,

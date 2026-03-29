@@ -45,6 +45,10 @@ class RequestPriority(StrEnum):
     HIGH = "high"
 
 
+class AssistantBackendKind(StrEnum):
+    CODEX_CLI = "codex_cli"
+
+
 class ResolutionKind(StrEnum):
     AUTO_REPLY = "auto_reply"
     HANDOFF_TO_HUMAN = "handoff_to_human"
@@ -84,6 +88,23 @@ class ControlActionStatus(StrEnum):
     REJECTED = "rejected"
     APPLIED = "applied"
     FAILED = "failed"
+
+
+class AssistantProfileSpec(BaseModel):
+    id: str
+    title: str = ""
+    description: str = ""
+    backend: AssistantBackendKind = AssistantBackendKind.CODEX_CLI
+    model: str | None = None
+    sandbox: str = "workspace-write"
+
+    @model_validator(mode="after")
+    def validate_profile(self) -> AssistantProfileSpec:
+        if not self.id.strip():
+            raise ValueError("id must not be empty")
+        if not self.sandbox.strip():
+            raise ValueError("sandbox must not be empty")
+        return self
 
 
 class AssistantRequest(BaseModel):

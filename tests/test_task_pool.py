@@ -82,6 +82,138 @@ def test_validate_graph_rejects_cycles(tmp_path: Path) -> None:
         TaskPoolService(store).validate_graph()
 
 
+def test_validate_graph_allows_unused_context_consumes(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="source",
+            title="Source",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md", "notes.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="target",
+            title="Target",
+            agent="default",
+            status=TaskStatus.READY,
+            depends_on=[
+                {
+                    "task": "source",
+                    "kind": "context",
+                    "consume": ["final.md", "notes.md"],
+                }
+            ],
+            compose=[{"kind": "from_dep", "task": "source", "path": "final.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    TaskPoolService(store).validate_graph()
+
+
+def test_validate_graph_rejects_from_dep_without_matching_dependency(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="target",
+            title="Target",
+            agent="default",
+            status=TaskStatus.READY,
+            compose=[{"kind": "from_dep", "task": "source", "path": "final.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="compose.from_dep references undeclared dependency source"):
+        TaskPoolService(store).validate_graph()
+
+
+def test_validate_graph_rejects_from_dep_with_order_dependency(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="source",
+            title="Source",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="target",
+            title="Target",
+            agent="default",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "source", "kind": "order", "consume": []}],
+            compose=[{"kind": "from_dep", "task": "source", "path": "final.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="requires a context dependency"):
+        TaskPoolService(store).validate_graph()
+
+
+def test_validate_graph_rejects_from_dep_path_not_listed_in_consume(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="source",
+            title="Source",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md", "notes.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="target",
+            title="Target",
+            agent="default",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "source", "kind": "context", "consume": ["final.md"]}],
+            compose=[{"kind": "from_dep", "task": "source", "path": "notes.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="must be listed in the matching context dependency consume"):
+        TaskPoolService(store).validate_graph()
+
+
+def test_validate_graph_rejects_duplicate_context_dependencies(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="source",
+            title="Source",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md", "notes.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="target",
+            title="Target",
+            agent="default",
+            status=TaskStatus.READY,
+            depends_on=[
+                {"task": "source", "kind": "context", "consume": ["final.md"]},
+                {"task": "source", "kind": "context", "consume": ["notes.md"]},
+            ],
+            publish=["final.md"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="multiple context dependencies on task source"):
+        TaskPoolService(store).validate_graph()
+
+
 def test_add_and_remove_edges(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
     pool = TaskPoolService(store)
@@ -120,3 +252,48 @@ def test_add_and_remove_edges(tmp_path: Path) -> None:
         kind=DependencyKind.CONTEXT,
     )
     assert pool.list_edges() == []
+
+
+def test_preview_preset_rejects_invalid_from_dep_contract(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    preset_path = store.paths.presets_dir / "bundle.yaml"
+    preset_path.write_text(
+        yaml.safe_dump(
+            {
+                "id": "bundle",
+                "title": "Bundle",
+                "variables": {},
+                "tasks": [
+                    {
+                        "id": "source",
+                        "title": "Source",
+                        "agent": "default",
+                        "status": "ready",
+                        "publish": ["final.md"],
+                    },
+                    {
+                        "id": "target",
+                        "title": "Target",
+                        "agent": "default",
+                        "status": "ready",
+                        "depends_on": [
+                            {
+                                "task": "source",
+                                "kind": "order",
+                                "consume": [],
+                            }
+                        ],
+                        "compose": [
+                            {"kind": "from_dep", "task": "source", "path": "final.md"}
+                        ],
+                        "publish": ["final.md"],
+                    },
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="requires a context dependency"):
+        TaskPoolService(store).preview_preset("bundle", {})
