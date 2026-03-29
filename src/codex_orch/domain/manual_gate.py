@@ -25,7 +25,6 @@ def _validate_relative_program_path(raw_path: str) -> str:
 
 class ManualGateReason(StrEnum):
     HANDOFF_TO_HUMAN = "handoff_to_human"
-    CONTROL_ACTION = "control_action"
 
 
 class ManualGateStatus(StrEnum):

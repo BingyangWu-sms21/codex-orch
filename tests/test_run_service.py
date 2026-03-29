@@ -82,8 +82,18 @@ def test_run_service_materializes_context_dependencies(tmp_path: Path) -> None:
 
     assert snapshot.status.value == "done"
     assert snapshot.prefect_flow_run_id is not None
+    snapshot_payload = snapshot.model_dump(mode="json")
+    assert "project_name" not in snapshot_payload
+    assert "selected_labels" not in snapshot_payload
+    assert "prefect_flow_run_name" not in snapshot_payload
     assert snapshot.nodes["analyze"].status.value == "done"
     assert snapshot.nodes["implement"].status.value == "done"
+    assert snapshot_payload["nodes"]["analyze"]["published"] == [
+        {"relative_path": "final.md"}
+    ]
+    assert snapshot_payload["nodes"]["implement"]["published"] == [
+        {"relative_path": "final.md"}
+    ]
 
     implement_final = (
         store.get_node_dir(snapshot.id, "implement") / "final.md"

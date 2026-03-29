@@ -549,14 +549,7 @@ class ProjectStore:
         action = record.control_action
         if action is None:
             raise KeyError(f"request {request_id} has no control action")
-        updates: dict[str, ControlActionStatus | str] = {"status": status}
-        if status in {
-            ControlActionStatus.APPROVED,
-            ControlActionStatus.APPLIED,
-            ControlActionStatus.REJECTED,
-            ControlActionStatus.FAILED,
-        }:
-            updates["applied_at"] = datetime.now(UTC).isoformat()
+        updates = {"status": status}
         updated = action.model_copy(update=updates)
         _write_json(
             self.get_assistant_control_action_path(record.run_id, record.task_id),

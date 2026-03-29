@@ -226,6 +226,7 @@ class CodexCliAssistantBackend:
                     "Choose resolution_kind=handoff_to_human when the decision depends on user preference, policy approval, or ambiguous product direction.",
                     "Keep citations grounded in the provided artifacts or stable repo/user guidance paths.",
                     "Keep proposed_control_actions empty unless a control-plane action is truly necessary.",
+                    "Treat proposed_control_actions and proposed_guidance_updates as proposals only; codex-orch records them but does not execute them automatically.",
                 ]
             ),
         ]

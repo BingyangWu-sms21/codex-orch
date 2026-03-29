@@ -52,7 +52,6 @@ class AssistantBackendKind(StrEnum):
 class ResolutionKind(StrEnum):
     AUTO_REPLY = "auto_reply"
     HANDOFF_TO_HUMAN = "handoff_to_human"
-    REFUSE = "refuse"
 
 
 class ConfidenceLevel(StrEnum):
@@ -86,8 +85,6 @@ class ControlActionStatus(StrEnum):
     PROPOSED = "proposed"
     APPROVED = "approved"
     REJECTED = "rejected"
-    APPLIED = "applied"
-    FAILED = "failed"
 
 
 class AssistantProfileSpec(BaseModel):
@@ -183,7 +180,6 @@ class AssistantControlAction(BaseModel):
     approval_mode: ApprovalMode
     status: ControlActionStatus = ControlActionStatus.PROPOSED
     created_at: str = Field(default_factory=_utc_now_iso)
-    applied_at: str | None = None
 
     @model_validator(mode="after")
     def validate_action(self) -> AssistantControlAction:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from codex_orch.assistant.base import (
@@ -10,7 +11,7 @@ from codex_orch.assistant.base import (
     AssistantBackend,
     AssistantBackendRequest,
 )
-from codex_orch.domain import ResolutionKind, TaskSpec
+from codex_orch.domain import AssistantBackendKind, ResolutionKind, TaskSpec
 from codex_orch.scheduler import RunService
 from codex_orch.store import AssistantRequestRecord, ProjectStore
 
@@ -32,11 +33,16 @@ class AssistantWorkerService:
         self,
         store: ProjectStore,
         *,
-        backend: AssistantBackend,
+        backend: AssistantBackend | None = None,
+        backend_registry: Mapping[AssistantBackendKind, AssistantBackend] | None = None,
         run_service: RunService,
     ) -> None:
         self.store = store
-        self.backend = backend
+        self.backends: dict[AssistantBackendKind, AssistantBackend] = {}
+        if backend_registry is not None:
+            self.backends.update(backend_registry)
+        if backend is not None:
+            self.backends.setdefault(AssistantBackendKind.CODEX_CLI, backend)
         self.run_service = run_service
         self._reported_request_issues: dict[str, str] = {}
 
@@ -96,7 +102,8 @@ class AssistantWorkerService:
                 assistant_request=record.request,
                 artifacts=tuple(self._load_artifacts(record)),
             )
-            result = self.backend.respond(backend_request)
+            backend = self._resolve_backend(profile.spec.backend)
+            result = backend.respond(backend_request)
             if result.resolution_kind not in {
                 ResolutionKind.AUTO_REPLY,
                 ResolutionKind.HANDOFF_TO_HUMAN,
@@ -126,6 +133,15 @@ class AssistantWorkerService:
                 exc=exc,
             )
             return "failed"
+
+    def _resolve_backend(
+        self,
+        backend_kind: AssistantBackendKind,
+    ) -> AssistantBackend:
+        backend = self.backends.get(backend_kind)
+        if backend is None:
+            raise ValueError(f"assistant backend {backend_kind.value} is not registered")
+        return backend
 
     def _resolve_task(self, record: AssistantRequestRecord) -> TaskSpec:
         task = self.store.maybe_get_run_task(record.run_id, record.task_id)

@@ -249,6 +249,49 @@ def test_assistant_worker_prefers_task_profile_over_project_default(tmp_path: Pa
     assert backend_request.artifacts[0].content == "Prefer deleting wrappers.\n"
 
 
+def test_assistant_worker_requires_registered_backend_for_profile(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/implement.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    run_service = RunService(store, FakeRunner())
+    snapshot = run_service.create_snapshot(roots=["worker"], labels=[], user_inputs=None)
+    store.create_assistant_request(
+        run_id=snapshot.id,
+        task_id="worker",
+        request_kind=RequestKind.CLARIFICATION,
+        question="Should I delete the wrapper?",
+        decision_kind=DecisionKind.POLICY,
+        options=["keep", "delete"],
+        context_artifacts=[],
+        requested_control_actions=[],
+        priority=RequestPriority.HIGH,
+    )
+    asyncio.run(run_service.run_snapshot(snapshot.id))
+
+    worker = AssistantWorkerService(
+        store,
+        backend_registry={},
+        run_service=run_service,
+    )
+
+    stats = worker.run_once()
+
+    assert stats.scanned == 1
+    assert stats.failed == 1
+    assert stats.processed == 0
+    assert store.list_assistant_requests(unresolved_only=True)
+
+
 def test_assistant_worker_handoff_materializes_manual_gate(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
     write_assistant_profile(store, "assistant-default")

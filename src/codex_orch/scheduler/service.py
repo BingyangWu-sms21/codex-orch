@@ -80,9 +80,7 @@ class RunService:
         }
         snapshot = RunSnapshot(
             id=self._new_run_id(),
-            project_name=project.name,
             roots=sorted(roots),
-            selected_labels=sorted(labels),
             user_inputs=merged_inputs,
             nodes=nodes,
         )
@@ -281,10 +279,8 @@ class RunService:
 
     def _attach_prefect_flow_metadata(self, run_context: _RunFlowContext) -> None:
         flow_run_id = prefect_flow_run.get_id()
-        flow_run_name = prefect_flow_run.get_name()
         with run_context.lock:
             run_context.snapshot.prefect_flow_run_id = flow_run_id
-            run_context.snapshot.prefect_flow_run_name = flow_run_name
             self.store.save_run(run_context.snapshot)
 
     def _execute_node(
@@ -662,7 +658,7 @@ class RunService:
             destination = published_dir / relative_path
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
-            artifacts.append(PublishedArtifact(task_id=task.id, relative_path=relative_path))
+            artifacts.append(PublishedArtifact(relative_path=relative_path))
         return artifacts
 
     def _published_artifacts_complete(self, run_id: str, task: TaskSpec) -> bool:
@@ -671,7 +667,7 @@ class RunService:
 
     def _load_published_artifacts(self, task: TaskSpec) -> list[PublishedArtifact]:
         return [
-            PublishedArtifact(task_id=task.id, relative_path=relative_path)
+            PublishedArtifact(relative_path=relative_path)
             for relative_path in task.publish
         ]
 

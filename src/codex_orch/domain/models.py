@@ -262,7 +262,6 @@ class PresetSpec(BaseModel):
 
 
 class PublishedArtifact(BaseModel):
-    task_id: str
     relative_path: str
 
     @model_validator(mode="after")
@@ -338,13 +337,10 @@ class RunNodeState(BaseModel):
 
 class RunSnapshot(BaseModel):
     id: str
-    project_name: str
     roots: list[str]
-    selected_labels: list[str] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
     status: RunStatus = RunStatus.PENDING
     user_inputs: dict[str, str] = Field(default_factory=dict)
     prefect_flow_run_id: str | None = None
-    prefect_flow_run_name: str | None = None
     nodes: dict[str, RunNodeState]

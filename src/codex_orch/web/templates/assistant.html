@@ -35,7 +35,7 @@
     {% endif %}
 
     {% if record.control_action %}
-    <p><strong>Control action:</strong> {{ record.control_action.action_kind.value }} ({{ record.control_action.status.value }})</p>
+    <p><strong>Control action proposal:</strong> {{ record.control_action.action_kind.value }} ({{ record.control_action.status.value }})</p>
     {% endif %}
 
     {% if record.request.request_id in manual_gate_by_request %}
@@ -73,10 +73,10 @@
         <label>Citations (one per line)
           <textarea name="citations" rows="3">{% if record.response %}{{ record.response.citations | join("\n") }}{% endif %}</textarea>
         </label>
-        <label>Guidance updates (one per line)
+        <label>Guidance updates proposal (one per line)
           <textarea name="guidance_updates" rows="2">{% if record.response %}{{ record.response.proposed_guidance_updates | join("\n") }}{% endif %}</textarea>
         </label>
-        <label>Proposed actions (one per line)
+        <label>Proposed actions (saved only, not executed)
           <textarea name="proposed_actions" rows="2">{% if record.response %}{{ record.response.proposed_control_actions | map(attribute="value") | join("\n") }}{% endif %}</textarea>
         </label>
         <button type="submit">Save response</button>
@@ -84,7 +84,7 @@
 
       <form method="post" action="/assistant/actions" class="stack-form">
         <input type="hidden" name="request_id" value="{{ record.request.request_id }}" />
-        <label>Action kind
+        <label>Proposal kind
           <select name="action_kind">
             {% for kind in control_action_kinds %}
             <option value="{{ kind }}">{{ kind }}</option>
@@ -117,21 +117,21 @@
             {% endfor %}
           </select>
         </label>
-        <button type="submit">Save control action</button>
+        <button type="submit">Save proposal</button>
       </form>
     </div>
 
     {% if record.control_action %}
     <form method="post" action="/assistant/actions/status" class="stack-form">
       <input type="hidden" name="request_id" value="{{ record.request.request_id }}" />
-      <label>Action status
+      <label>Proposal review status
         <select name="status">
           {% for status in control_action_statuses %}
           <option value="{{ status }}" {% if status == record.control_action.status.value %}selected{% endif %}>{{ status }}</option>
           {% endfor %}
         </select>
       </label>
-      <button type="submit">Update action status</button>
+      <button type="submit">Update proposal status</button>
     </form>
     {% endif %}
   </section>
