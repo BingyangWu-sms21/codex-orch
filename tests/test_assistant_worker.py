@@ -245,8 +245,60 @@ def test_assistant_worker_prefers_task_profile_over_project_default(tmp_path: Pa
     backend_request = backend.requests[0]
     assert backend_request.profile.spec.id == "task-override"
     assert backend_request.task.assistant_profile == "task-override"
-    assert backend_request.artifacts[0].relative_path == "context/policy.md"
-    assert backend_request.artifacts[0].content == "Prefer deleting wrappers.\n"
+    assert backend_request.artifacts[0].source_reference == "context/policy.md"
+    assert backend_request.artifacts[0].inline_text == "Prefer deleting wrappers.\n"
+
+
+def test_assistant_worker_reads_frozen_artifact_snapshot(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/implement.md"}],
+            publish=["final.md"],
+        )
+    )
+    artifact_path = store.paths.root / "context" / "policy.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("Original policy.\n", encoding="utf-8")
+
+    run_service = RunService(store, FakeRunner())
+    snapshot = run_service.create_snapshot(roots=["worker"], labels=[], user_inputs=None)
+    store.create_assistant_request(
+        run_id=snapshot.id,
+        task_id="worker",
+        request_kind=RequestKind.CLARIFICATION,
+        question="Should I delete the wrapper?",
+        decision_kind=DecisionKind.POLICY,
+        options=["keep", "delete"],
+        context_artifacts=["context/policy.md"],
+        requested_control_actions=[],
+        priority=RequestPriority.HIGH,
+    )
+    artifact_path.write_text("Updated policy.\n", encoding="utf-8")
+    asyncio.run(run_service.run_snapshot(snapshot.id))
+
+    backend = RecordingAssistantBackend(
+        AssistantBackendResult(
+            resolution_kind=ResolutionKind.AUTO_REPLY,
+            answer="Delete it.",
+            rationale="The frozen policy allows it.",
+            confidence=ConfidenceLevel.HIGH,
+        )
+    )
+    worker = AssistantWorkerService(store, backend=backend, run_service=run_service)
+
+    stats = worker.run_once()
+
+    assert stats.processed == 1
+    assert len(backend.requests) == 1
+    artifact = backend.requests[0].artifacts[0]
+    assert artifact.inline_text == "Original policy.\n"
+    assert artifact.staged_path.read_text(encoding="utf-8") == "Original policy.\n"
 
 
 def test_assistant_worker_requires_registered_backend_for_profile(tmp_path: Path) -> None:

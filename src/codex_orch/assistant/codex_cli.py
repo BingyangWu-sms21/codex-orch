@@ -55,12 +55,13 @@ class CodexCliAssistantBackend:
         schema_path = self._write_schema_file(request.profile.profile_dir)
         try:
             result = subprocess.run(
-                self._build_command(request, schema_path, prompt),
+                self._build_command(request, schema_path),
                 cwd=request.profile.workspace_dir,
                 env=self._build_environment(request),
                 capture_output=True,
                 text=True,
                 check=False,
+                input=prompt,
             )
         finally:
             schema_path.unlink(missing_ok=True)
@@ -92,7 +93,6 @@ class CodexCliAssistantBackend:
         self,
         request: AssistantBackendRequest,
         schema_path: Path,
-        prompt: str,
     ) -> list[str]:
         command = [
             "codex",
@@ -115,7 +115,7 @@ class CodexCliAssistantBackend:
                 command.extend(["--add-dir", str(visible_root)])
         if request.profile.spec.model is not None:
             command.extend(["--model", request.profile.spec.model])
-        command.extend(["--output-schema", str(schema_path), prompt])
+        command.extend(["--output-schema", str(schema_path), "-"])
         return command
 
     def _build_environment(self, request: AssistantBackendRequest) -> dict[str, str]:
@@ -176,22 +176,7 @@ class CodexCliAssistantBackend:
 
         artifact_sections: list[str] = []
         for artifact in request.artifacts:
-            body = (
-                artifact.content
-                if artifact.content is not None
-                else f"[missing artifact at {artifact.absolute_path}]"
-            )
-            artifact_sections.append(
-                "\n".join(
-                    [
-                        f"## {artifact.relative_path}",
-                        f"Absolute path: {artifact.absolute_path}",
-                        "```text",
-                        body.rstrip(),
-                        "```",
-                    ]
-                )
-            )
+            artifact_sections.append(self._format_artifact_section(artifact))
 
         requester_node_dir = self._run_nodes_dir(request) / request.task.id
         accessible_paths = [
@@ -231,6 +216,31 @@ class CodexCliAssistantBackend:
             ),
         ]
         return "\n\n".join(section for section in sections if section)
+
+    def _format_artifact_section(self, artifact) -> str:
+        lines = [
+            f"## {artifact.source_reference}",
+            f"Source path: {artifact.source_path}",
+            f"Staged path: {artifact.staged_path}",
+            f"Byte size: {artifact.byte_size}",
+            f"SHA-256: {artifact.sha256}",
+        ]
+        if not artifact.is_text:
+            lines.append("Content omitted: artifact is not UTF-8 text.")
+            return "\n".join(lines)
+        if artifact.inline_text is not None:
+            lines.extend(["```text", artifact.inline_text.rstrip(), "```"])
+            return "\n".join(lines)
+        preview = artifact.preview_text.rstrip() if artifact.preview_text is not None else ""
+        lines.extend(
+            [
+                "Preview only: artifact exceeded inline size limit.",
+                "```text",
+                preview,
+                "```",
+            ]
+        )
+        return "\n".join(lines)
 
     def _command_visible_roots(
         self,

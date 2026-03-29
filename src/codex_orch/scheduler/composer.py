@@ -3,6 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from codex_orch.domain import ComposeStepKind, TaskSpec
+from codex_orch.prompt_context import (
+    StagedPromptFile,
+    ensure_staged_compose_program_file,
+    ensure_staged_dependency_file,
+    read_staged_text,
+)
 
 
 class PromptComposer:
@@ -13,6 +19,7 @@ class PromptComposer:
         self,
         task: TaskSpec,
         *,
+        node_dir: Path,
         user_inputs: dict[str, str],
         dependency_node_dirs: dict[str, Path],
     ) -> str:
@@ -20,11 +27,13 @@ class PromptComposer:
         for step in task.compose:
             if step.kind is ComposeStepKind.FILE and step.path is not None:
                 sections.append(
-                    self._format_section(
+                    self._format_staged_file_section(
                         f"File Prompt: {step.path}",
-                        (self.program_dir / step.path).read_text(
-                            encoding="utf-8"
-                        ).rstrip(),
+                        ensure_staged_compose_program_file(
+                            program_dir=self.program_dir,
+                            node_dir=node_dir,
+                            relative_path=step.path,
+                        ),
                     )
                 )
             elif step.kind is ComposeStepKind.USER_INPUT and step.key is not None:
@@ -43,13 +52,15 @@ class PromptComposer:
             ):
                 if step.task not in dependency_node_dirs:
                     raise ValueError(f"dependency node {step.task} is not available")
-                published_path = (
-                    dependency_node_dirs[step.task] / "published" / step.path
-                )
                 sections.append(
-                    self._format_section(
+                    self._format_staged_file_section(
                         f"Dependency Context: {step.task}/{step.path}",
-                        published_path.read_text(encoding="utf-8").rstrip(),
+                        ensure_staged_dependency_file(
+                            node_dir=node_dir,
+                            dependency_task_id=step.task,
+                            dependency_node_dir=dependency_node_dirs[step.task],
+                            relative_path=step.path,
+                        ),
                     )
                 )
             elif step.kind is ComposeStepKind.LITERAL and step.text is not None:
@@ -65,3 +76,22 @@ class PromptComposer:
         if not body:
             return ""
         return f"## {title}\n\n{body}"
+
+    def _format_staged_file_section(
+        self,
+        title: str,
+        staged_file: StagedPromptFile,
+    ) -> str:
+        content = read_staged_text(staged_file).rstrip()
+        lines = [
+            f"## {title}",
+            "",
+            f"- staged_path: `{staged_file.staged_path}`",
+            f"- byte_size: {staged_file.byte_size}",
+            f"- sha256: `{staged_file.sha256}`",
+            "",
+            "### Content",
+            "",
+            content,
+        ]
+        return "\n".join(lines).rstrip()

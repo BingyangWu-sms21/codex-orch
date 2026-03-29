@@ -48,6 +48,10 @@ class RejectingRunner(FakeRunner):
         raise ValueError("extra writable roots require a writable sandbox")
 
 
+def _large_text_with_tail(marker: str) -> str:
+    return "header\n" + ("A" * (17 * 1024)) + f"\n{marker}\n"
+
+
 def test_run_service_materializes_context_dependencies(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
     store.save_task(
@@ -280,6 +284,155 @@ def test_create_snapshot_requires_existing_workspace_directory(tmp_path: Path) -
         )
 
 
+def test_create_snapshot_freezes_compose_file_context(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="refactor",
+            title="Refactor",
+            agent="worker",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/implement.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    runner = FakeRunner()
+    service = RunService(store, runner)
+    snapshot = service.create_snapshot(roots=["refactor"], labels=[], user_inputs=None)
+    (store.paths.prompts_dir / "implement.md").write_text(
+        "mutated prompt\n",
+        encoding="utf-8",
+    )
+
+    resumed = asyncio.run(service.run_snapshot(snapshot.id))
+
+    assert resumed.status is RunStatus.DONE
+    prompt = runner.prompts["refactor"]
+    assert "implement prompt" in prompt
+    assert "mutated prompt" not in prompt
+    assert f"- staged_path: `{store.get_node_dir(snapshot.id, 'refactor') / 'context' / 'compose' / 'program' / 'prompts' / 'implement.md'}`" in prompt
+
+
+def test_create_snapshot_keeps_large_compose_file_in_prompt(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    large_prompt = _large_text_with_tail("COMPOSE TAIL SENTINEL")
+    (store.paths.prompts_dir / "implement.md").write_text(
+        large_prompt,
+        encoding="utf-8",
+    )
+    store.save_task(
+        TaskSpec(
+            id="refactor",
+            title="Refactor",
+            agent="worker",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/implement.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    runner = FakeRunner()
+    service = RunService(store, runner)
+    snapshot = service.create_snapshot(roots=["refactor"], labels=[], user_inputs=None)
+    (store.paths.prompts_dir / "implement.md").write_text(
+        "mutated prompt\n",
+        encoding="utf-8",
+    )
+
+    resumed = asyncio.run(service.run_snapshot(snapshot.id))
+
+    assert resumed.status is RunStatus.DONE
+    prompt = runner.prompts["refactor"]
+    assert "COMPOSE TAIL SENTINEL" in prompt
+    assert "mutated prompt" not in prompt
+    assert "### Preview (truncated)" not in prompt
+    assert "- content_truncated: true" not in prompt
+
+
+def test_create_snapshot_rejects_binary_compose_file_context(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    binary_path = store.paths.root / "prompts" / "binary.bin"
+    binary_path.write_bytes(b"\x00\x01\x02")
+    store.save_task(
+        TaskSpec(
+            id="refactor",
+            title="Refactor",
+            agent="worker",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/binary.bin"}],
+            publish=["final.md"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="prompts/binary.bin must be UTF-8 text"):
+        RunService(store, FakeRunner()).create_snapshot(
+            roots=["refactor"],
+            labels=[],
+            user_inputs=None,
+        )
+
+
+def test_run_service_keeps_large_dependency_context_in_prompt(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="analyze",
+            title="Analyze",
+            agent="explorer",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/analyze.md"}],
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="implement",
+            title="Implement",
+            agent="worker",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "analyze", "kind": "context", "consume": ["final.md"]}],
+            compose=[
+                {"kind": "file", "path": "prompts/implement.md"},
+                {"kind": "from_dep", "task": "analyze", "path": "final.md"},
+            ],
+            publish=["final.md"],
+        )
+    )
+
+    large_dependency = _large_text_with_tail("DEPENDENCY TAIL SENTINEL")
+
+    class LargeDependencyRunner(FakeRunner):
+        async def run(self, request: NodeExecutionRequest) -> NodeExecutionResult:
+            self.prompts[request.task.id] = request.prompt
+            self.requests[request.task.id] = request
+            final_path = request.node_dir / "final.md"
+            if request.task.id == "analyze":
+                final_path.write_text(large_dependency, encoding="utf-8")
+                return NodeExecutionResult(
+                    success=True,
+                    return_code=0,
+                    final_message="analysis result",
+                )
+            final_path.write_text(request.prompt, encoding="utf-8")
+            return NodeExecutionResult(
+                success=True,
+                return_code=0,
+                final_message=request.prompt,
+            )
+
+    runner = LargeDependencyRunner()
+    service = RunService(store, runner)
+
+    snapshot = asyncio.run(service.start_run(roots=["implement"], labels=[], user_inputs=None))
+
+    assert snapshot.status is RunStatus.DONE
+    prompt = runner.prompts["implement"]
+    assert "DEPENDENCY TAIL SENTINEL" in prompt
+    assert "### Preview (truncated)" not in prompt
+    assert "- content_truncated: true" not in prompt
+
+
 def test_run_service_waits_for_assistant_reply(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
     write_assistant_profile(store, set_as_default=True)
@@ -489,7 +642,7 @@ def test_run_service_resumes_after_manual_gate_approval(tmp_path: Path) -> None:
     assert "### Assistant Rationale\nThe boundary is ambiguous." in prompt
     assert "### Human Answer\nDelete it." in prompt
     assert "- ~/.codex/AGENTS.md" in prompt
-    assert "- `docs/legacy-wrapper.md`" in prompt
+    assert "- source: `docs/legacy-wrapper.md`; staged_path:" in prompt
 
 
 def test_run_service_does_not_inject_manual_gate_packet_into_downstream_task(

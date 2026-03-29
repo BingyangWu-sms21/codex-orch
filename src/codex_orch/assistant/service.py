@@ -12,6 +12,7 @@ from codex_orch.assistant.base import (
     AssistantBackendRequest,
 )
 from codex_orch.domain import AssistantBackendKind, ResolutionKind, TaskSpec
+from codex_orch.prompt_context import ensure_staged_assistant_artifact
 from codex_orch.scheduler import RunService
 from codex_orch.store import AssistantRequestRecord, ProjectStore
 
@@ -154,16 +155,13 @@ class AssistantWorkerService:
         record: AssistantRequestRecord,
     ) -> list[AssistantArtifactContext]:
         artifacts: list[AssistantArtifactContext] = []
+        node_dir = self.store.get_node_dir(record.run_id, record.task_id)
         for relative_path in record.request.context_artifacts:
-            absolute_path = self.store.paths.root / relative_path
-            content = None
-            if absolute_path.exists():
-                content = absolute_path.read_text(encoding="utf-8")
             artifacts.append(
-                AssistantArtifactContext(
+                ensure_staged_assistant_artifact(
+                    program_dir=self.store.paths.root,
+                    node_dir=node_dir,
                     relative_path=relative_path,
-                    absolute_path=absolute_path,
-                    content=content,
                 )
             )
         return artifacts

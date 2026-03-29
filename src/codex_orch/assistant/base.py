@@ -12,14 +12,8 @@ from codex_orch.domain import (
     ResolutionKind,
     TaskSpec,
 )
+from codex_orch.prompt_context import StagedPromptFile as AssistantArtifactContext
 from codex_orch.store import ResolvedAssistantProfile
-
-
-@dataclass(frozen=True)
-class AssistantArtifactContext:
-    relative_path: str
-    absolute_path: Path
-    content: str | None
 
 
 @dataclass(frozen=True)

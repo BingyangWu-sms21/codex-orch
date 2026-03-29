@@ -50,6 +50,22 @@ def _install_fake_codex(tmp_path: Path) -> Path:
                     flush=True,
                 )
                 raise SystemExit(0)
+            if mode == "echo-stdin":
+                prompt = sys.stdin.read()
+                print(
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": "item_0",
+                                "type": "agent_message",
+                                "text": prompt,
+                            },
+                        }
+                    ),
+                    flush=True,
+                )
+                raise SystemExit(0)
             if mode == "sleep":
                 time.sleep(30)
                 raise SystemExit(0)
@@ -179,7 +195,7 @@ def test_build_command_skips_git_repo_check_for_workspace_write(tmp_path: Path) 
         "--full-auto",
         "--add-dir",
         str(tmp_path / "node"),
-        "hello",
+        "-",
     ]
 
 
@@ -208,7 +224,7 @@ def test_build_command_includes_extra_writable_roots(tmp_path: Path) -> None:
         str(tmp_path / "shared-cache"),
         "--add-dir",
         str(tmp_path / "env-source"),
-        "hello",
+        "-",
     ]
 
 
@@ -231,7 +247,7 @@ def test_build_command_omits_add_dir_for_danger_full_access(tmp_path: Path) -> N
         "--cd",
         str(tmp_path / "workspace"),
         "--dangerously-bypass-approvals-and-sandbox",
-        "hello",
+        "-",
     ]
 
 
@@ -274,6 +290,23 @@ def test_runner_writes_runtime_for_successful_execution(
     assert runtime.last_event_summary == "item.completed:agent_message:hello from fake codex"
     assert runtime.termination_reason is NodeExecutionTerminationReason.COMPLETED
     assert (request.node_dir / "final.md").read_text(encoding="utf-8") == "hello from fake codex"
+
+
+def test_runner_passes_prompt_via_stdin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_bin_dir = _install_fake_codex(tmp_path)
+    monkeypatch.setenv("PATH", f"{fake_bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_CODEX_MODE", "echo-stdin")
+
+    request = _build_request(tmp_path, sandbox="read-only")
+    runner = CodexExecRunner()
+
+    result = asyncio.run(runner.run(request))
+
+    assert result.success
+    assert result.final_message == "hello"
 
 
 def test_runner_handles_long_stdout_jsonl_lines(

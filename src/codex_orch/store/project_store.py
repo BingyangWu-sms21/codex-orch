@@ -36,6 +36,7 @@ from codex_orch.domain import (
     ResolutionKind,
     TaskSpec,
 )
+from codex_orch.prompt_context import ensure_staged_assistant_artifact
 from codex_orch.store.layout import (
     GlobalPaths,
     ProgramPaths,
@@ -415,6 +416,13 @@ class ProjectStore:
             requested_control_actions=requested_control_actions,
             priority=priority,
         )
+        node_dir = self.get_node_dir(run_id, task_id)
+        for relative_path in context_artifacts:
+            ensure_staged_assistant_artifact(
+                program_dir=self.paths.root,
+                node_dir=node_dir,
+                relative_path=relative_path,
+            )
         self.save_assistant_request(run_id, task_id, request)
         return request
 

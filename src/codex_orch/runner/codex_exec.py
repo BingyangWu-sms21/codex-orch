@@ -204,6 +204,7 @@ class CodexExecRunner:
                 *command,
                 cwd=str(request.workspace_dir),
                 env=self._build_environment(request),
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -229,6 +230,9 @@ class CodexExecRunner:
             idle_timeout_sec=request.project.node_idle_timeout_sec,
         )
         await runtime_tracker.set_pid(process.pid)
+        stdin_task = asyncio.create_task(
+            self._write_prompt_stdin(process, request.prompt)
+        )
         stdout_task = asyncio.create_task(
             self._capture_stdout(process, events_path, runtime_tracker)
         )
@@ -246,6 +250,7 @@ class CodexExecRunner:
         )
 
         return_code = await process.wait()
+        await stdin_task
         watchdog_reason = await watchdog_task
         final_message = await stdout_task
         stderr_output = await stderr_task
@@ -300,7 +305,7 @@ class CodexExecRunner:
         if request.task.result_schema is not None:
             schema_path = request.program_dir / request.task.result_schema
             command.extend(["--output-schema", str(schema_path)])
-        command.append(request.prompt)
+        command.append("-")
         return command
 
     def _build_environment(self, request: NodeExecutionRequest) -> dict[str, str]:
@@ -342,6 +347,25 @@ class CodexExecRunner:
         if sandbox in {"read-only", "danger-full-access"}:
             return tuple()
         return (request.workspace_dir, *self._command_writable_roots(request))
+
+    async def _write_prompt_stdin(
+        self,
+        process: asyncio.subprocess.Process,
+        prompt: str,
+    ) -> None:
+        if process.stdin is None:
+            return
+        try:
+            process.stdin.write(prompt.encode("utf-8"))
+            await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        finally:
+            process.stdin.close()
+            try:
+                await process.stdin.wait_closed()
+            except BrokenPipeError:
+                return
 
     async def _capture_stdout(
         self,

@@ -18,6 +18,7 @@ from prefect.runtime import flow_run as prefect_flow_run
 from prefect.task_runners import ThreadPoolTaskRunner
 
 from codex_orch.domain import (
+    ComposeStepKind,
     DependencyKind,
     ManualGateStatus,
     NodeExecutionRuntime,
@@ -32,6 +33,10 @@ from codex_orch.domain import (
     RunStatus,
     TaskSpec,
     TaskStatus,
+)
+from codex_orch.prompt_context import (
+    ensure_staged_assistant_artifact,
+    ensure_staged_compose_program_file,
 )
 from codex_orch.runner import NodeExecutionRequest, NodeExecutionResult, TaskRunner
 from codex_orch.scheduler.composer import PromptComposer
@@ -78,12 +83,14 @@ class RunService:
             task_id: RunNodeState(task=self._materialize_task(project, task))
             for task_id, task in selected.items()
         }
+        run_id = self._new_run_id()
         snapshot = RunSnapshot(
-            id=self._new_run_id(),
+            id=run_id,
             roots=sorted(roots),
             user_inputs=merged_inputs,
             nodes=nodes,
         )
+        self._stage_snapshot_compose_context(snapshot)
         self.store.save_run(snapshot)
         return snapshot
 
@@ -443,12 +450,13 @@ class RunService:
         user_inputs: dict[str, str],
         dependency_dirs: dict[str, Path],
     ) -> NodeExecutionResult:
+        node_dir = self.store.get_node_dir(run_id, task.id)
         prompt = self.composer.render(
             task,
+            node_dir=node_dir,
             user_inputs=user_inputs,
             dependency_node_dirs=dependency_dirs,
         )
-        node_dir = self.store.get_node_dir(run_id, task.id)
         project_workspace_dir = self._resolve_project_workspace_dir(project)
         workspace_dir = self._resolve_task_workspace_dir(project, task)
         extra_writable_roots = tuple(
@@ -841,9 +849,7 @@ class RunService:
         if request.context_artifacts:
             sections.append(
                 "### Context Artifacts\n"
-                + "\n".join(
-                    f"- `{artifact}`" for artifact in request.context_artifacts
-                )
+                + self._assistant_context_artifact_lines(run_id, task_id, request.context_artifacts)
             )
         return "\n\n".join(sections)
 
@@ -880,11 +886,32 @@ class RunService:
         if human_request.context_artifacts:
             sections.append(
                 "### Context Artifacts\n"
-                + "\n".join(
-                    f"- `{artifact}`" for artifact in human_request.context_artifacts
+                + self._assistant_context_artifact_lines(
+                    run_id,
+                    task_id,
+                    human_request.context_artifacts,
                 )
             )
         return "\n\n".join(sections)
+
+    def _assistant_context_artifact_lines(
+        self,
+        run_id: str,
+        task_id: str,
+        relative_paths: list[str],
+    ) -> str:
+        node_dir = self.store.get_node_dir(run_id, task_id)
+        lines: list[str] = []
+        for relative_path in relative_paths:
+            staged = ensure_staged_assistant_artifact(
+                program_dir=self.store.paths.root,
+                node_dir=node_dir,
+                relative_path=relative_path,
+            )
+            lines.append(
+                f"- source: `{relative_path}`; staged_path: `{staged.staged_path}`"
+            )
+        return "\n".join(lines)
 
     def _declared_writable_roots(
         self,
@@ -1027,6 +1054,17 @@ class RunService:
         if not updates:
             return task
         return task.model_copy(update=updates)
+
+    def _stage_snapshot_compose_context(self, snapshot: RunSnapshot) -> None:
+        for task_id, node in snapshot.nodes.items():
+            node_dir = self.store.get_node_dir(snapshot.id, task_id)
+            for step in node.task.compose:
+                if step.kind is ComposeStepKind.FILE and step.path is not None:
+                    ensure_staged_compose_program_file(
+                        program_dir=self.store.paths.root,
+                        node_dir=node_dir,
+                        relative_path=step.path,
+                    )
 
     def _resolve_project_workspace_dir(self, project: ProjectSpec) -> Path:
         return Path(project.workspace).resolve()
