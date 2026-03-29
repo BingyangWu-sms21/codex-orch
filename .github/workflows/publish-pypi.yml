@@ -44,8 +44,9 @@ jobs:
       - name: Smoke test installed wheel
         run: |
           python -m pipx install dist/codex_orch-*.whl
-          "${HOME}/.local/bin/codex-orch" --help
-          "${HOME}/.local/bin/codex-orch" --version
+          PIPX_BIN_DIR="$(python -m pipx environment --value PIPX_BIN_DIR)"
+          "${PIPX_BIN_DIR}/codex-orch" --help
+          "${PIPX_BIN_DIR}/codex-orch" --version
 
       - name: Upload distributions
         uses: actions/upload-artifact@v4
