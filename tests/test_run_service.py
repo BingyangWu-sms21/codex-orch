@@ -176,6 +176,46 @@ def test_create_snapshot_materializes_workspace_and_writable_roots(tmp_path: Pat
     ]
 
 
+def test_create_snapshot_materializes_assistant_requesting_help_doc(
+    tmp_path: Path,
+) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
+    store.save_task(
+        TaskSpec(
+            id="refactor",
+            title="Refactor",
+            agent="worker",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/implement.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    snapshot = RunService(store, FakeRunner()).create_snapshot(
+        roots=["refactor"],
+        labels=[],
+        user_inputs=None,
+    )
+
+    helper_path = (
+        store.get_node_dir(snapshot.id, "refactor")
+        / "context"
+        / "assistant"
+        / "requesting-help.md"
+    )
+    helper_text = helper_path.read_text(encoding="utf-8")
+
+    assert helper_path.exists()
+    assert "# Requesting Assistant Help" in helper_text
+    assert "- effective_assistant_profile: `assistant-default`" in helper_text
+    assert "codex-orch assistant request create \\" in helper_text
+    assert '--program-dir "$CODEX_ORCH_PROGRAM_DIR"' in helper_text
+    assert "Use `--question-file /path/to/question.md`" in helper_text
+    assert "Do not hand-write `assistant_request.json`" in helper_text
+    assert "A `handoff_to_human` reply creates `manual_gate.json`" in helper_text
+
+
 def test_run_service_uses_task_workspace_override(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
     (store.paths.root / "fresh-clone").mkdir()
@@ -205,6 +245,53 @@ def test_run_service_uses_task_workspace_override(tmp_path: Path) -> None:
     assert request.extra_writable_roots == (
         (store.paths.root / "fresh-clone" / "tool-cache").resolve(),
     )
+
+
+def test_run_service_includes_assistant_escalation_contract(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
+    store.save_task(
+        TaskSpec(
+            id="refactor",
+            title="Refactor",
+            agent="worker",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/implement.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    runner = FakeRunner()
+    snapshot = asyncio.run(
+        RunService(store, runner).start_run(
+            roots=["refactor"],
+            labels=[],
+            user_inputs=None,
+        )
+    )
+
+    helper_path = (
+        store.get_node_dir(snapshot.id, "refactor")
+        / "context"
+        / "assistant"
+        / "requesting-help.md"
+    )
+    prompt = runner.prompts["refactor"]
+
+    assert snapshot.status is RunStatus.DONE
+    assert "### Assistant Escalation Contract" in prompt
+    assert f"- Read `{helper_path}` before escalating." in prompt
+    assert "- Effective assistant profile for this task: `assistant-default`." in prompt
+    assert "- Pass `--artifact` paths relative to `CODEX_ORCH_PROGRAM_DIR`." in prompt
+    assert (
+        "- `auto_reply` and approved manual-gate continuations apply only to this "
+        "task continuation, not downstream tasks."
+    ) in prompt
+    assert (
+        "- `handoff_to_human` creates `manual_gate.json` and `human_request.json` "
+        "for this node and pauses execution."
+    ) in prompt
+    assert "wrapped by a Codex skill" not in prompt
 
 
 def test_resume_run_keeps_materialized_workspace_after_project_change(tmp_path: Path) -> None:

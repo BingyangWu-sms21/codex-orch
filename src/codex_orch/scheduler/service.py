@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from textwrap import dedent
 
 from prefect import flow, task
 from prefect.futures import PrefectFuture
@@ -90,7 +91,7 @@ class RunService:
             user_inputs=merged_inputs,
             nodes=nodes,
         )
-        self._stage_snapshot_compose_context(snapshot)
+        self._materialize_snapshot_node_context(snapshot)
         self.store.save_run(snapshot)
         return snapshot
 
@@ -451,6 +452,7 @@ class RunService:
         dependency_dirs: dict[str, Path],
     ) -> NodeExecutionResult:
         node_dir = self.store.get_node_dir(run_id, task.id)
+        self._materialize_node_context(task, node_dir)
         prompt = self.composer.render(
             task,
             node_dir=node_dir,
@@ -773,6 +775,8 @@ class RunService:
         extra_writable_roots: tuple[Path, ...],
     ) -> str:
         sandbox = task.sandbox or "workspace-write"
+        assistant_helper_path = self._assistant_requesting_help_doc_path(node_dir)
+        assistant_profile = task.assistant_profile or "<none>"
         sections = [
             "## Execution Contract",
             "\n".join(
@@ -810,10 +814,16 @@ class RunService:
         sections.append(
             "\n".join(
                 [
-                    "### Assistant Helper Contract",
-                    "- Use `codex-orch assistant request create` to create assistant requests.",
+                    "### Assistant Escalation Contract",
+                    "- Escalate only for policy ambiguity, missing user preference, required approval, or codex-orch control-plane help.",
+                    f"- Read `{assistant_helper_path}` before escalating.",
+                    "- Create requests with `codex-orch assistant request create`; do not hand-write `assistant_request.json`.",
+                    f"- Effective assistant profile for this task: `{assistant_profile}`.",
+                    "- Requests succeed only when this task has an effective assistant profile.",
                     "- Runtime env vars are available: `CODEX_ORCH_PROGRAM_DIR`, `CODEX_ORCH_RUN_ID`, `CODEX_ORCH_TASK_ID`, `CODEX_ORCH_NODE_DIR`, `CODEX_ORCH_PROJECT_WORKSPACE_DIR`, `CODEX_ORCH_WORKSPACE_DIR`.",
-                    "- Pass assistant artifact paths relative to `CODEX_ORCH_PROGRAM_DIR`.",
+                    "- Pass `--artifact` paths relative to `CODEX_ORCH_PROGRAM_DIR`.",
+                    "- `auto_reply` and approved manual-gate continuations apply only to this task continuation, not downstream tasks.",
+                    "- `handoff_to_human` creates `manual_gate.json` and `human_request.json` for this node and pauses execution.",
                 ]
             )
         )
@@ -1055,16 +1065,97 @@ class RunService:
             return task
         return task.model_copy(update=updates)
 
-    def _stage_snapshot_compose_context(self, snapshot: RunSnapshot) -> None:
+    def _materialize_snapshot_node_context(self, snapshot: RunSnapshot) -> None:
         for task_id, node in snapshot.nodes.items():
             node_dir = self.store.get_node_dir(snapshot.id, task_id)
-            for step in node.task.compose:
-                if step.kind is ComposeStepKind.FILE and step.path is not None:
-                    ensure_staged_compose_program_file(
-                        program_dir=self.store.paths.root,
-                        node_dir=node_dir,
-                        relative_path=step.path,
-                    )
+            self._materialize_node_context(node.task, node_dir)
+
+    def _materialize_node_context(self, task: TaskSpec, node_dir: Path) -> None:
+        for step in task.compose:
+            if step.kind is ComposeStepKind.FILE and step.path is not None:
+                ensure_staged_compose_program_file(
+                    program_dir=self.store.paths.root,
+                    node_dir=node_dir,
+                    relative_path=step.path,
+                )
+        self._write_assistant_requesting_help_doc(node_dir=node_dir, task=task)
+
+    def _assistant_requesting_help_doc_path(self, node_dir: Path) -> Path:
+        return node_dir / "context" / "assistant" / "requesting-help.md"
+
+    def _write_assistant_requesting_help_doc(
+        self,
+        *,
+        node_dir: Path,
+        task: TaskSpec,
+    ) -> None:
+        helper_path = self._assistant_requesting_help_doc_path(node_dir)
+        assistant_profile = task.assistant_profile or "<none>"
+        helper_path.parent.mkdir(parents=True, exist_ok=True)
+        helper_path.write_text(
+            dedent(
+                f"""\
+                # Requesting Assistant Help
+
+                This node can escalate questions to the configured assistant without hand-writing protocol files.
+
+                ## Current Task State
+
+                - task_id: `{task.id}`
+                - effective_assistant_profile: `{assistant_profile}`
+
+                ## When To Escalate
+
+                Use assistant escalation for:
+
+                - policy ambiguity
+                - missing user preference or approval
+                - codex-orch control-plane help such as runs, assistant inbox, manual gates, or resume/recovery
+
+                Do not escalate ordinary implementation choices that can be settled from the repo, task prompt, or dependency context already provided to this node.
+
+                ## Create A Request
+
+                ```bash
+                codex-orch assistant request create \\
+                  --program-dir "$CODEX_ORCH_PROGRAM_DIR" \\
+                  --run-id "$CODEX_ORCH_RUN_ID" \\
+                  --task-id "$CODEX_ORCH_TASK_ID" \\
+                  --kind clarification \\
+                  --decision-kind policy \\
+                  --question "Can I delete the legacy wrapper?" \\
+                  --option delete \\
+                  --option keep_wrapper
+                ```
+
+                Use `--question-file /path/to/question.md` for longer prompts or structured decision memos.
+
+                ## Attach Artifacts
+
+                - Pass `--artifact <relative/path>` using paths relative to `CODEX_ORCH_PROGRAM_DIR`.
+                - Attach only files that materially help the assistant answer.
+                - Do not hand-write `assistant_request.json`; the CLI owns envelope fields such as `request_id`, `created_at`, and `requester_task_id`.
+
+                ## Runtime Env Vars
+
+                - `CODEX_ORCH_PROGRAM_DIR`
+                - `CODEX_ORCH_RUN_ID`
+                - `CODEX_ORCH_TASK_ID`
+                - `CODEX_ORCH_NODE_DIR`
+                - `CODEX_ORCH_PROJECT_WORKSPACE_DIR`
+                - `CODEX_ORCH_WORKSPACE_DIR`
+
+                ## Continuation Semantics
+
+                - If this task has no effective assistant profile, request creation fails immediately.
+                - An `auto_reply` is reinjected only into this task continuation when the run resumes.
+                - A `handoff_to_human` reply creates `manual_gate.json` and `human_request.json`; this node waits for a human answer and approval.
+                - Downstream tasks do not automatically receive the assistant or human answer unless this task publishes new artifacts that encode the decision.
+                """
+            ).rstrip()
+            + "\n",
+            encoding="utf-8",
+        )
 
     def _resolve_project_workspace_dir(self, project: ProjectSpec) -> Path:
         return Path(project.workspace).resolve()

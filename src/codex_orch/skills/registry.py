@@ -17,10 +17,13 @@ def list_builtin_skills() -> list[BuiltinSkill]:
     root = Path(__file__).resolve().parent
     return [
         BuiltinSkill(
-            skill_id="request-assistant",
-            resource_dir=root / "request_assistant",
-            export_dir_name="request-assistant",
-            description="Create assistant requests without hand-writing protocol envelopes.",
+            skill_id="operate-codex-orch",
+            resource_dir=root / "operate_codex_orch",
+            export_dir_name="operate-codex-orch",
+            description=(
+                "Operate codex-orch programs from the terminal, including runs, "
+                "assistant inbox, and manual gates."
+            ),
         )
     ]
 

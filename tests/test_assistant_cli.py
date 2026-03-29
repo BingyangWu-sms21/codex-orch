@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -168,13 +170,85 @@ def test_assistant_request_create_fails_without_profile(tmp_path: Path) -> None:
     assert "has no effective assistant profile" in request_result.output
 
 
+def test_cli_version_flag() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == package_version("codex-orch")
+
+
 def test_skill_export_and_install_cli(tmp_path: Path) -> None:
     runner = CliRunner()
     export_root = tmp_path / "exported-skills"
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
+    list_result = runner.invoke(app, ["skill", "list", "--json"])
+    assert list_result.exit_code == 0
+    skills = json.loads(list_result.stdout)
+    assert any(skill["id"] == "operate-codex-orch" for skill in skills)
+    assert all(skill["id"] != "request-assistant" for skill in skills)
+
     export_result = runner.invoke(
+        app,
+        [
+            "skill",
+            "export",
+            "operate-codex-orch",
+            str(export_root),
+            "--json",
+        ],
+    )
+    assert export_result.exit_code == 0
+    exported_skill_dir = export_root / "operate-codex-orch"
+    assert exported_skill_dir.exists()
+    assert (exported_skill_dir / "SKILL.md").exists()
+    assert (exported_skill_dir / "references" / "quickstart.md").exists()
+    assert (exported_skill_dir / "references" / "operator-runbook.md").exists()
+    assert not (exported_skill_dir / "scripts").exists()
+    exported_skill_text = (exported_skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    exported_quickstart_text = (
+        exported_skill_dir / "references" / "quickstart.md"
+    ).read_text(encoding="utf-8")
+    exported_runbook_text = (
+        exported_skill_dir / "references" / "operator-runbook.md"
+    ).read_text(encoding="utf-8")
+    assert "pipx install codex-orch" in exported_skill_text
+    assert "codex-orch --version" in exported_skill_text
+    assert "Assume your current working directory is the target codex-orch program" in exported_skill_text
+    assert "pipx install codex-orch" in exported_quickstart_text
+    assert "codex-orch task list ." in exported_quickstart_text
+    assert "codex-orch assistant request list . --json" in exported_runbook_text
+    assert "uv run codex-orch" not in exported_skill_text
+    assert "uv run codex-orch" not in exported_quickstart_text
+    assert "uv run codex-orch" not in exported_runbook_text
+
+    install_result = runner.invoke(
+        app,
+        [
+            "skill",
+            "install",
+            "operate-codex-orch",
+            "--repo-dir",
+            str(repo_root),
+            "--json",
+        ],
+    )
+    assert install_result.exit_code == 0
+    installed_skill_dir = repo_root / ".codex" / "skills" / "operate-codex-orch"
+    assert installed_skill_dir.exists()
+    assert (installed_skill_dir / "references" / "quickstart.md").exists()
+    assert (installed_skill_dir / "references" / "operator-runbook.md").exists()
+    assert not (installed_skill_dir / "scripts").exists()
+    installed_quickstart_text = (
+        installed_skill_dir / "references" / "quickstart.md"
+    ).read_text(encoding="utf-8")
+    assert "pipx install codex-orch" in installed_quickstart_text
+    assert "uv run codex-orch" not in installed_quickstart_text
+
+    legacy_export_result = runner.invoke(
         app,
         [
             "skill",
@@ -184,26 +258,4 @@ def test_skill_export_and_install_cli(tmp_path: Path) -> None:
             "--json",
         ],
     )
-    assert export_result.exit_code == 0
-    exported_skill_dir = export_root / "request-assistant"
-    assert exported_skill_dir.exists()
-    assert (exported_skill_dir / "SKILL.md").exists()
-    assert (
-        exported_skill_dir / "scripts" / "request_assistant.sh"
-    ).read_text(encoding="utf-8").startswith("#!/usr/bin/env bash")
-
-    install_result = runner.invoke(
-        app,
-        [
-            "skill",
-            "install",
-            "request-assistant",
-            "--repo-dir",
-            str(repo_root),
-            "--json",
-        ],
-    )
-    assert install_result.exit_code == 0
-    installed_skill_dir = repo_root / ".codex" / "skills" / "request-assistant"
-    assert installed_skill_dir.exists()
-    assert (installed_skill_dir / "references" / "protocol.md").exists()
+    assert legacy_export_result.exit_code != 0

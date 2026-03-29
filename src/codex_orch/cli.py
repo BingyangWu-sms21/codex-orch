@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import json
+import os
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 
 import typer
@@ -62,6 +63,29 @@ assistant_app.add_typer(assistant_action_app, name="action")
 app.add_typer(assistant_app, name="assistant")
 app.add_typer(manual_gate_app, name="manual-gate")
 app.add_typer(skill_app, name="skill")
+
+
+def _version_callback(value: bool) -> None:
+    if not value:
+        return
+    try:
+        typer.echo(package_version("codex-orch"))
+    except PackageNotFoundError:
+        typer.echo("unknown")
+    raise typer.Exit()
+
+
+@app.callback()
+def app_callback(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show codex-orch version and exit.",
+    ),
+) -> None:
+    del version
 
 
 def _store(program_dir: Path) -> ProjectStore:

@@ -20,7 +20,7 @@ concurrency, and run metadata.
   `assistant_request.json`, `assistant_response.json`, `assistant_control_action.json`
 - Manual-gate protocol:
   `manual_gate.json`, `human_request.json`, `human_response.json`
-- Bundled `request-assistant` Codex skill with explicit export/install commands
+- Built-in worker assistant escalation contract plus bundled `operate-codex-orch` operator skill
 - Local web board for task lists, kanban, dependency graph, presets, runs, assistant inbox, and manual gates
 
 ## Repository layout
@@ -49,19 +49,37 @@ codex-programs/my-program/
 
 ## Quick start
 
+For local development in this repository:
+
 ```bash
 uv sync --extra dev
 uv run codex-orch task list /path/to/program
 uv run codex-orch web /path/to/program
 ```
 
-## Assistant helper commands
-
-Worker-side assistant requests are intended to be wrapped by a Codex skill, but
-the stable contract is the CLI helper:
+For operators working from a codex-orch program directory after the package is
+published to PyPI:
 
 ```bash
-uv run codex-orch assistant request create \
+pipx install codex-orch
+codex-orch --version
+codex-orch task list .
+```
+
+## Assistant helper flow
+
+Worker-side assistant escalation is built into each node's runtime prompt plus a
+node-local helper doc at:
+
+```text
+.runs/<run-id>/nodes/<task-id>/context/assistant/requesting-help.md
+```
+
+Workers should use the stable CLI helper instead of hand-writing protocol
+files:
+
+```bash
+codex-orch assistant request create \
   --program-dir /path/to/program \
   --run-id 20260319010101-deadbeef \
   --task-id executeRefactor \
@@ -78,11 +96,21 @@ When a worker runs inside `codex-orch`, the helper can infer:
 - `CODEX_ORCH_RUN_ID`
 - `CODEX_ORCH_TASK_ID`
 - `CODEX_ORCH_NODE_DIR`
+- `CODEX_ORCH_PROJECT_WORKSPACE_DIR`
+- `CODEX_ORCH_WORKSPACE_DIR`
+
+Assistant artifacts passed with `--artifact` must be relative to
+`CODEX_ORCH_PROGRAM_DIR`.
+
+An `auto_reply` is reinjected only into the same task continuation on resume. A
+`handoff_to_human` reply materializes `manual_gate.json` and
+`human_request.json` for that node and pauses execution until a human responds
+and the gate is approved or rejected.
 
 Assistant or human responses are written back with:
 
 ```bash
-uv run codex-orch assistant respond /path/to/program <request-id> \
+codex-orch assistant respond /path/to/program <request-id> \
   --resolution-kind auto_reply \
   --answer "Delete it." \
   --rationale "The repository does not need compatibility wrappers."
@@ -91,7 +119,7 @@ uv run codex-orch assistant respond /path/to/program <request-id> \
 Control-plane actions are stored separately from replies:
 
 ```bash
-uv run codex-orch assistant action create /path/to/program <request-id> \
+codex-orch assistant action create /path/to/program <request-id> \
   --action-kind append_guidance_proposal \
   --requested-by assistant \
   --target-kind user_guidance \
@@ -101,21 +129,26 @@ uv run codex-orch assistant action create /path/to/program <request-id> \
 
 ## Skill export
 
-`codex-orch` ships a canonical `request-assistant` skill template. Export it
-into any target directory or install it into a repo-local `.codex/skills/`
-folder explicitly:
+`codex-orch` ships a canonical `operate-codex-orch` skill template for
+external or user-controlled agents operating a program from outside a worker
+node. It is not the worker-side escalation mechanism. The skill assumes the
+operator is in the target program directory and that `codex-orch` was installed
+separately, typically with `pipx install codex-orch`.
+
+Maintainers can still export it from this repository or install it into a
+repo-local `.codex/skills/` folder explicitly:
 
 ```bash
 uv run codex-orch skill list
-uv run codex-orch skill export request-assistant /tmp/exported-skills
-uv run codex-orch skill install request-assistant --repo-dir /path/to/repo
+uv run codex-orch skill export operate-codex-orch /tmp/exported-skills
+uv run codex-orch skill install operate-codex-orch --repo-dir /path/to/repo
 ```
 
 The exported skill contains:
 
 - `SKILL.md`
-- `scripts/request_assistant.sh`
-- `references/protocol.md`
+- `references/quickstart.md`
+- `references/operator-runbook.md`
 
 ## Manual gates
 
@@ -129,11 +162,11 @@ materializes:
 The CLI exposes the minimal human-control surface:
 
 ```bash
-uv run codex-orch manual-gate list /path/to/program
-uv run codex-orch manual-gate show /path/to/program <gate-id>
-uv run codex-orch manual-gate respond /path/to/program <gate-id> \
+codex-orch manual-gate list /path/to/program
+codex-orch manual-gate show /path/to/program <gate-id>
+codex-orch manual-gate respond /path/to/program <gate-id> \
   --answer "Delete the wrapper."
-uv run codex-orch manual-gate approve /path/to/program <gate-id> --resume
+codex-orch manual-gate approve /path/to/program <gate-id> --resume
 ```
 
 The web UI exposes the same flow at `/manual-gates`.
