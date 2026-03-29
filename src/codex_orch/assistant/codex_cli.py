@@ -105,10 +105,14 @@ class CodexCliAssistantBackend:
         sandbox = request.profile.spec.sandbox
         if sandbox == "workspace-write":
             command.append("--full-auto")
+            for visible_root in self._command_visible_roots(request):
+                command.extend(["--add-dir", str(visible_root)])
         elif sandbox == "danger-full-access":
             command.append("--dangerously-bypass-approvals-and-sandbox")
         else:
             command.extend(["--sandbox", sandbox])
+            for visible_root in self._command_visible_roots(request):
+                command.extend(["--add-dir", str(visible_root)])
         if request.profile.spec.model is not None:
             command.extend(["--model", request.profile.spec.model])
         command.extend(["--output-schema", str(schema_path), prompt])
@@ -124,6 +128,8 @@ class CodexCliAssistantBackend:
                 "CODEX_ORCH_ASSISTANT_PROFILE_ID": request.profile.spec.id,
                 "CODEX_ORCH_ASSISTANT_PROFILE_DIR": str(request.profile.profile_dir),
                 "CODEX_ORCH_ASSISTANT_WORKSPACE_DIR": str(request.profile.workspace_dir),
+                "CODEX_ORCH_RUN_DIR": str(self._run_dir(request)),
+                "CODEX_ORCH_RUN_NODES_DIR": str(self._run_nodes_dir(request)),
             }
         )
         return env
@@ -144,14 +150,11 @@ class CodexCliAssistantBackend:
     def _build_prompt(self, request: AssistantBackendRequest) -> str:
         instructions = request.profile.instructions_path.read_text(encoding="utf-8").strip()
         metadata_lines = [
-            f"- profile_id: {request.profile.spec.id}",
-            f"- backend: {request.profile.spec.backend.value}",
             f"- project_name: {request.project.name}",
             f"- run_id: {request.assistant_request.run_id}",
             f"- requester_task_id: {request.task.id}",
             f"- requester_task_title: {request.task.title}",
             f"- requester_task_agent: {request.task.agent}",
-            f"- request_id: {request.assistant_request.request_id}",
             f"- request_kind: {request.assistant_request.request_kind.value}",
             f"- decision_kind: {request.assistant_request.decision_kind.value}",
             f"- priority: {request.assistant_request.priority.value}",
@@ -190,11 +193,25 @@ class CodexCliAssistantBackend:
                 )
             )
 
+        requester_node_dir = self._run_nodes_dir(request) / request.task.id
+        accessible_paths = [
+            f"- assistant_profile_workspace: `{request.profile.workspace_dir}`",
+            f"- program_dir: `{request.program_dir}`",
+            f"- run_dir: `{self._run_dir(request)}`",
+            f"- run_nodes_dir: `{self._run_nodes_dir(request)}`",
+            f"- requester_node_dir: `{requester_node_dir}`",
+            (
+                "- Use the assistant profile workspace for persistent notes and preferences. "
+                "Treat the program and run directories as observational context and do not modify them while answering this request."
+            ),
+        ]
         sections = [
             "# Assistant Profile Instructions",
             instructions or "(no profile instructions provided)",
             "# Run Context",
             "\n".join(metadata_lines),
+            "# Accessible Paths",
+            "\n".join(accessible_paths),
             "# Assistant Request",
             request.assistant_request.question.strip(),
             "# Artifact Context",
@@ -213,6 +230,30 @@ class CodexCliAssistantBackend:
             ),
         ]
         return "\n\n".join(section for section in sections if section)
+
+    def _command_visible_roots(
+        self,
+        request: AssistantBackendRequest,
+    ) -> tuple[Path, ...]:
+        candidates = [
+            request.program_dir,
+            self._run_nodes_dir(request),
+        ]
+        deduped: list[Path] = []
+        seen: set[str] = {str(request.profile.workspace_dir)}
+        for path in candidates:
+            normalized = str(path)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(path)
+        return tuple(deduped)
+
+    def _run_dir(self, request: AssistantBackendRequest) -> Path:
+        return request.program_dir / ".runs" / request.assistant_request.run_id
+
+    def _run_nodes_dir(self, request: AssistantBackendRequest) -> Path:
+        return self._run_dir(request) / "nodes"
 
     def _extract_final_agent_message(self, stdout: str) -> str:
         final_message = ""

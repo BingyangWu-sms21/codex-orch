@@ -7,12 +7,13 @@ from typer.testing import CliRunner
 from codex_orch.cli import app
 from codex_orch.domain import TaskSpec, TaskStatus
 from codex_orch.scheduler import RunService
-from tests.helpers import build_test_store
+from tests.helpers import build_test_store, write_assistant_profile
 from tests.test_run_service import FakeRunner
 
 
 def test_assistant_cli_round_trip(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
     store.save_task(
         TaskSpec(
             id="worker",
@@ -53,6 +54,7 @@ def test_assistant_cli_round_trip(tmp_path: Path) -> None:
             "keep_wrapper",
             "--json",
         ],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
     )
     assert request_result.exit_code == 0
     assert "\"request_id\"" in request_result.stdout
@@ -120,6 +122,50 @@ def test_assistant_cli_round_trip(tmp_path: Path) -> None:
     assert record.response.answer == "Delete it."
     assert record.control_action is not None
     assert record.control_action.status.value == "approved"
+
+
+def test_assistant_request_create_fails_without_profile(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    snapshot = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    runner = CliRunner()
+
+    request_result = runner.invoke(
+        app,
+        [
+            "assistant",
+            "request",
+            "create",
+            "--program-dir",
+            str(store.paths.root),
+            "--run-id",
+            snapshot.id,
+            "--task-id",
+            "worker",
+            "--kind",
+            "clarification",
+            "--decision-kind",
+            "policy",
+            "--question",
+            "Can I remove the wrapper?",
+        ],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+
+    assert request_result.exit_code != 0
+    assert "has no effective assistant profile" in request_result.output
 
 
 def test_skill_export_and_install_cli(tmp_path: Path) -> None:

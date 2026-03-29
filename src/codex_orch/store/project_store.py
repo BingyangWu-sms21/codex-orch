@@ -398,6 +398,11 @@ class ProjectStore:
         existing = self.maybe_get_assistant_request(run_id, task_id)
         if existing is not None:
             return existing
+        self._validate_assistant_request_target(
+            run_id=run_id,
+            task_id=task_id,
+            context_artifacts=context_artifacts,
+        )
         request = AssistantRequest(
             request_id=self._new_event_id(prefix="req"),
             run_id=run_id,
@@ -782,6 +787,27 @@ class ProjectStore:
             ManualGateStatus.WAITING_FOR_HUMAN,
             ManualGateStatus.ANSWERED,
         }
+
+    def _validate_assistant_request_target(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        context_artifacts: list[str],
+    ) -> None:
+        profile_id = self.resolve_assistant_profile_id(run_id, task_id)
+        if profile_id is None:
+            raise ValueError(
+                f"task {task_id} has no effective assistant profile"
+            )
+        self.load_assistant_profile(profile_id)
+        for relative_path in context_artifacts:
+            absolute_path = self.paths.root / relative_path
+            if absolute_path.exists():
+                continue
+            raise ValueError(
+                f"context artifact {relative_path} does not exist under program dir"
+            )
 
     def _task_path(self, task_id: str) -> Path:
         return self.paths.tasks_dir / f"{task_id}.yaml"

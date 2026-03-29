@@ -23,7 +23,7 @@ from codex_orch.domain import (
 )
 from codex_orch.runner import NodeExecutionRequest, NodeExecutionResult
 from codex_orch.scheduler import RunService
-from tests.helpers import build_test_store
+from tests.helpers import build_test_store, write_assistant_profile
 
 
 class FakeRunner:
@@ -76,7 +76,8 @@ def test_run_service_materializes_context_dependencies(tmp_path: Path) -> None:
         )
     )
 
-    service = RunService(store, FakeRunner())
+    runner = FakeRunner()
+    service = RunService(store, runner)
     snapshot = asyncio.run(service.start_run(roots=["implement"], labels=[], user_inputs=None))
 
     assert snapshot.status.value == "done"
@@ -87,6 +88,10 @@ def test_run_service_materializes_context_dependencies(tmp_path: Path) -> None:
     implement_final = (
         store.get_node_dir(snapshot.id, "implement") / "final.md"
     ).read_text(encoding="utf-8")
+    assert "## File Prompt: prompts/implement.md" in implement_final
+    assert "## Dependency Context: analyze/final.md" in implement_final
+    assert "## User Input: brief" in implement_final
+    assert "## Execution Contract" in implement_final
     assert "analysis result" in implement_final
     assert "brief input" in implement_final
 
@@ -128,12 +133,14 @@ def test_create_snapshot_rejects_invalid_from_dep_contract(tmp_path: Path) -> No
 
 def test_create_snapshot_materializes_workspace_and_writable_roots(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    (store.paths.root / "fresh-clone").mkdir()
     store.save_task(
         TaskSpec(
             id="refactor",
             title="Refactor",
             agent="worker",
             status=TaskStatus.READY,
+            sandbox="workspace-write",
             workspace="fresh-clone",
             extra_writable_roots=["tool-cache", "../env-source", "tool-cache"],
             compose=[{"kind": "file", "path": "prompts/implement.md"}],
@@ -157,12 +164,14 @@ def test_create_snapshot_materializes_workspace_and_writable_roots(tmp_path: Pat
 
 def test_run_service_uses_task_workspace_override(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    (store.paths.root / "fresh-clone").mkdir()
     store.save_task(
         TaskSpec(
             id="refactor",
             title="Refactor",
             agent="worker",
             status=TaskStatus.READY,
+            sandbox="workspace-write",
             workspace="fresh-clone",
             extra_writable_roots=["tool-cache"],
             compose=[{"kind": "file", "path": "prompts/implement.md"}],
@@ -186,6 +195,7 @@ def test_run_service_uses_task_workspace_override(tmp_path: Path) -> None:
 
 def test_resume_run_keeps_materialized_workspace_after_project_change(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    (store.paths.root / "fresh-clone").mkdir()
     store.save_task(
         TaskSpec(
             id="refactor",
@@ -212,7 +222,7 @@ def test_resume_run_keeps_materialized_workspace_after_project_change(tmp_path: 
     assert runner.requests["refactor"].workspace_dir == Path(original_workspace)
 
 
-def test_run_service_fails_when_runner_rejects_extra_writable_roots(tmp_path: Path) -> None:
+def test_create_snapshot_rejects_read_only_extra_writable_roots(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
     store.save_task(
         TaskSpec(
@@ -227,21 +237,42 @@ def test_run_service_fails_when_runner_rejects_extra_writable_roots(tmp_path: Pa
         )
     )
 
-    snapshot = asyncio.run(
-        RunService(store, RejectingRunner()).start_run(
+    with pytest.raises(
+        ValueError,
+        match="cannot use extra writable roots with read-only sandbox",
+    ):
+        RunService(store, RejectingRunner()).create_snapshot(
             roots=["refactor"],
             labels=[],
             user_inputs=None,
         )
+
+
+def test_create_snapshot_requires_existing_workspace_directory(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="refactor",
+            title="Refactor",
+            agent="worker",
+            status=TaskStatus.READY,
+            workspace="fresh-clone",
+            compose=[{"kind": "file", "path": "prompts/implement.md"}],
+            publish=["final.md"],
+        )
     )
 
-    assert snapshot.status is RunStatus.FAILED
-    assert snapshot.nodes["refactor"].status is RunNodeStatus.FAILED
-    assert snapshot.nodes["refactor"].error == "extra writable roots require a writable sandbox"
+    with pytest.raises(ValueError, match="workspace does not exist"):
+        RunService(store, FakeRunner()).create_snapshot(
+            roots=["refactor"],
+            labels=[],
+            user_inputs=None,
+        )
 
 
 def test_run_service_waits_for_assistant_reply(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
     store.save_task(
         TaskSpec(
             id="refactor",
@@ -253,7 +284,8 @@ def test_run_service_waits_for_assistant_reply(tmp_path: Path) -> None:
         )
     )
 
-    service = RunService(store, FakeRunner())
+    runner = FakeRunner()
+    service = RunService(store, runner)
     snapshot = service.create_snapshot(roots=["refactor"], labels=[], user_inputs=None)
     request = store.create_assistant_request(
         run_id=snapshot.id,
@@ -289,10 +321,95 @@ def test_run_service_waits_for_assistant_reply(tmp_path: Path) -> None:
     resumed_snapshot = asyncio.run(service.resume_run(snapshot.id))
     assert resumed_snapshot.status.value == "done"
     assert resumed_snapshot.nodes["refactor"].status.value == "done"
+    prompt = runner.prompts["refactor"]
+    assert "## Assistant Continuation Context" in prompt
+    assert "### Original Question\nCan I delete the legacy wrapper?" in prompt
+    assert "### Assistant Answer\nDelete it." in prompt
+    assert "### Assistant Rationale\nNo compatibility layer is needed." in prompt
+    assert "- ~/.codex/AGENTS.md" in prompt
+    assert "## Execution Contract" in prompt
+
+
+def test_run_service_does_not_inject_assistant_packet_into_downstream_task(
+    tmp_path: Path,
+) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
+    store.save_task(
+        TaskSpec(
+            id="analyze",
+            title="Analyze",
+            agent="explorer",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/analyze.md"}],
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="implement",
+            title="Implement",
+            agent="worker",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "analyze", "kind": "context", "consume": ["final.md"]}],
+            compose=[
+                {"kind": "file", "path": "prompts/implement.md"},
+                {"kind": "from_dep", "task": "analyze", "path": "final.md"},
+            ],
+            publish=["final.md"],
+        )
+    )
+
+    runner = FakeRunner()
+    service = RunService(store, runner)
+    snapshot = service.create_snapshot(roots=["implement"], labels=[], user_inputs=None)
+    request = store.create_assistant_request(
+        run_id=snapshot.id,
+        task_id="analyze",
+        request_kind=RequestKind.CLARIFICATION,
+        question="Should I delete the legacy wrapper?",
+        decision_kind=DecisionKind.POLICY,
+        options=["delete", "keep_wrapper"],
+        context_artifacts=[],
+        requested_control_actions=[],
+        priority=RequestPriority.HIGH,
+    )
+
+    waiting_snapshot = asyncio.run(service.run_snapshot(snapshot.id))
+    assert waiting_snapshot.status.value == "waiting"
+    assert waiting_snapshot.nodes["analyze"].status.value == "waiting"
+    assert waiting_snapshot.nodes["implement"].status.value == "pending"
+
+    store.save_assistant_response_by_request_id(
+        request.request_id,
+        resolution_kind=ResolutionKind.AUTO_REPLY,
+        answer="Delete it.",
+        rationale="No compatibility layer is needed.",
+        confidence=ConfidenceLevel.HIGH,
+        citations=["~/.codex/AGENTS.md"],
+        proposed_guidance_updates=[],
+        proposed_control_actions=[],
+    )
+
+    resumed_snapshot = asyncio.run(service.resume_run(snapshot.id))
+    assert resumed_snapshot.status.value == "done"
+    assert resumed_snapshot.nodes["analyze"].status.value == "done"
+    assert resumed_snapshot.nodes["implement"].status.value == "done"
+
+    analyze_prompt = runner.prompts["analyze"]
+    implement_prompt = runner.prompts["implement"]
+    assert "## Assistant Continuation Context" in analyze_prompt
+    assert "Delete it." in analyze_prompt
+    assert "## Assistant Continuation Context" not in implement_prompt
+    assert "Delete it." not in implement_prompt
 
 
 def test_run_service_resumes_after_manual_gate_approval(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
+    legacy_doc = store.paths.root / "docs" / "legacy-wrapper.md"
+    legacy_doc.parent.mkdir(parents=True, exist_ok=True)
+    legacy_doc.write_text("Legacy wrapper notes.\n", encoding="utf-8")
     store.save_task(
         TaskSpec(
             id="refactor",
@@ -369,6 +486,10 @@ def test_run_service_does_not_inject_manual_gate_packet_into_downstream_task(
     tmp_path: Path,
 ) -> None:
     store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
+    legacy_doc = store.paths.root / "docs" / "legacy-wrapper.md"
+    legacy_doc.parent.mkdir(parents=True, exist_ok=True)
+    legacy_doc.write_text("Legacy wrapper notes.\n", encoding="utf-8")
     store.save_task(
         TaskSpec(
             id="analyze",
@@ -448,6 +569,7 @@ def test_run_service_does_not_inject_manual_gate_packet_into_downstream_task(
 
 def test_run_service_fails_after_manual_gate_rejection(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
     store.save_task(
         TaskSpec(
             id="refactor",
@@ -624,6 +746,7 @@ def test_abort_run_marks_active_nodes_failed(tmp_path: Path) -> None:
 
 def test_reconcile_ignores_waiting_assistant_node(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
     store.save_task(
         TaskSpec(
             id="refactor",

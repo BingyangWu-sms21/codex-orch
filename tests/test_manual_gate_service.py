@@ -13,12 +13,13 @@ from codex_orch.domain import (
     TaskStatus,
 )
 from codex_orch.scheduler import RunService
-from tests.helpers import build_test_store
+from tests.helpers import build_test_store, write_assistant_profile
 from tests.test_run_service import FakeRunner
 
 
 def test_handoff_response_materializes_manual_gate_artifacts(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
     store.save_task(
         TaskSpec(
             id="worker",

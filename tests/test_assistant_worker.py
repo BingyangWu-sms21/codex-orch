@@ -4,13 +4,14 @@ import asyncio
 import json
 from pathlib import Path
 
-import yaml
+import pytest
 from typer.testing import CliRunner
 
 from codex_orch import cli as cli_module
 from codex_orch.assistant import AssistantBackendRequest, AssistantBackendResult, AssistantWorkerService
 from codex_orch.cli import app
 from codex_orch.domain import (
+    AssistantRequest,
     ConfidenceLevel,
     DecisionKind,
     ManualGateStatus,
@@ -22,7 +23,7 @@ from codex_orch.domain import (
     TaskStatus,
 )
 from codex_orch.scheduler import RunService
-from tests.helpers import build_test_store
+from tests.helpers import build_test_store, write_assistant_profile
 from tests.test_run_service import FakeRunner
 
 
@@ -36,31 +37,108 @@ class RecordingAssistantBackend:
         return self.result
 
 
-def _write_profile(
-    store,
-    profile_id: str,
-    *,
-    title: str | None = None,
-    instructions: str = "Prefer concise answers.",
+def test_create_assistant_request_requires_effective_profile(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/implement.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    snapshot = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+
+    with pytest.raises(ValueError, match="has no effective assistant profile"):
+        store.create_assistant_request(
+            run_id=snapshot.id,
+            task_id="worker",
+            request_kind=RequestKind.CLARIFICATION,
+            question="Should I keep the wrapper?",
+            decision_kind=DecisionKind.POLICY,
+            options=["keep", "delete"],
+            context_artifacts=[],
+            requested_control_actions=[],
+            priority=RequestPriority.NORMAL,
+        )
+
+
+def test_create_assistant_request_requires_existing_context_artifact(
+    tmp_path: Path,
 ) -> None:
-    profile_dir = store.get_profile_dir(profile_id)
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    store.get_profile_spec_path(profile_id).write_text(
-        yaml.safe_dump(
-            {
-                "id": profile_id,
-                "title": title or profile_id,
-                "backend": "codex_cli",
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
+    store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/implement.md"}],
+            publish=["final.md"],
+        )
     )
-    store.get_profile_instructions_path(profile_id).write_text(
-        instructions + "\n",
-        encoding="utf-8",
+
+    snapshot = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
     )
-    store.get_profile_workspace_dir(profile_id)
+
+    with pytest.raises(ValueError, match="context artifact missing.md does not exist"):
+        store.create_assistant_request(
+            run_id=snapshot.id,
+            task_id="worker",
+            request_kind=RequestKind.CLARIFICATION,
+            question="Should I keep the wrapper?",
+            decision_kind=DecisionKind.POLICY,
+            options=["keep", "delete"],
+            context_artifacts=["missing.md"],
+            requested_control_actions=[],
+            priority=RequestPriority.NORMAL,
+        )
+
+
+def test_create_assistant_request_requires_loadable_profile(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
+    store.get_profile_instructions_path("assistant-default").unlink()
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            compose=[{"kind": "file", "path": "prompts/implement.md"}],
+            publish=["final.md"],
+        )
+    )
+
+    snapshot = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+
+    with pytest.raises(KeyError, match="missing instructions.md"):
+        store.create_assistant_request(
+            run_id=snapshot.id,
+            task_id="worker",
+            request_kind=RequestKind.CLARIFICATION,
+            question="Should I keep the wrapper?",
+            decision_kind=DecisionKind.POLICY,
+            options=["keep", "delete"],
+            context_artifacts=[],
+            requested_control_actions=[],
+            priority=RequestPriority.NORMAL,
+        )
 
 
 def test_assistant_worker_skips_request_without_effective_profile(tmp_path: Path) -> None:
@@ -78,9 +156,10 @@ def test_assistant_worker_skips_request_without_effective_profile(tmp_path: Path
 
     run_service = RunService(store, FakeRunner())
     snapshot = run_service.create_snapshot(roots=["worker"], labels=[], user_inputs=None)
-    request = store.create_assistant_request(
+    request = AssistantRequest(
+        request_id="req_legacy",
         run_id=snapshot.id,
-        task_id="worker",
+        requester_task_id="worker",
         request_kind=RequestKind.CLARIFICATION,
         question="Should I keep the wrapper?",
         decision_kind=DecisionKind.POLICY,
@@ -89,6 +168,7 @@ def test_assistant_worker_skips_request_without_effective_profile(tmp_path: Path
         requested_control_actions=[],
         priority=RequestPriority.NORMAL,
     )
+    store.save_assistant_request(snapshot.id, "worker", request)
     asyncio.run(run_service.run_snapshot(snapshot.id))
 
     backend = RecordingAssistantBackend(
@@ -111,8 +191,8 @@ def test_assistant_worker_skips_request_without_effective_profile(tmp_path: Path
 
 def test_assistant_worker_prefers_task_profile_over_project_default(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
-    _write_profile(store, "project-default")
-    _write_profile(store, "task-override")
+    write_assistant_profile(store, "project-default")
+    write_assistant_profile(store, "task-override")
     project = store.load_project()
     store.save_project(
         project.model_copy(update={"default_assistant_profile": "project-default"})
@@ -171,7 +251,7 @@ def test_assistant_worker_prefers_task_profile_over_project_default(tmp_path: Pa
 
 def test_assistant_worker_handoff_materializes_manual_gate(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
-    _write_profile(store, "assistant-default")
+    write_assistant_profile(store, "assistant-default")
     project = store.load_project()
     store.save_project(
         project.model_copy(update={"default_assistant_profile": "assistant-default"})
@@ -227,7 +307,7 @@ def test_assistant_worker_cli_once_auto_replies_and_resumes_run(
     monkeypatch,
 ) -> None:
     store = build_test_store(tmp_path)
-    _write_profile(store, "assistant-default")
+    write_assistant_profile(store, "assistant-default")
     project = store.load_project()
     store.save_project(
         project.model_copy(update={"default_assistant_profile": "assistant-default"})

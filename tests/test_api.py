@@ -14,7 +14,7 @@ from codex_orch.domain import (
 )
 from codex_orch.scheduler import RunService
 from codex_orch.store import ProjectStore
-from tests.helpers import build_test_store
+from tests.helpers import build_test_store, write_assistant_profile
 from tests.test_run_service import FakeRunner
 
 
@@ -122,6 +122,7 @@ def test_graph_page_renders_existing_edges(tmp_path: Path) -> None:
 
 def test_assistant_page_and_response_form(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    write_assistant_profile(store, set_as_default=True)
     store.save_task(
         TaskSpec(
             id="worker",

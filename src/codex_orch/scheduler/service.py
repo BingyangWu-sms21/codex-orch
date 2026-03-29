@@ -452,13 +452,6 @@ class RunService:
             user_inputs=user_inputs,
             dependency_node_dirs=dependency_dirs,
         )
-        manual_gate_appendix = self._manual_gate_prompt_appendix(run_id, task.id)
-        if manual_gate_appendix is not None:
-            prompt = (
-                f"{prompt}\n\n{manual_gate_appendix}"
-                if prompt
-                else manual_gate_appendix
-            )
         node_dir = self.store.get_node_dir(run_id, task.id)
         project_workspace_dir = self._resolve_project_workspace_dir(project)
         workspace_dir = self._resolve_task_workspace_dir(project, task)
@@ -466,6 +459,19 @@ class RunService:
             Path(root)
             for root in self._resolve_task_extra_writable_roots(task, workspace_dir)
         )
+        appendices = [
+            self._execution_contract_appendix(
+                task=task,
+                node_dir=node_dir,
+                project_workspace_dir=project_workspace_dir,
+                workspace_dir=workspace_dir,
+                extra_writable_roots=extra_writable_roots,
+            ),
+            self._assistant_auto_reply_prompt_appendix(run_id, task.id),
+            self._manual_gate_prompt_appendix(run_id, task.id),
+        ]
+        prompt_sections = [prompt, *appendices]
+        prompt = "\n\n".join(section for section in prompt_sections if section)
         return await self.runner.run(
             NodeExecutionRequest(
                 run_id=run_id,
@@ -753,6 +759,98 @@ class RunService:
             ManualGateStatus.APPLIED,
         )
 
+    def _execution_contract_appendix(
+        self,
+        *,
+        task: TaskSpec,
+        node_dir: Path,
+        project_workspace_dir: Path,
+        workspace_dir: Path,
+        extra_writable_roots: tuple[Path, ...],
+    ) -> str:
+        sandbox = task.sandbox or "workspace-write"
+        sections = [
+            "## Execution Contract",
+            "\n".join(
+                [
+                    f"- workspace_dir (cwd): `{workspace_dir}`",
+                    f"- project_workspace_dir: `{project_workspace_dir}`",
+                    f"- node_dir: `{node_dir}`",
+                    f"- sandbox: `{sandbox}`",
+                ]
+            ),
+        ]
+        writable_roots = self._declared_writable_roots(
+            sandbox=sandbox,
+            workspace_dir=workspace_dir,
+            node_dir=node_dir,
+            extra_writable_roots=extra_writable_roots,
+        )
+        if writable_roots is None:
+            sections.append(
+                "### Writable Roots\n- unrestricted via `danger-full-access` sandbox"
+            )
+        elif writable_roots:
+            sections.append(
+                "### Writable Roots\n"
+                + "\n".join(f"- `{root}`" for root in writable_roots)
+            )
+        else:
+            sections.append("### Writable Roots\n- none")
+        sections.append(
+            "### Publish Targets\n"
+            + "\n".join(f"- `{path}`" for path in task.publish)
+        )
+        if task.result_schema is not None:
+            sections.append(f"### Result Schema\n- `{task.result_schema}`")
+        sections.append(
+            "\n".join(
+                [
+                    "### Assistant Helper Contract",
+                    "- Use `codex-orch assistant request create` to create assistant requests.",
+                    "- Runtime env vars are available: `CODEX_ORCH_PROGRAM_DIR`, `CODEX_ORCH_RUN_ID`, `CODEX_ORCH_TASK_ID`, `CODEX_ORCH_NODE_DIR`, `CODEX_ORCH_PROJECT_WORKSPACE_DIR`, `CODEX_ORCH_WORKSPACE_DIR`.",
+                    "- Pass assistant artifact paths relative to `CODEX_ORCH_PROGRAM_DIR`.",
+                ]
+            )
+        )
+        return "\n\n".join(sections)
+
+    def _assistant_auto_reply_prompt_appendix(
+        self, run_id: str, task_id: str
+    ) -> str | None:
+        request = self.store.maybe_get_assistant_request(run_id, task_id)
+        if request is None:
+            return None
+        response = self.store.maybe_get_assistant_response(run_id, task_id)
+        if response is None:
+            return None
+        if response.resolution_kind is not ResolutionKind.AUTO_REPLY:
+            return None
+
+        sections = [
+            "## Assistant Continuation Context",
+            (
+                "Apply this assistant answer only to this task continuation. "
+                "Use it as the resolved assistant guidance for this task."
+            ),
+            f"### Original Question\n{request.question.rstrip()}",
+            f"### Assistant Answer\n{response.answer.rstrip()}",
+            f"### Assistant Rationale\n{response.rationale.rstrip()}",
+        ]
+        if response.citations:
+            sections.append(
+                "### Citations\n"
+                + "\n".join(f"- {citation}" for citation in response.citations)
+            )
+        if request.context_artifacts:
+            sections.append(
+                "### Context Artifacts\n"
+                + "\n".join(
+                    f"- `{artifact}`" for artifact in request.context_artifacts
+                )
+            )
+        return "\n\n".join(sections)
+
     def _manual_gate_prompt_appendix(self, run_id: str, task_id: str) -> str | None:
         gate = self.store.maybe_get_manual_gate(run_id, task_id)
         if gate is None:
@@ -791,6 +889,29 @@ class RunService:
                 )
             )
         return "\n\n".join(sections)
+
+    def _declared_writable_roots(
+        self,
+        *,
+        sandbox: str,
+        workspace_dir: Path,
+        node_dir: Path,
+        extra_writable_roots: tuple[Path, ...],
+    ) -> tuple[Path, ...] | None:
+        if sandbox == "danger-full-access":
+            return None
+        if sandbox == "read-only":
+            return tuple()
+        candidates = [workspace_dir, node_dir, *extra_writable_roots]
+        deduped: list[Path] = []
+        seen: set[str] = set()
+        for path in candidates:
+            normalized = str(path)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(path)
+        return tuple(deduped)
 
     def _wait_reason_message(self, reason: RunNodeWaitReason) -> str:
         if reason is RunNodeWaitReason.ASSISTANT_PENDING:
@@ -877,6 +998,7 @@ class RunService:
         )
 
     def _materialize_task(self, project: ProjectSpec, task: TaskSpec) -> TaskSpec:
+        effective_sandbox = task.sandbox or project.default_sandbox
         updates: dict[str, object] = {}
         if (
             task.assistant_profile is None
@@ -888,10 +1010,22 @@ class RunService:
         if task.model is None and project.default_model is not None:
             updates["model"] = project.default_model
         workspace_dir = self._resolve_task_workspace_dir(project, task)
+        if not workspace_dir.exists():
+            raise ValueError(
+                f"task {task.id} workspace does not exist: {workspace_dir}"
+            )
+        if not workspace_dir.is_dir():
+            raise ValueError(
+                f"task {task.id} workspace is not a directory: {workspace_dir}"
+            )
         workspace = str(workspace_dir)
         if task.workspace != workspace:
             updates["workspace"] = workspace
         extra_writable_roots = self._resolve_task_extra_writable_roots(task, workspace_dir)
+        if effective_sandbox == "read-only" and extra_writable_roots:
+            raise ValueError(
+                f"task {task.id} cannot use extra writable roots with read-only sandbox"
+            )
         if task.extra_writable_roots != extra_writable_roots:
             updates["extra_writable_roots"] = extra_writable_roots
         if not updates:

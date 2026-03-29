@@ -65,7 +65,7 @@ app.add_typer(skill_app, name="skill")
 
 
 def _store(program_dir: Path) -> ProjectStore:
-    return ProjectStore(program_dir)
+    return ProjectStore(program_dir, global_root=_resolve_global_root())
 
 
 def _task_pool(program_dir: Path) -> TaskPoolService:
@@ -106,6 +106,13 @@ def _resolve_program_dir(program_dir: Path | None) -> Path:
     if raw:
         return Path(raw)
     raise typer.BadParameter("program directory is required or set CODEX_ORCH_PROGRAM_DIR")
+
+
+def _resolve_global_root() -> Path | None:
+    raw = os.environ.get("CODEX_ORCH_GLOBAL_ROOT")
+    if not raw:
+        return None
+    return Path(raw)
 
 
 def _resolve_run_id(run_id: str | None) -> str:
@@ -475,19 +482,22 @@ def assistant_request_create(
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     resolved_program_dir = _resolve_program_dir(program_dir)
-    request = _store(resolved_program_dir).create_assistant_request(
-        run_id=_resolve_run_id(run_id),
-        task_id=_resolve_task_id(task_id),
-        request_kind=kind,
-        question=_read_text_input(question, question_file, field="question"),
-        decision_kind=decision_kind,
-        options=[] if option is None else option,
-        context_artifacts=[] if artifact is None else artifact,
-        requested_control_actions=[]
-        if requested_action is None
-        else requested_action,
-        priority=priority,
-    )
+    try:
+        request = _store(resolved_program_dir).create_assistant_request(
+            run_id=_resolve_run_id(run_id),
+            task_id=_resolve_task_id(task_id),
+            request_kind=kind,
+            question=_read_text_input(question, question_file, field="question"),
+            decision_kind=decision_kind,
+            options=[] if option is None else option,
+            context_artifacts=[] if artifact is None else artifact,
+            requested_control_actions=[]
+            if requested_action is None
+            else requested_action,
+            priority=priority,
+        )
+    except (KeyError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if as_json:
         _print_json(request.model_dump(mode="json"))
         return
