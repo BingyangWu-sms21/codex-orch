@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from codex_orch.compose_refs import parse_compose_ref
 from codex_orch.domain.assistant import DecisionKind
 
 
@@ -24,6 +24,11 @@ class TaskStatus(StrEnum):
     ARCHIVED = "archived"
 
 
+class TaskKind(StrEnum):
+    WORK = "work"
+    CONTROLLER = "controller"
+
+
 class DependencyKind(StrEnum):
     CONTEXT = "context"
     ORDER = "order"
@@ -31,24 +36,8 @@ class DependencyKind(StrEnum):
 
 class ComposeStepKind(StrEnum):
     FILE = "file"
-    USER_INPUT = "user_input"
-    FROM_DEP = "from_dep"
+    REF = "ref"
     LITERAL = "literal"
-
-
-class RunNodeStatus(StrEnum):
-    PENDING = "pending"
-    RUNNING = "running"
-    WAITING = "waiting"
-    DONE = "done"
-    FAILED = "failed"
-    SKIPPED = "skipped"
-
-
-class RunNodeWaitReason(StrEnum):
-    ASSISTANT_PENDING = "assistant_pending"
-    HANDOFF_TO_HUMAN = "handoff_to_human"
-    MANUAL_GATE_BLOCKED = "manual_gate_blocked"
 
 
 class RunStatus(StrEnum):
@@ -116,9 +105,12 @@ class ProjectSpec(BaseModel):
 
 
 class DependencyEdge(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     task: str
     kind: DependencyKind
     consume: list[str] = Field(default_factory=list)
+    as_: str | None = Field(default=None, alias="as")
 
     @model_validator(mode="after")
     def validate_dependency(self) -> DependencyEdge:
@@ -126,44 +118,26 @@ class DependencyEdge(BaseModel):
             raise ValueError("order dependencies cannot consume artifacts")
         if self.kind is DependencyKind.CONTEXT and not self.consume:
             raise ValueError("context dependencies must consume at least one file")
+        if self.as_ is not None:
+            object.__setattr__(
+                self,
+                "as_",
+                _validate_path_reference(self.as_, field_name="depends_on.as"),
+            )
         validated_paths = [_validate_relative_file_path(path) for path in self.consume]
         object.__setattr__(self, "consume", validated_paths)
         return self
+
+    @property
+    def scope(self) -> str:
+        return self.as_ or self.task
 
 
 class ComposeStepSpec(BaseModel):
     kind: ComposeStepKind
     path: str | None = None
-    key: str | None = None
-    task: str | None = None
+    ref: str | None = None
     text: str | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_legacy_shape(
-        cls, data: object
-    ) -> dict[str, object] | object:
-        if not isinstance(data, Mapping):
-            return data
-        raw = dict(data)
-        if "kind" in raw:
-            return raw
-        if "file" in raw:
-            return {"kind": "file", "path": raw["file"]}
-        if "user_input" in raw:
-            return {"kind": "user_input", "key": raw["user_input"]}
-        if "literal" in raw:
-            return {"kind": "literal", "text": raw["literal"]}
-        if "from_dep" in raw:
-            dep = raw["from_dep"]
-            if isinstance(dep, Mapping):
-                dep_raw = dict(dep)
-                return {
-                    "kind": "from_dep",
-                    "task": dep_raw.get("task"),
-                    "path": dep_raw.get("path"),
-                }
-        return raw
 
     @model_validator(mode="after")
     def validate_compose_step(self) -> ComposeStepSpec:
@@ -171,15 +145,55 @@ class ComposeStepSpec(BaseModel):
             if self.path is None:
                 raise ValueError("file steps require path")
             object.__setattr__(self, "path", _validate_relative_file_path(self.path))
-        elif self.kind is ComposeStepKind.USER_INPUT:
-            if self.key is None:
-                raise ValueError("user_input steps require key")
-        elif self.kind is ComposeStepKind.FROM_DEP:
-            if self.task is None or self.path is None:
-                raise ValueError("from_dep steps require task and path")
-            object.__setattr__(self, "path", _validate_relative_file_path(self.path))
-        elif self.kind is ComposeStepKind.LITERAL and self.text is None:
-            raise ValueError("literal steps require text")
+            if self.ref is not None or self.text is not None:
+                raise ValueError("file steps may only define path")
+        elif self.kind is ComposeStepKind.REF:
+            if self.ref is None:
+                raise ValueError("ref steps require ref")
+            object.__setattr__(
+                self,
+                "ref",
+                _validate_path_reference(self.ref, field_name="compose.ref"),
+            )
+            parse_compose_ref(self.ref)
+            if self.path is not None or self.text is not None:
+                raise ValueError("ref steps may only define ref")
+        elif self.kind is ComposeStepKind.LITERAL:
+            if self.text is None:
+                raise ValueError("literal steps require text")
+            if self.path is not None or self.ref is not None:
+                raise ValueError("literal steps may only define text")
+        return self
+
+
+class ControllerRouteSpec(BaseModel):
+    label: str
+    targets: list[str]
+
+    @model_validator(mode="after")
+    def validate_route(self) -> ControllerRouteSpec:
+        if not self.label.strip():
+            raise ValueError("control.routes[].label must not be empty")
+        normalized_targets = [
+            _validate_path_reference(target, field_name="control.routes[].targets")
+            for target in self.targets
+        ]
+        if not normalized_targets:
+            raise ValueError("control.routes[].targets must not be empty")
+        object.__setattr__(self, "targets", normalized_targets)
+        return self
+
+
+class TaskControlSpec(BaseModel):
+    routes: list[ControllerRouteSpec]
+
+    @model_validator(mode="after")
+    def validate_control(self) -> TaskControlSpec:
+        if not self.routes:
+            raise ValueError("controller tasks must declare at least one route")
+        labels = [route.label for route in self.routes]
+        if len(set(labels)) != len(labels):
+            raise ValueError("controller route labels must be unique per task")
         return self
 
 
@@ -232,12 +246,14 @@ class TaskSpec(BaseModel):
     id: str
     title: str
     agent: str
+    kind: TaskKind = TaskKind.WORK
     status: TaskStatus = TaskStatus.DRAFT
     description: str = ""
     labels: list[str] = Field(default_factory=list)
     depends_on: list[DependencyEdge] = Field(default_factory=list)
     compose: list[ComposeStepSpec] = Field(default_factory=list)
     publish: list[str] = Field(default_factory=lambda: ["final.md"])
+    control: TaskControlSpec | None = None
     assistant_hints: TaskAssistantHints = Field(default_factory=TaskAssistantHints)
     interaction_policy: TaskInteractionPolicy = Field(default_factory=TaskInteractionPolicy)
     model: str | None = None
@@ -248,6 +264,12 @@ class TaskSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_task(self) -> TaskSpec:
+        if not self.id.strip():
+            raise ValueError("id must not be empty")
+        if not self.title.strip():
+            raise ValueError("title must not be empty")
+        if not self.agent.strip():
+            raise ValueError("agent must not be empty")
         validated_publish = [_validate_relative_file_path(path) for path in self.publish]
         object.__setattr__(self, "publish", validated_publish)
         if self.workspace is not None:
@@ -267,6 +289,14 @@ class TaskSpec(BaseModel):
                 "result_schema",
                 _validate_relative_file_path(self.result_schema),
             )
+        if self.kind is TaskKind.CONTROLLER:
+            if self.control is None:
+                raise ValueError("controller tasks must declare control")
+        elif self.control is not None:
+            raise ValueError("only controller tasks may declare control")
+        scopes = [dependency.scope for dependency in self.depends_on]
+        if len(set(scopes)) != len(scopes):
+            raise ValueError("dependency scopes must be unique per task")
         return self
 
 
@@ -350,26 +380,3 @@ class NodeExecutionRuntime(BaseModel):
         if self.idle_timeout_sec is not None and self.idle_timeout_sec <= 0:
             raise ValueError("idle_timeout_sec must be > 0")
         return self
-
-
-class RunNodeState(BaseModel):
-    task: TaskSpec
-    status: RunNodeStatus = RunNodeStatus.PENDING
-    waiting_reason: RunNodeWaitReason | None = None
-    published: list[PublishedArtifact] = Field(default_factory=list)
-    error: str | None = None
-    attempt: int = 0
-    termination_reason: NodeExecutionTerminationReason | None = None
-    started_at: str | None = None
-    finished_at: str | None = None
-
-
-class RunSnapshot(BaseModel):
-    id: str
-    roots: list[str]
-    created_at: str = Field(default_factory=utc_now_iso)
-    updated_at: str = Field(default_factory=utc_now_iso)
-    status: RunStatus = RunStatus.PENDING
-    user_inputs: dict[str, str] = Field(default_factory=dict)
-    prefect_flow_run_id: str | None = None
-    nodes: dict[str, RunNodeState]

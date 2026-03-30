@@ -6,6 +6,7 @@ from typing import Protocol
 
 from codex_orch.domain import (
     AssistantRequest,
+    AssistantUpdateProposal,
     ConfidenceLevel,
     ControlActionKind,
     ProjectSpec,
@@ -26,6 +27,7 @@ class AssistantBackendRequest:
     assistant_request: AssistantRequest
     artifacts: tuple[AssistantArtifactContext, ...]
     allow_human_handoff: bool
+    shared_operating_model_path: Path
 
 
 @dataclass(frozen=True)
@@ -35,7 +37,7 @@ class AssistantBackendResult:
     rationale: str
     confidence: ConfidenceLevel = ConfidenceLevel.MEDIUM
     citations: tuple[str, ...] = ()
-    proposed_guidance_updates: tuple[str, ...] = ()
+    proposed_updates: tuple[AssistantUpdateProposal, ...] = ()
     proposed_control_actions: tuple[ControlActionKind, ...] = ()
 
 

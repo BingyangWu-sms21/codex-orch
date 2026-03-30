@@ -7,10 +7,12 @@ import yaml
 from codex_orch.assistant.base import AssistantBackendRequest
 from codex_orch.assistant.codex_cli import (
     CodexCliAssistantBackend,
+    _parse_proposed_updates,
     _assistant_output_schema,
 )
 from codex_orch.domain import (
     AssistantRequest,
+    AssistantUpdateKind,
     DecisionKind,
     RequestKind,
     RequestPriority,
@@ -95,11 +97,12 @@ def test_assistant_backend_exposes_program_and_run_instances_context(tmp_path: P
         program_dir=store.paths.root,
         role=store.load_assistant_role("policy"),
         project=store.load_project(),
-        task=instance.task,
+        task=run.tasks[instance.task_id],
         instance_id=instance.instance_id,
         assistant_request=request,
         artifacts=(artifact,),
         allow_human_handoff=True,
+        shared_operating_model_path=store.get_assistant_operating_model_path(),
     )
 
     prompt = CodexCliAssistantBackend()._build_prompt(backend_request)
@@ -109,6 +112,8 @@ def test_assistant_backend_exposes_program_and_run_instances_context(tmp_path: P
     assert "Prefer deleting wrappers." in prompt
     assert "Managed Role Assets" in prompt
     assert "naming: explicit" in prompt
+    assert "Assistant Operating Model" in prompt
+    assert "Role Instructions" in prompt
 
 
 def test_assistant_backend_formats_large_and_binary_artifacts(tmp_path: Path) -> None:
@@ -159,3 +164,30 @@ def test_assistant_backend_schema_blocks_handoff_when_human_is_disallowed() -> N
     schema = _assistant_output_schema(allow_human_handoff=False)
 
     assert schema["properties"]["resolution_kind"]["enum"] == ["auto_reply"]
+    assert "proposed_updates" in schema["properties"]
+
+
+def test_parse_proposed_updates_drops_invalid_entries() -> None:
+    proposals = _parse_proposed_updates(
+        [
+            {
+                "kind": "instruction_update",
+                "summary": "Clarify instructions",
+                "rationale": "The assistant keeps asking the same question.",
+                "suggested_content_mode": "snippet",
+                "suggested_content": "Ask fewer policy questions.\n",
+                "target": {"role_id": "policy"},
+            },
+            {
+                "kind": "routing_policy_update",
+                "summary": "Broken routing change",
+                "rationale": "Missing routing target fields.",
+                "suggested_content_mode": "snippet",
+                "suggested_content": "assistant_hints:\n  preferred_roles:\n    - policy\n",
+                "target": {"role_id": "policy"},
+            },
+        ]
+    )
+
+    assert len(proposals) == 1
+    assert proposals[0].kind is AssistantUpdateKind.INSTRUCTION_UPDATE

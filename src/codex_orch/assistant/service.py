@@ -11,6 +11,7 @@ from codex_orch.assistant.base import (
     AssistantBackend,
     AssistantBackendRequest,
 )
+from codex_orch.assistant.proposals import resolve_update_proposals
 from codex_orch.assistant.routing import AssistantRoleRouter
 from codex_orch.domain import (
     AssistantBackendKind,
@@ -108,6 +109,11 @@ class AssistantWorkerService:
             role = self.store.load_assistant_role(resolved_role_id)
             task = self._resolve_task(record)
             project = self.store.load_project()
+            shared_operating_model_path = self.store.get_assistant_operating_model_path()
+            if not shared_operating_model_path.exists():
+                raise FileNotFoundError(
+                    "assistant operating model is missing; install assistant_roles/_shared/operating-model.md first"
+                )
             backend_request = AssistantBackendRequest(
                 program_dir=self.store.paths.root,
                 role=role,
@@ -117,6 +123,7 @@ class AssistantWorkerService:
                 assistant_request=self._to_assistant_request(record),
                 artifacts=tuple(self._load_artifacts(record)),
                 allow_human_handoff=task.interaction_policy.allow_human,
+                shared_operating_model_path=shared_operating_model_path,
             )
             backend = self._resolve_backend(role.spec.backend)
             result = backend.respond(backend_request)
@@ -127,6 +134,12 @@ class AssistantWorkerService:
                 raise ValueError(
                     "automated assistant must return auto_reply or handoff_to_human"
                 )
+            self._record_proposals(
+                record=record,
+                role=role,
+                task=task,
+                proposals=result.proposed_updates,
+            )
             if result.resolution_kind is ResolutionKind.AUTO_REPLY:
                 self.store.save_interrupt_reply(
                     interrupt_id,
@@ -246,3 +259,50 @@ class AssistantWorkerService:
             logger.warning("%s [%s]", message, request_id)
             return
         logger.exception("%s [%s]", message, request_id)
+
+    def _record_proposals(
+        self,
+        *,
+        record: InterruptRecord,
+        role,
+        task: TaskSpec,
+        proposals,
+    ) -> None:
+        self.store.delete_proposals_for_interrupt(
+            record.run_id,
+            record.interrupt.interrupt_id,
+        )
+        resolved, dropped = resolve_update_proposals(
+            store=self.store,
+            run_id=record.run_id,
+            instance_id=record.instance_id,
+            interrupt_id=record.interrupt.interrupt_id,
+            role=role,
+            task=task,
+            proposals=proposals,
+        )
+        for proposal_record in resolved:
+            self.store.save_proposal(proposal_record)
+            self.store.append_event(
+                record.run_id,
+                "proposal_recorded",
+                instance_id=record.instance_id,
+                payload={
+                    "proposal_id": proposal_record.proposal_id,
+                    "interrupt_id": record.interrupt.interrupt_id,
+                    "kind": proposal_record.proposal.kind.value,
+                    "target_file_path": proposal_record.target_file_path,
+                },
+            )
+        for dropped_proposal in dropped:
+            self.store.append_event(
+                record.run_id,
+                "proposal_dropped",
+                instance_id=record.instance_id,
+                payload={
+                    "interrupt_id": record.interrupt.interrupt_id,
+                    "kind": dropped_proposal.proposal.kind.value,
+                    "summary": dropped_proposal.proposal.summary,
+                    "reason": dropped_proposal.reason,
+                },
+            )

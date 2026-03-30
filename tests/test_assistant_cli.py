@@ -6,6 +6,8 @@ from typer.testing import CliRunner
 
 from codex_orch.cli import app
 from codex_orch.domain import (
+    AssistantUpdateKind,
+    AssistantUpdateStatus,
     InterruptAudience,
     InterruptReplyKind,
     DecisionKind,
@@ -23,6 +25,42 @@ def _instance_for_task(run, task_id: str):
     matches = [instance for instance in run.instances.values() if instance.task_id == task_id]
     assert len(matches) == 1
     return matches[0]
+
+
+def _write_demo_proposal(store, *, run_id: str, instance_id: str) -> None:
+    proposal_path = store.get_proposals_dir(run_id) / "prop-demo.json"
+    proposal_path.write_text(
+        json.dumps(
+            {
+                "proposal_id": "prop-demo",
+                "run_id": run_id,
+                "instance_id": instance_id,
+                "interrupt_id": "int-demo",
+                "source_role_id": "policy",
+                "requester_task_id": "worker",
+                "proposal": {
+                    "kind": "routing_policy_update",
+                    "summary": "Prefer policy",
+                    "rationale": "This task often asks policy questions.",
+                    "suggested_content_mode": "snippet",
+                    "suggested_content": "preferred_roles:\\n  - policy\\n",
+                    "target": {
+                        "task_id": "worker",
+                        "routing_section": "assistant_hints",
+                    },
+                },
+                "target_file_path": str(store.paths.tasks_dir / "worker.yaml"),
+                "status": "proposed",
+                "created_at": "2026-03-30T00:00:00+00:00",
+                "status_updated_at": "2026-03-30T00:00:00+00:00",
+                "status_note": None,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def test_interrupt_cli_round_trip(tmp_path) -> None:
@@ -94,6 +132,51 @@ def test_interrupt_cli_round_trip(tmp_path) -> None:
     assert record["interrupt"]["audience"] == "assistant"
     assert record["interrupt"]["resolved_target_role_id"] == "policy"
     assert record["reply"] is None
+
+
+def test_project_init_scaffolds_assistant_operating_model(tmp_path) -> None:
+    program_dir = tmp_path / "program"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "project",
+            "init",
+            str(program_dir),
+            "demo",
+            str(workspace),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (program_dir / "assistant_roles" / "_shared" / "operating-model.md").exists()
+
+
+def test_project_init_preserves_existing_assistant_operating_model(tmp_path) -> None:
+    program_dir = tmp_path / "program"
+    workspace = tmp_path / "workspace"
+    operating_model_path = program_dir / "assistant_roles" / "_shared" / "operating-model.md"
+    workspace.mkdir()
+    operating_model_path.parent.mkdir(parents=True, exist_ok=True)
+    operating_model_path.write_text("custom operating model\n", encoding="utf-8")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "project",
+            "init",
+            str(program_dir),
+            "demo",
+            str(workspace),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert operating_model_path.read_text(encoding="utf-8") == "custom operating model\n"
 
 
 def test_interrupt_recommend_cli_returns_role_and_policy(tmp_path) -> None:
@@ -215,6 +298,28 @@ def test_inbox_reply_cli_round_trip(tmp_path) -> None:
     assert record.reply.text == "Delete it."
 
 
+def test_assistant_doc_install_cli_writes_program_copy(tmp_path) -> None:
+    store = build_test_store(tmp_path)
+    store.get_assistant_operating_model_path().unlink()
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "assistant-doc",
+            "install",
+            str(store.paths.root),
+            "--json",
+        ],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["installed_path"].endswith("assistant_roles/_shared/operating-model.md")
+    assert store.get_assistant_operating_model_path().exists()
+
+
 def test_interrupt_create_cli_requires_target_when_no_recommendation(tmp_path) -> None:
     store = build_test_store(tmp_path)
     write_assistant_role(
@@ -269,6 +374,115 @@ def test_interrupt_create_cli_requires_target_when_no_recommendation(tmp_path) -
     assert "no assistant role recommendation is available" in (
         result.stdout + getattr(result, "stderr", "")
     )
+
+
+def test_proposal_cli_lists_and_marks_recorded_proposals(tmp_path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    _write_demo_proposal(
+        store,
+        run_id=run.id,
+        instance_id=next(iter(run.instances.values())).instance_id,
+    )
+    runner = CliRunner()
+
+    list_result = runner.invoke(
+        app,
+        [
+            "proposal",
+            "list",
+            str(store.paths.root),
+            "--run-id",
+            run.id,
+            "--kind",
+            AssistantUpdateKind.ROUTING_POLICY_UPDATE.value,
+            "--json",
+        ],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+    assert list_result.exit_code == 0
+    listed = json.loads(list_result.stdout)
+    assert listed[0]["proposal_id"] == "prop-demo"
+
+    mark_result = runner.invoke(
+        app,
+        [
+            "proposal",
+            "mark",
+            str(store.paths.root),
+            "prop-demo",
+            "--status",
+            AssistantUpdateStatus.APPLIED.value,
+            "--note",
+            "updated manually",
+            "--json",
+        ],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+    assert mark_result.exit_code == 0
+    updated = json.loads(mark_result.stdout)
+    assert updated["status"] == "applied"
+    assert updated["status_note"] == "updated manually"
+
+
+def test_proposal_mark_cli_rejects_blank_note_without_corrupting_record(tmp_path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    _write_demo_proposal(
+        store,
+        run_id=run.id,
+        instance_id=next(iter(run.instances.values())).instance_id,
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "proposal",
+            "mark",
+            str(store.paths.root),
+            "prop-demo",
+            "--status",
+            AssistantUpdateStatus.APPLIED.value,
+            "--note",
+            "   ",
+        ],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+
+    assert result.exit_code != 0
+    assert "status_note must not be blank" in (result.stdout + getattr(result, "stderr", ""))
+    proposal = store.find_proposal("prop-demo")
+    assert proposal.status is AssistantUpdateStatus.PROPOSED
+    assert proposal.status_note is None
 
 
 def test_interrupt_create_cli_rejects_task_instance_mismatch_before_persisting(tmp_path) -> None:

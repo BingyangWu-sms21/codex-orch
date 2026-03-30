@@ -16,6 +16,12 @@
       <label>Id <input name="id" value="{{ task.id }}" required /></label>
       <label>Title <input name="title" value="{{ task.title }}" required /></label>
       <label>Agent <input name="agent" value="{{ task.agent }}" required /></label>
+      <label>Kind
+        <select name="kind">
+          <option value="work" {% if task.kind.value == 'work' %}selected{% endif %}>work</option>
+          <option value="controller" {% if task.kind.value == 'controller' %}selected{% endif %}>controller</option>
+        </select>
+      </label>
       <label>Status
         <select name="status">
           {% for status in task_statuses %}
@@ -26,6 +32,9 @@
       <label>Description <textarea name="description" rows="3">{{ task.description }}</textarea></label>
       <label>Labels (comma separated) <input name="labels" value="{{ task.labels | join(', ') }}" /></label>
       <label>Publish files <textarea name="publish" rows="3">{{ task.publish | join('\n') }}</textarea></label>
+      <label>Control (YAML object for controller tasks)
+        <textarea name="control" rows="8">{{ control_text }}</textarea>
+      </label>
       <label>Assistant hints (YAML object)
         <textarea name="assistant_hints" rows="8">{{ assistant_hints_text }}</textarea>
       </label>
@@ -64,6 +73,7 @@
         <tr>
           <th>Source</th>
           <th>Kind</th>
+          <th>Scope</th>
           <th>Consume</th>
           <th></th>
         </tr>
@@ -73,6 +83,7 @@
         <tr>
           <td>{{ edge.source }}</td>
           <td>{{ edge.kind }}</td>
+          <td>{{ edge.scope }}</td>
           <td>{{ edge.consume | join(', ') }}</td>
           <td>
             <form method="post" action="/edges/delete">
@@ -103,6 +114,7 @@
           <option value="context">context</option>
         </select>
       </label>
+      <label>Scope alias <input name="scope_alias" /></label>
       <label>Consume files (context only) <textarea name="consume" rows="3"></textarea></label>
       <button type="submit">Add edge</button>
     </form>

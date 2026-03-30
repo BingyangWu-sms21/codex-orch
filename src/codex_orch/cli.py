@@ -14,8 +14,11 @@ from codex_orch.assistant import (
     AssistantWorkerService,
     CodexCliAssistantBackend,
 )
+from codex_orch.assistant_docs import install_assistant_operating_model
 from codex_orch.api.app import DEFAULT_WEB_PORT, serve
 from codex_orch.domain import (
+    AssistantUpdateKind,
+    AssistantUpdateStatus,
     ConfidenceLevel,
     DecisionKind,
     DependencyKind,
@@ -47,6 +50,8 @@ graph_app = typer.Typer(help="Display the task graph.")
 inspect_app = typer.Typer(help="Inspect tasks and runs.")
 interrupt_app = typer.Typer(help="Create and inspect runtime interrupts.")
 inbox_app = typer.Typer(help="Operate the runtime inbox and assistant worker.")
+proposal_app = typer.Typer(help="Inspect and mark recorded assistant update proposals.")
+assistant_doc_app = typer.Typer(help="Install shared assistant operating model docs.")
 skill_app = typer.Typer(help="Export bundled Codex skills.")
 
 app.add_typer(project_app, name="project")
@@ -58,6 +63,8 @@ app.add_typer(graph_app, name="graph")
 app.add_typer(inspect_app, name="inspect")
 app.add_typer(interrupt_app, name="interrupt")
 app.add_typer(inbox_app, name="inbox")
+app.add_typer(proposal_app, name="proposal")
+app.add_typer(assistant_doc_app, name="assistant-doc")
 app.add_typer(skill_app, name="skill")
 
 
@@ -188,6 +195,10 @@ def _interrupt_record_payload(record: InterruptRecord) -> dict[str, object]:
     }
 
 
+def _proposal_payload(record) -> dict[str, object]:
+    return record.model_dump(mode="json")
+
+
 @project_app.command("init")
 def project_init(
     program_dir: Path,
@@ -208,7 +219,26 @@ def project_init(
         max_concurrency=max_concurrency,
     )
     store.save_project(project)
+    if not store.get_assistant_operating_model_path().exists():
+        install_assistant_operating_model(store.paths.root, overwrite=False)
     typer.echo(f"Initialized program at {store.paths.root}")
+
+
+@assistant_doc_app.command("install")
+def assistant_doc_install(
+    program_dir: Path,
+    overwrite: bool = False,
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    installed_path = install_assistant_operating_model(
+        program_dir,
+        overwrite=overwrite,
+    )
+    payload = {"installed_path": str(installed_path)}
+    if as_json:
+        _print_json(payload)
+        return
+    typer.echo(str(installed_path))
 
 
 @task_app.command("list")
@@ -232,9 +262,9 @@ def task_list(
 def task_show(program_dir: Path, task_id: str, as_json: bool = typer.Option(False, "--json")) -> None:
     task = _task_pool(program_dir).get_task(task_id)
     if as_json:
-        _print_json(task.model_dump(mode="json"))
+        _print_json(task.model_dump(mode="json", by_alias=True))
         return
-    typer.echo(yaml.safe_dump(task.model_dump(mode="json"), sort_keys=False))
+    typer.echo(yaml.safe_dump(task.model_dump(mode="json", by_alias=True), sort_keys=False))
 
 
 @task_app.command("add")
@@ -276,6 +306,7 @@ def edge_list(program_dir: Path, as_json: bool = typer.Option(False, "--json")) 
             "source": edge.source,
             "target": edge.target,
             "kind": edge.kind,
+            "scope": edge.scope,
             "consume": list(edge.consume),
         }
         for edge in edges
@@ -285,7 +316,7 @@ def edge_list(program_dir: Path, as_json: bool = typer.Option(False, "--json")) 
         return
     for edge in payload:
         typer.echo(
-            f"{edge['source']} -> {edge['target']} [{edge['kind']}] consume={edge['consume']}"
+            f"{edge['source']} -> {edge['target']} [{edge['kind']}] scope={edge['scope']} consume={edge['consume']}"
         )
 
 
@@ -295,6 +326,7 @@ def edge_add(
     source: str,
     target: str,
     kind: DependencyKind,
+    scope_alias: str | None = typer.Option(None, "--scope-alias"),
     consume: list[str] | None = typer.Option(None),
 ) -> None:
     store = _store(program_dir)
@@ -303,6 +335,7 @@ def edge_add(
         target_task_id=target,
         kind=kind,
         consume=[] if consume is None else consume,
+        as_=scope_alias,
     )
     TaskPoolService(store).validate_graph()
     typer.echo(f"Added {kind.value} edge {source} -> {target}")
@@ -768,6 +801,62 @@ def inbox_worker(
         typer.echo(" ".join(f"{key}={value}" for key, value in payload.items()))
         return
     worker.serve_forever(poll_interval_sec=poll_interval_sec)
+
+
+@proposal_app.command("list")
+def proposal_list(
+    program_dir: Path,
+    run_id: str | None = typer.Option(None, "--run-id"),
+    status: AssistantUpdateStatus | None = typer.Option(None, "--status"),
+    kind: AssistantUpdateKind | None = typer.Option(None, "--kind"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    records = _store(program_dir).list_proposals(run_id=run_id, status=status)
+    if kind is not None:
+        records = [record for record in records if record.proposal.kind is kind]
+    if as_json:
+        _print_json([_proposal_payload(record) for record in records])
+        return
+    for record in records:
+        typer.echo(
+            f"{record.proposal_id}\trun={record.run_id}\tstatus={record.status.value}\tkind={record.proposal.kind.value}\ttarget={record.target_file_path}"
+        )
+
+
+@proposal_app.command("show")
+def proposal_show(
+    program_dir: Path,
+    proposal_id: str,
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    record = _store(program_dir).find_proposal(proposal_id)
+    payload = _proposal_payload(record)
+    if as_json:
+        _print_json(payload)
+        return
+    typer.echo(yaml.safe_dump(payload, sort_keys=False))
+
+
+@proposal_app.command("mark")
+def proposal_mark(
+    program_dir: Path,
+    proposal_id: str,
+    status: AssistantUpdateStatus = typer.Option(..., "--status"),
+    note: str | None = typer.Option(None, "--note"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    try:
+        updated = _store(program_dir).mark_proposal_status(
+            proposal_id,
+            status=status,
+            note=note,
+        )
+    except (KeyError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if as_json:
+        _print_json(updated.model_dump(mode="json"))
+        return
+    typer.echo(updated.proposal_id)
 
 
 @skill_app.command("list")

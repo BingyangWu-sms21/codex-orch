@@ -9,6 +9,12 @@ from codex_orch.assistant import (
     AssistantWorkerService,
 )
 from codex_orch.domain import (
+    AssistantUpdateKind,
+    AssistantUpdateProposal,
+    AssistantUpdateStatus,
+    AssistantUpdateTarget,
+    AssistantUpdateContentMode,
+    RoutingPolicySection,
     ConfidenceLevel,
     InterruptAudience,
     InterruptReplyKind,
@@ -158,6 +164,142 @@ def test_assistant_worker_auto_reply_resolves_interrupt_and_resumes_run(tmp_path
     assert backend.requests[0].instance_id == instance.instance_id
 
 
+def test_assistant_worker_records_valid_proposals(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    instance = _instance_for_task(run, "worker")
+    _create_assistant_interrupt(
+        store,
+        run_id=run.id,
+        instance_id=instance.instance_id,
+        task_id="worker",
+    )
+
+    backend = StubBackend(
+        AssistantBackendResult(
+            resolution_kind=ResolutionKind.AUTO_REPLY,
+            answer="Use explicit names.",
+            rationale="That matches the role guidance.",
+            proposed_updates=(
+                AssistantUpdateProposal(
+                    kind=AssistantUpdateKind.MANAGED_ASSET_UPDATE,
+                    summary="Add naming preference",
+                    rationale="The user consistently prefers explicit names.",
+                    suggested_content_mode=AssistantUpdateContentMode.SNIPPET,
+                    suggested_content="preferences:\n  naming_style: explicit\n",
+                    target=AssistantUpdateTarget(
+                        role_id="policy",
+                        managed_asset_path="preferences.yaml",
+                    ),
+                ),
+                AssistantUpdateProposal(
+                    kind=AssistantUpdateKind.ROUTING_POLICY_UPDATE,
+                    summary="Prefer policy role",
+                    rationale="This task frequently asks policy questions.",
+                    suggested_content_mode=AssistantUpdateContentMode.SNIPPET,
+                    suggested_content="preferred_roles:\n  - policy\n",
+                    target=AssistantUpdateTarget(
+                        task_id="worker",
+                        routing_section=RoutingPolicySection.ASSISTANT_HINTS,
+                    ),
+                ),
+            ),
+        )
+    )
+    worker = AssistantWorkerService(
+        store,
+        backend=backend,
+        run_service=RunService(store, FakeRunner()),
+    )
+
+    stats = worker.run_once()
+    proposals = store.list_proposals(run_id=run.id)
+    events = store.list_events(run.id)
+
+    assert stats.auto_replied == 1
+    assert len(proposals) == 2
+    assert proposals[0].status is AssistantUpdateStatus.PROPOSED
+    assert proposals[0].proposal.kind is AssistantUpdateKind.MANAGED_ASSET_UPDATE
+    assert proposals[1].proposal.kind is AssistantUpdateKind.ROUTING_POLICY_UPDATE
+    assert any(event.event_type == "proposal_recorded" for event in events)
+
+
+def test_assistant_worker_drops_invalid_proposals_without_blocking_answer(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    instance = _instance_for_task(run, "worker")
+    interrupt = _create_assistant_interrupt(
+        store,
+        run_id=run.id,
+        instance_id=instance.instance_id,
+        task_id="worker",
+    )
+
+    backend = StubBackend(
+        AssistantBackendResult(
+            resolution_kind=ResolutionKind.AUTO_REPLY,
+            answer="Keep the wrapper.",
+            rationale="Compatibility still matters.",
+            proposed_updates=(
+                AssistantUpdateProposal(
+                    kind=AssistantUpdateKind.MANAGED_ASSET_UPDATE,
+                    summary="Write undeclared asset",
+                    rationale="Testing invalid proposal handling.",
+                    suggested_content_mode=AssistantUpdateContentMode.SNIPPET,
+                    suggested_content="guidance:\n  - keep wrappers\n",
+                    target=AssistantUpdateTarget(
+                        role_id="policy",
+                        managed_asset_path="not-declared.yaml",
+                    ),
+                ),
+            ),
+        )
+    )
+    worker = AssistantWorkerService(
+        store,
+        backend=backend,
+        run_service=RunService(store, FakeRunner()),
+    )
+
+    stats = worker.run_once()
+    proposals = store.list_proposals(run_id=run.id)
+    record = store.find_interrupt(interrupt.interrupt_id)
+    events = store.list_events(run.id)
+
+    assert stats.auto_replied == 1
+    assert proposals == []
+    assert record.reply is not None
+    assert any(event.event_type == "proposal_dropped" for event in events)
+
+
 def test_assistant_worker_handoff_creates_human_interrupt(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
     write_assistant_role(store)
@@ -207,3 +349,45 @@ def test_assistant_worker_handoff_creates_human_interrupt(tmp_path: Path) -> Non
     assert len(human_records) == 1
     assert human_records[0].interrupt.metadata["assistant_summary"] == "I need a human decision."
     assert human_records[0].interrupt.resolved_target_role_id is None
+
+
+def test_assistant_worker_fails_when_shared_operating_model_is_missing(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    store.get_assistant_operating_model_path().unlink()
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    instance = _instance_for_task(run, "worker")
+    _create_assistant_interrupt(
+        store,
+        run_id=run.id,
+        instance_id=instance.instance_id,
+        task_id="worker",
+    )
+
+    worker = AssistantWorkerService(
+        store,
+        backend=StubBackend(
+            AssistantBackendResult(
+                resolution_kind=ResolutionKind.AUTO_REPLY,
+                answer="Delete it.",
+                rationale="No wrapper is needed.",
+            )
+        ),
+        run_service=RunService(store, FakeRunner()),
+    )
+
+    stats = worker.run_once()
+    assert stats.failed == 1

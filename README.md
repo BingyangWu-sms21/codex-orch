@@ -3,9 +3,10 @@
 `codex-orch` is a local-first task orchestrator for Codex CLI.
 
 It keeps tasks, presets, runtime state, interrupts, and published outputs on
-disk instead of in a database. A run materializes a static task subgraph,
-creates one runtime instance per selected task, and executes those instances
-through `codex exec` / `codex exec resume` with a built-in instance scheduler.
+disk instead of in a database. A run materializes a frozen task snapshot,
+creates seed runtime instances, and lets the built-in instance scheduler
+dynamically activate downstream instances from concrete dependency bindings and
+controller route selections.
 
 The current implemented runtime is documented in [docs/spec.md](./docs/spec.md).
 The future controller-driven branching and loop runtime is documented in
@@ -17,9 +18,10 @@ assistant-role interaction control plane is documented in
 
 - File-backed task pool with CRUD operations
 - Two dependency kinds: `order` and `context`
-- `compose.from_dep` reads only from explicitly consumed `context` artifacts
+- `compose.ref` reads run inputs, materialized dependency results, and consumed dependency artifacts
+- `controller` tasks with route-driven branch activation
 - Global presets under `~/.codex-orch/` plus per-program presets
-- Run-centered instance runtime with attempts, published artifacts, and event log
+- Run-centered task snapshot, instance runtime, materialized results, and event log
 - Codex session-aware resume via `codex exec resume`
 - Runtime inbox with interrupt requests and replies for assistant and human interaction
 - Built-in assistant worker plus bundled `operate-codex-orch` operator skill
@@ -38,7 +40,7 @@ codex-orch/
 Key docs:
 
 - [docs/spec.md](./docs/spec.md): current implemented storage and execution model
-- [docs/controller-runtime.md](./docs/controller-runtime.md): target controller-driven runtime for branching and loops
+- [docs/controller-runtime.md](./docs/controller-runtime.md): north star for the remaining controller runtime work, especially loops and channels
 - [docs/assistant-role-control-plane.md](./docs/assistant-role-control-plane.md): target worker/assistant/human interaction control plane with named assistant roles and managed role-scoped preferences
 
 ## Program layout
@@ -48,6 +50,7 @@ Each orchestrated program lives in its own directory, for example:
 ```text
 codex-programs/my-program/
 ├── assistant_roles/
+│   └── _shared/operating-model.md
 ├── project.yaml
 ├── tasks/
 ├── presets/
@@ -74,6 +77,7 @@ published to PyPI:
 pipx install codex-orch
 codex-orch --version
 codex-orch task list .
+codex-orch assistant-doc install . --json
 ```
 
 ## Interrupt helper flow
@@ -148,6 +152,14 @@ The built-in assistant worker processes unresolved assistant interrupts:
 
 ```bash
 codex-orch inbox worker /path/to/program --once --json
+```
+
+Assistant update proposals are recorded per run and can be reviewed manually:
+
+```bash
+codex-orch proposal list /path/to/program --run-id <run-id> --json
+codex-orch proposal show /path/to/program <proposal-id> --json
+codex-orch proposal mark /path/to/program <proposal-id> --status applied --note "updated manually"
 ```
 
 ## Skill export

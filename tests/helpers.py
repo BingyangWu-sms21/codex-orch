@@ -4,6 +4,7 @@ from pathlib import Path
 
 import yaml
 
+from codex_orch.assistant_docs import install_assistant_operating_model
 from codex_orch.domain import ProjectSpec, TaskSpec, TaskStatus
 from codex_orch.store import ProjectStore
 
@@ -28,6 +29,7 @@ def build_test_store(tmp_path: Path) -> ProjectStore:
         "implement prompt\n",
         encoding="utf-8",
     )
+    install_assistant_operating_model(store.paths.root, overwrite=False)
     return store
 
 

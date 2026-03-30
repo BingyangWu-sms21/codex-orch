@@ -1,13 +1,38 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import tempfile
 from pathlib import Path
 
+import yaml
+from pydantic import ValidationError
+
 from codex_orch.assistant.base import AssistantBackendRequest, AssistantBackendResult
-from codex_orch.domain import ConfidenceLevel, ControlActionKind, ResolutionKind
+from codex_orch.domain import (
+    AssistantUpdateProposal,
+    ConfidenceLevel,
+    ControlActionKind,
+    ResolutionKind,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_proposed_updates(raw_updates: list[object]) -> tuple[AssistantUpdateProposal, ...]:
+    proposals: list[AssistantUpdateProposal] = []
+    for proposal_index, raw in enumerate(raw_updates, start=1):
+        try:
+            proposals.append(AssistantUpdateProposal.model_validate(raw))
+        except ValidationError as exc:
+            logger.warning(
+                "Dropping invalid assistant proposed_update #%s: %s",
+                proposal_index,
+                exc,
+            )
+    return tuple(proposals)
 
 
 def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
@@ -30,9 +55,56 @@ def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
                 "enum": [level.value for level in ConfidenceLevel],
             },
             "citations": {"type": "array", "items": {"type": "string"}},
-            "proposed_guidance_updates": {
+            "proposed_updates": {
                 "type": "array",
-                "items": {"type": "string"},
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "instruction_update",
+                                "managed_asset_update",
+                                "routing_policy_update",
+                            ],
+                        },
+                        "summary": {"type": "string", "minLength": 1},
+                        "rationale": {"type": "string", "minLength": 1},
+                        "suggested_content_mode": {
+                            "type": "string",
+                            "enum": ["snippet", "full_replacement"],
+                        },
+                        "suggested_content": {"type": "string", "minLength": 1},
+                        "target": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "role_id": {"type": "string", "minLength": 1},
+                                "managed_asset_path": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                },
+                                "task_id": {"type": "string", "minLength": 1},
+                                "routing_section": {
+                                    "type": "string",
+                                    "enum": [
+                                        "assistant_hints",
+                                        "interaction_policy",
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                    "required": [
+                        "kind",
+                        "summary",
+                        "rationale",
+                        "suggested_content_mode",
+                        "suggested_content",
+                        "target",
+                    ],
+                },
             },
             "proposed_control_actions": {
                 "type": "array",
@@ -48,7 +120,7 @@ def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
             "rationale",
             "confidence",
             "citations",
-            "proposed_guidance_updates",
+            "proposed_updates",
             "proposed_control_actions",
         ],
     }
@@ -88,9 +160,7 @@ class CodexCliAssistantBackend:
             rationale=payload["rationale"],
             confidence=ConfidenceLevel(payload["confidence"]),
             citations=tuple(payload.get("citations", [])),
-            proposed_guidance_updates=tuple(
-                payload.get("proposed_guidance_updates", [])
-            ),
+            proposed_updates=_parse_proposed_updates(payload.get("proposed_updates", [])),
             proposed_control_actions=tuple(
                 ControlActionKind(raw)
                 for raw in payload.get("proposed_control_actions", [])
@@ -139,6 +209,9 @@ class CodexCliAssistantBackend:
                 "CODEX_ORCH_ASSISTANT_MANAGED_ASSET_PATHS": os.pathsep.join(
                     str(path) for path in request.role.managed_asset_paths
                 ),
+                "CODEX_ORCH_ASSISTANT_OPERATING_MODEL_PATH": str(
+                    request.shared_operating_model_path
+                ),
                 "CODEX_ORCH_RUN_DIR": str(self._run_dir(request)),
                 "CODEX_ORCH_RUN_INSTANCES_DIR": str(self._run_instances_dir(request)),
             }
@@ -171,6 +244,9 @@ class CodexCliAssistantBackend:
             return Path(handle.name)
 
     def _build_prompt(self, request: AssistantBackendRequest) -> str:
+        shared_operating_model = request.shared_operating_model_path.read_text(
+            encoding="utf-8"
+        ).strip()
         instructions = request.role.instructions_path.read_text(encoding="utf-8").strip()
         metadata_lines = [
             f"- project_name: {request.project.name}",
@@ -225,7 +301,33 @@ class CodexCliAssistantBackend:
                 "- Treat the program and run directories as observational context and do not modify them while answering this request."
             ),
         ]
+        routing_context_sections = [
+            "## assistant_hints",
+            "```yaml",
+            yaml.safe_dump(
+                request.task.assistant_hints.model_dump(
+                    mode="json",
+                    exclude_defaults=True,
+                ),
+                sort_keys=False,
+            ).strip()
+            or "{}",
+            "```",
+            "## interaction_policy",
+            "```yaml",
+            yaml.safe_dump(
+                request.task.interaction_policy.model_dump(
+                    mode="json",
+                    exclude_defaults=True,
+                ),
+                sort_keys=False,
+            ).strip()
+            or "{}",
+            "```",
+        ]
         sections = [
+            "# Assistant Operating Model",
+            shared_operating_model or "(assistant operating model missing content)",
             "# Assistant Role Instructions",
             instructions or "(no role instructions provided)",
             "# Managed Role Assets",
@@ -234,6 +336,8 @@ class CodexCliAssistantBackend:
             else "No managed role assets were configured.",
             "# Run Context",
             "\n".join(metadata_lines),
+            "# Requester Task Routing Context",
+            "\n".join(routing_context_sections),
             "# Accessible Paths",
             "\n".join(accessible_paths),
             "# Assistant Request",
@@ -253,8 +357,9 @@ class CodexCliAssistantBackend:
                         else "Human handoff is not allowed for this task. Always return resolution_kind=auto_reply."
                     ),
                     "Keep citations grounded in the provided artifacts or stable repo/user guidance paths.",
+                    "Use proposed_updates for repository-facing update proposals about instructions, managed assets, or routing policy.",
                     "Keep proposed_control_actions empty unless a control-plane action is truly necessary.",
-                    "Treat proposed_control_actions and proposed_guidance_updates as proposals only; codex-orch records them but does not execute them automatically.",
+                    "Treat proposed_updates and proposed_control_actions as proposals only; codex-orch records them but does not execute them automatically.",
                 ]
             ),
         ]

@@ -8,6 +8,12 @@
       <label>Id <input name="id" required /></label>
       <label>Title <input name="title" required /></label>
       <label>Agent <input name="agent" value="{{ project.default_agent if project else 'default' }}" required /></label>
+      <label>Kind
+        <select name="kind">
+          <option value="work">work</option>
+          <option value="controller">controller</option>
+        </select>
+      </label>
       <label>Status
         <select name="status">
           {% for status in task_statuses %}
@@ -18,6 +24,9 @@
       <label>Description <textarea name="description" rows="3"></textarea></label>
       <label>Labels (comma separated) <input name="labels" /></label>
       <label>Publish files (one per line or comma separated) <textarea name="publish" rows="3">final.md</textarea></label>
+      <label>Control (YAML object for controller tasks)
+        <textarea name="control" rows="6">{{ control_example }}</textarea>
+      </label>
       <label>Assistant hints (YAML object)
         <textarea name="assistant_hints" rows="6">{}</textarea>
       </label>

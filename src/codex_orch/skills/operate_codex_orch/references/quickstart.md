@@ -18,9 +18,7 @@ pipx upgrade codex-orch
 ## Bootstrap a program in the current directory
 
 ```bash
-codex-orch project init . \
-  --name my-program \
-  --workspace "$PWD"
+codex-orch project init . my-program "$PWD"
 ```
 
 ## Program layout
@@ -28,6 +26,7 @@ codex-orch project init . \
 Expect a program directory with:
 
 - `project.yaml`
+- `assistant_roles/_shared/operating-model.md`
 - `tasks/`
 - `presets/`
 - `prompts/`
@@ -61,6 +60,7 @@ codex-orch inbox list . --json
 codex-orch inbox show . <interrupt-id> --json
 codex-orch inbox reply . <interrupt-id> --text "Answer" --resume
 codex-orch inbox worker . --once --json
+codex-orch proposal list . --json
 ```
 
 ## File-backed truth sources
@@ -71,6 +71,7 @@ When CLI output is not enough, inspect:
 - `tasks/*.yaml`
 - `.runs/<run-id>/state/run.json`
 - `.runs/<run-id>/state/instances/<instance-id>.json`
+- `.runs/<run-id>/proposals/`
 - `.runs/<run-id>/inbox/interrupts/`
 - `.runs/<run-id>/inbox/replies/`
 - `.runs/<run-id>/instances/<instance-id>/attempts/<attempt-no>/runtime.json`

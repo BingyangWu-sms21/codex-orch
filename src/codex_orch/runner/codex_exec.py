@@ -554,7 +554,11 @@ class CodexExecRunner:
         request: NodeExecutionRequest,
         final_message: str,
     ) -> None:
-        if request.task.result_schema is None and "result.json" not in request.task.publish:
+        if (
+            request.task.kind.value != "controller"
+            and request.task.result_schema is None
+            and "result.json" not in request.task.publish
+        ):
             return
         try:
             payload = json.loads(final_message)

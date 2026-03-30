@@ -4,11 +4,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from string import Template
 
+from codex_orch.compose_refs import ComposeRefKind, parse_compose_ref
 from codex_orch.domain import (
     ComposeStepKind,
     DependencyEdge,
     DependencyKind,
     PresetSpec,
+    TaskKind,
     TaskSpec,
     TaskStatus,
 )
@@ -21,6 +23,7 @@ class GraphEdgeView:
     target: str
     kind: str
     consume: tuple[str, ...]
+    scope: str
 
 
 class TaskPoolService:
@@ -64,6 +67,7 @@ class TaskPoolService:
                     target=target,
                     kind=dependency.kind.value,
                     consume=tuple(dependency.consume),
+                    scope=dependency.scope,
                 )
             )
         return views
@@ -130,7 +134,20 @@ class TaskPoolService:
             task = tasks[task_id]
             selected[task_id] = task
             stack.extend(dependency.task for dependency in task.depends_on)
+            if task.kind is TaskKind.CONTROLLER and task.control is not None:
+                for route in task.control.routes:
+                    stack.extend(route.targets)
         return selected
+
+    def routed_targets(self, tasks: dict[str, TaskSpec]) -> dict[str, str]:
+        targets: dict[str, str] = {}
+        for task in tasks.values():
+            if task.kind is not TaskKind.CONTROLLER or task.control is None:
+                continue
+            for route in task.control.routes:
+                for target in route.targets:
+                    targets[target] = task.id
+        return targets
 
     def _build_bindings(
         self,
@@ -187,46 +204,59 @@ class TaskPoolService:
         allow_external: bool = False,
     ) -> None:
         self._validate_dependencies_exist(tasks, allow_external=allow_external)
-        self._validate_compose_dependencies(tasks)
+        self._validate_controller_routes(tasks)
+        self._validate_compose_refs(tasks)
         self._validate_cycles(tasks)
 
-    def _validate_compose_dependencies(self, tasks: dict[str, TaskSpec]) -> None:
+    def _validate_compose_refs(self, tasks: dict[str, TaskSpec]) -> None:
         for task in tasks.values():
-            dependency_tasks = {dependency.task for dependency in task.depends_on}
-            context_dependencies: dict[str, DependencyEdge] = {}
-            for dependency in task.depends_on:
-                if dependency.kind is not DependencyKind.CONTEXT:
-                    continue
-                if dependency.task in context_dependencies:
-                    raise ValueError(
-                        f"task {task.id} has multiple context dependencies on task "
-                        f"{dependency.task}"
-                    )
-                context_dependencies[dependency.task] = dependency
-
+            dependencies_by_scope = {dependency.scope: dependency for dependency in task.depends_on}
             for step in task.compose:
-                if (
-                    step.kind is not ComposeStepKind.FROM_DEP
-                    or step.task is None
-                    or step.path is None
-                ):
+                if step.kind is not ComposeStepKind.REF or step.ref is None:
                     continue
-                if step.task not in dependency_tasks:
-                    raise ValueError(
-                        f"task {task.id} compose.from_dep references undeclared "
-                        f"dependency {step.task}"
-                    )
-                dependency = context_dependencies.get(step.task)
+                parsed = parse_compose_ref(step.ref)
+                if parsed.kind is ComposeRefKind.INPUT:
+                    continue
+                assert parsed.scope is not None
+                dependency = dependencies_by_scope.get(parsed.scope)
                 if dependency is None:
                     raise ValueError(
-                        f"task {task.id} compose.from_dep {step.task}:{step.path} "
-                        "requires a context dependency"
+                        f"task {task.id} compose.ref {step.ref} references unknown dependency scope {parsed.scope}"
                     )
-                if step.path not in dependency.consume:
+                if parsed.kind is ComposeRefKind.DEP_RESULT:
+                    continue
+                assert parsed.artifact_path is not None
+                if dependency.kind is not DependencyKind.CONTEXT:
                     raise ValueError(
-                        f"task {task.id} compose.from_dep {step.task}:{step.path} "
-                        "must be listed in the matching context dependency consume"
+                        f"task {task.id} compose.ref {step.ref} requires a context dependency"
                     )
+                if parsed.artifact_path not in dependency.consume:
+                    raise ValueError(
+                        f"task {task.id} compose.ref {step.ref} must be listed in the matching context dependency consume"
+                    )
+
+    def _validate_controller_routes(self, tasks: dict[str, TaskSpec]) -> None:
+        routed_targets: dict[str, str] = {}
+        for task in tasks.values():
+            if task.kind is not TaskKind.CONTROLLER:
+                continue
+            assert task.control is not None
+            for route in task.control.routes:
+                for target_task_id in route.targets:
+                    if target_task_id not in tasks:
+                        raise ValueError(
+                            f"controller task {task.id} routes to missing task {target_task_id}"
+                        )
+                    target_task = tasks[target_task_id]
+                    if target_task_id in routed_targets:
+                        raise ValueError(
+                            f"task {target_task_id} is targeted by more than one controller route"
+                        )
+                    routed_targets[target_task_id] = task.id
+                    if task.id not in {dependency.task for dependency in target_task.depends_on}:
+                        raise ValueError(
+                            f"controller route {task.id} -> {target_task_id} requires {target_task_id} to depend_on {task.id}"
+                        )
 
     def _validate_cycles(self, tasks: dict[str, TaskSpec]) -> None:
         visited: set[str] = set()

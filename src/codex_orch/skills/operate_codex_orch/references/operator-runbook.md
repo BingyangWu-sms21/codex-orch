@@ -32,6 +32,21 @@ Let the built-in assistant worker process unresolved assistant interrupts:
 codex-orch inbox worker . --once --json
 ```
 
+List recorded assistant update proposals:
+
+```bash
+codex-orch proposal list . --json
+codex-orch proposal show . <proposal-id> --json
+```
+
+Mark a proposal after manual review or repo editing:
+
+```bash
+codex-orch proposal mark . <proposal-id> \
+  --status applied \
+  --note "updated manually"
+```
+
 ## Recovery and debugging
 
 Use these files as the first stop when a run is stuck or surprising:
@@ -39,8 +54,10 @@ Use these files as the first stop when a run is stuck or surprising:
 - `.runs/<run-id>/state/run.json`
 - `.runs/<run-id>/state/instances/<instance-id>.json`
 - `.runs/<run-id>/events/*.json`
+- `.runs/<run-id>/proposals/*.json`
 - `.runs/<run-id>/inbox/interrupts/<interrupt-id>.json`
 - `.runs/<run-id>/inbox/replies/<interrupt-id>.json`
+- `assistant_roles/_shared/operating-model.md`
 - `.runs/<run-id>/instances/<instance-id>/session.json`
 - `.runs/<run-id>/instances/<instance-id>/attempts/<attempt-no>/runtime.json`
 - `.runs/<run-id>/instances/<instance-id>/attempts/<attempt-no>/events.jsonl`
@@ -49,5 +66,6 @@ Use these files as the first stop when a run is stuck or surprising:
 Common failure patterns:
 
 - missing assistant role or context artifact: interrupt remains unresolved or the assistant worker skips it
+- missing assistant operating model: assistant worker fails until `assistant_roles/_shared/operating-model.md` is installed
 - instance waiting on replies: inspect unresolved interrupts and the latest attempt runtime
 - published artifact missing: inspect attempt prompt, outputs, and instance `published/`

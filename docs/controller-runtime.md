@@ -1,8 +1,10 @@
 # Controller-Driven Runtime North Star
 
 This document defines the target runtime model for controller-driven branching
-and loops in `codex-orch`. It is intentionally future-facing. The current
-implemented runtime is documented in [docs/spec.md](./spec.md).
+and loops in `codex-orch`. Branching MVP is now implemented in the current
+runtime. This document remains future-facing for the remaining loop, channel,
+and richer workflow-state pieces. The current implemented runtime is documented
+in [docs/spec.md](./spec.md).
 
 For the future worker / assistant / human interaction control plane with named
 assistant roles and managed role-scoped preferences, see
@@ -15,25 +17,23 @@ filesystem-backed architecture.
 ## Why the current model is not enough
 
 Today's runtime already has a run-centered instance scheduler, attempt
-directories, interrupt/inbox channels, and Codex session resume. That is
-sufficient for:
+directories, interrupt/inbox channels, Codex session resume, controller route
+selection, and materialized per-instance results. That is sufficient for:
 
-- fixed `order` / `context` dependencies
-- published-artifact handoff between tasks
+- fixed `order` / `context` dependencies plus controller-driven branching
+- published-artifact handoff and path-first result/artifact refs
 - pausing and resuming the same instance after assistant or human input
 
 It is not sufficient for:
 
-- dynamic branch selection
 - loops that create multiple instances of the same logical task
-- routing based on structured state instead of raw protocol files
+- richer routing based on declared channels and loop inputs
 - replay and reconciliation when routing decisions depend on side effects
 
 The core issue is no longer basic runtime persistence or resume mechanics. The
-gap is now higher-level control semantics: the runtime still creates one initial
-instance per selected task, only understands static dependency closure, and does
-not yet have a first-class controller model that can emit routing and loop
-control facts for the scheduler to consume.
+gap is now higher-level control semantics beyond branching: loop lineage,
+declared channels, and richer workflow-state composition still need a more
+complete controller model.
 
 ## Core Principles
 

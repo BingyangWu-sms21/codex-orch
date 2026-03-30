@@ -1,7 +1,8 @@
 # Current storage and execution spec
 
-This document describes the current implemented runtime. For the future
-controller-driven runtime that supports first-class branching and loops, see
+This document describes the current implemented runtime. Controller-driven
+branching is now part of the runtime. For the remaining north-star controller
+work, especially loops and channels, see
 [docs/controller-runtime.md](./controller-runtime.md). For the future
 assistant-role interaction control plane, see
 [docs/assistant-role-control-plane.md](./assistant-role-control-plane.md).
@@ -24,6 +25,7 @@ assistant roles, local assistant scratch state, and run artifacts.
 ```text
 program/
 ├── assistant_roles/
+│   └── _shared/operating-model.md
 ├── .codex-orch/
 ├── project.yaml
 ├── tasks/
@@ -51,27 +53,40 @@ kinds:
 - `order`: execution order only
 - `context`: execution order plus explicit artifact consumption
 
-Prompt composition can consume dependency artifacts with
-`compose.kind == from_dep`, but only under an explicit `context` dependency:
+Task additions in the current runtime:
 
-- `from_dep.task` must name a task in `depends_on`
-- that dependency must be `context`
-- `from_dep.path` must be listed in the matching dependency edge's `consume`
+- `kind: work | controller`, default `work`
+- `depends_on[].as`: optional dependency scope alias
+- `control.routes[]`: valid only on `controller` tasks
+- `compose.ref`: runtime state references with path-first staging
+
+`compose.ref` supports:
+
+- `deps.<scope>.result`
+- `deps.<scope>.artifacts.<relative-path>`
+- `inputs.<key>`
+
+Artifact refs still require an explicit `context` dependency and the referenced
+artifact path must be listed in the matching `consume` list.
 
 ## Run model
 
-When a run starts, `codex-orch` resolves a static subgraph from the task pool,
-creates one runtime instance per selected task, and writes run-centered state
-under `.runs/<run-id>/`.
+When a run starts, `codex-orch` resolves a frozen task snapshot from the task
+pool, writes it under `.runs/<run-id>/`, creates seed runtime instances, and
+lets the scheduler create additional instances later as concrete dependency
+bindings and controller route selections become available.
 
 Task definitions inside the run are materialized and frozen for that run. Later
 edits to the task pool do not mutate the in-flight run.
 
-Run state is split into four areas:
+Run state is split into five areas:
 
-- `state/run.json`: run metadata and instance ids
+- `state/run.json`: run metadata plus frozen task ids and instance ids
+- `state/tasks/<task-id>.json`: frozen task snapshot
 - `state/instances/<instance-id>.json`: instance state
+- `state/results/<instance-id>.json`: materialized structured results
 - `events/*.json`: append-only runtime events
+- `proposals/*.json`: recorded assistant update proposals
 - `inbox/interrupts/*.json` and `inbox/replies/*.json`: external interaction
   envelopes
 
@@ -98,6 +113,14 @@ Each attempt directory contains:
 
 Only files copied into `published/` are visible to downstream `context`
 dependencies.
+
+`compose.ref` is path-first:
+
+- runtime resolves each ref against the frozen run snapshot and materialized
+  state
+- the resolved source is staged into `attempts/<attempt-no>/context/refs/...`
+- prompt text includes staged paths and metadata, not inline copies of the
+  referenced content
 
 `runtime.json` is the attempt-local liveness record for worker execution. It
 tracks:
@@ -154,6 +177,19 @@ The helper reads runtime context from:
 Artifact paths passed with `--artifact` must be relative to
 `CODEX_ORCH_PROGRAM_DIR`.
 
+Assistant execution also requires a shared operating model document at:
+
+```text
+assistant_roles/_shared/operating-model.md
+```
+
+New programs scaffold it during `project init`. Existing programs can install it
+with:
+
+```bash
+codex-orch assistant-doc install /path/to/program
+```
+
 ## Inbox protocol
 
 Interrupt requests are stored under `inbox/interrupts/` and replies under
@@ -189,6 +225,11 @@ Reply fields include:
 - `payload`
 - optional `rationale`, `confidence`, and `citations`
 
+Assistant replies may also carry structured `proposed_updates[]`. Valid
+proposals are recorded under `.runs/<run-id>/proposals/` and invalid proposals
+are dropped with corresponding runtime events. Proposal records are manual
+operator input only and are never auto-applied by runtime automation.
+
 Assistant replies with `reply_kind=handoff_to_human` are recorded on the
 assistant interrupt and then materialize a new human interrupt on the same
 instance, but only when the task's `interaction_policy.allow_human` is true.
@@ -207,6 +248,21 @@ Run status still exposes `waiting`, but instance state now records
 - before rescheduling work, `resume_run()` first reconciles stale `running`
   instances using the active attempt `runtime.json`
 
+## Controller branching
+
+`controller` tasks must produce `result.json` with a top-level `control.labels`
+array. The scheduler materializes that result, records route decision events,
+and only then instantiates downstream route targets.
+
+Current controller rules:
+
+- branch targets must explicitly depend on the controller in `depends_on`
+- unselected branches do not get placeholder runtime instances
+- repeated activation of the same logical task is deduped by concrete
+  `dependency_instances`
+- different dependency bindings may produce multiple instances of the same
+  logical task in one run
+
 ## Timeout and recovery semantics
 
 Worker execution is guarded by two runner-level timeouts:
@@ -224,6 +280,8 @@ Recovery entrypoints:
   instances
 - `codex-orch run abort <run-id>` to stop active worker processes and fail the
   run
+- `codex-orch proposal list/show/mark ...` to inspect and track manual handling
+  of recorded assistant update proposals
 
 ## Workspace and access scope
 

@@ -42,6 +42,23 @@ class FakeRunner:
                 final_message="analysis result",
                 session_id=f"session-{request.instance_id}",
             )
+        if request.task.id == "gate":
+            payload = {
+                "result": {"summary": "ready to publish"},
+                "control": {"labels": ["done"]},
+            }
+            payload_text = json.dumps(payload, indent=2, sort_keys=True)
+            final_path.write_text(payload_text + "\n", encoding="utf-8")
+            (request.attempt_dir / "result.json").write_text(
+                payload_text + "\n",
+                encoding="utf-8",
+            )
+            return NodeExecutionResult(
+                success=True,
+                return_code=0,
+                final_message=payload_text,
+                session_id=f"session-{request.instance_id}",
+            )
         if (
             self.store is not None
             and request.task.id == "worker"
@@ -107,11 +124,18 @@ def test_run_service_materializes_context_dependencies(tmp_path: Path) -> None:
             title="Implement",
             agent="worker",
             status=TaskStatus.READY,
-            depends_on=[{"task": "analyze", "kind": "context", "consume": ["final.md"]}],
+            depends_on=[
+                {
+                    "task": "analyze",
+                    "as": "analysis",
+                    "kind": "context",
+                    "consume": ["final.md"],
+                }
+            ],
             compose=[
                 {"kind": "file", "path": "prompts/implement.md"},
-                {"kind": "from_dep", "task": "analyze", "path": "final.md"},
-                {"kind": "user_input", "key": "brief"},
+                {"kind": "ref", "ref": "deps.analysis.artifacts.final.md"},
+                {"kind": "ref", "ref": "inputs.brief"},
             ],
             publish=["final.md"],
         )
@@ -130,12 +154,29 @@ def test_run_service_materializes_context_dependencies(tmp_path: Path) -> None:
     published = (
         store.get_instance_published_dir(run.id, implement.instance_id) / "final.md"
     ).read_text(encoding="utf-8")
+    staged_dep = (
+        store.get_attempt_dir(run.id, implement.instance_id, 1)
+        / "context"
+        / "refs"
+        / "deps"
+        / "analysis"
+        / "artifacts"
+        / "final.md"
+    ).read_text(encoding="utf-8")
+    staged_input = (
+        store.get_attempt_dir(run.id, implement.instance_id, 1)
+        / "context"
+        / "refs"
+        / "inputs"
+        / "brief.txt"
+    ).read_text(encoding="utf-8")
     assert "## File Prompt: prompts/implement.md" in published
-    assert "## Dependency Context: analyze/final.md" in published
-    assert "## User Input: brief" in published
+    assert "## Ref: deps.analysis.artifacts.final.md" in published
+    assert "## Ref: inputs.brief" in published
     assert "## Execution Contract" in published
-    assert "analysis result" in published
-    assert "brief input" in published
+    assert "Read this file directly if you need its contents" in published
+    assert staged_dep == "analysis result\n"
+    assert staged_input == "brief input\n"
 
 
 def test_run_service_waits_for_blocking_interrupt_and_resumes_same_session(tmp_path: Path) -> None:
@@ -250,3 +291,88 @@ def test_abort_run_marks_active_instances_failed(tmp_path: Path) -> None:
 
     assert aborted.status is RunStatus.FAILED
     assert updated.status in {RunInstanceStatus.FAILED, RunInstanceStatus.SKIPPED}
+
+
+def test_run_service_branches_from_controller_without_placeholder_instances(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="source",
+            title="Source",
+            agent="worker",
+            status=TaskStatus.READY,
+            compose=[{"kind": "literal", "text": "prepare inputs"}],
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="gate",
+            title="Gate",
+            agent="worker",
+            kind="controller",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "source", "kind": "order", "consume": []}],
+            compose=[{"kind": "literal", "text": "emit controller result"}],
+            control={
+                "routes": [
+                    {"label": "fix", "targets": ["apply_fix"]},
+                    {"label": "done", "targets": ["publish_summary"]},
+                ]
+            },
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="apply_fix",
+            title="Apply Fix",
+            agent="worker",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "gate", "kind": "order", "consume": []}],
+            compose=[{"kind": "literal", "text": "fix things"}],
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="publish_summary",
+            title="Publish Summary",
+            agent="worker",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "gate", "as": "gate", "kind": "order", "consume": []}],
+            compose=[{"kind": "ref", "ref": "deps.gate.result"}],
+            publish=["final.md"],
+        )
+    )
+
+    runner = FakeRunner()
+    run = asyncio.run(
+        RunService(store, runner).start_run(
+            roots=["publish_summary"],
+            labels=[],
+            user_inputs=None,
+        )
+    )
+
+    assert run.status is RunStatus.DONE
+    gate = _instance_for_task(run, "gate")
+    publish = _instance_for_task(run, "publish_summary")
+    assert [instance for instance in run.instances.values() if instance.task_id == "apply_fix"] == []
+    assert store.maybe_get_instance_result(run.id, gate.instance_id) == {
+        "control": {"labels": ["done"]},
+        "result": {"summary": "ready to publish"},
+    }
+    assert "## Ref: deps.gate.result" in runner.prompts["publish_summary"]
+    staged_result = (
+        store.get_attempt_dir(run.id, publish.instance_id, 1)
+        / "context"
+        / "refs"
+        / "deps"
+        / "gate"
+        / "result.json"
+    ).read_text(encoding="utf-8")
+    assert '"labels": [' in staged_result
+    event_types = [event.event_type for event in store.list_events(run.id)]
+    assert "route_selected" in event_types
+    assert "route_unselected" in event_types

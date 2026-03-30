@@ -60,6 +60,29 @@ class ConfidenceLevel(StrEnum):
     HIGH = "high"
 
 
+class AssistantUpdateKind(StrEnum):
+    INSTRUCTION_UPDATE = "instruction_update"
+    MANAGED_ASSET_UPDATE = "managed_asset_update"
+    ROUTING_POLICY_UPDATE = "routing_policy_update"
+
+
+class AssistantUpdateContentMode(StrEnum):
+    SNIPPET = "snippet"
+    FULL_REPLACEMENT = "full_replacement"
+
+
+class RoutingPolicySection(StrEnum):
+    ASSISTANT_HINTS = "assistant_hints"
+    INTERACTION_POLICY = "interaction_policy"
+
+
+class AssistantUpdateStatus(StrEnum):
+    PROPOSED = "proposed"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    APPLIED = "applied"
+
+
 class ControlActor(StrEnum):
     ASSISTANT = "assistant"
     HUMAN = "human"
@@ -159,6 +182,90 @@ class AssistantRequest(BaseModel):
         return self
 
 
+class AssistantUpdateTarget(BaseModel):
+    role_id: str | None = None
+    managed_asset_path: str | None = None
+    task_id: str | None = None
+    routing_section: RoutingPolicySection | None = None
+
+    @model_validator(mode="after")
+    def validate_target(self) -> AssistantUpdateTarget:
+        if self.role_id is not None and not self.role_id.strip():
+            raise ValueError("role_id must not be blank")
+        if self.managed_asset_path is not None:
+            object.__setattr__(
+                self,
+                "managed_asset_path",
+                _validate_relative_program_path(self.managed_asset_path),
+            )
+        if self.task_id is not None and not self.task_id.strip():
+            raise ValueError("task_id must not be blank")
+        return self
+
+
+class AssistantUpdateProposal(BaseModel):
+    kind: AssistantUpdateKind
+    summary: str
+    rationale: str
+    suggested_content_mode: AssistantUpdateContentMode
+    suggested_content: str
+    target: AssistantUpdateTarget
+
+    @model_validator(mode="after")
+    def validate_proposal(self) -> AssistantUpdateProposal:
+        if not self.summary.strip():
+            raise ValueError("summary must not be empty")
+        if not self.rationale.strip():
+            raise ValueError("rationale must not be empty")
+        if not self.suggested_content.strip():
+            raise ValueError("suggested_content must not be empty")
+        if self.kind is AssistantUpdateKind.INSTRUCTION_UPDATE:
+            if self.target.role_id is None:
+                raise ValueError("instruction_update requires target.role_id")
+            if any(
+                value is not None
+                for value in (
+                    self.target.managed_asset_path,
+                    self.target.task_id,
+                    self.target.routing_section,
+                )
+            ):
+                raise ValueError(
+                    "instruction_update target may only set role_id"
+                )
+        elif self.kind is AssistantUpdateKind.MANAGED_ASSET_UPDATE:
+            if self.target.role_id is None or self.target.managed_asset_path is None:
+                raise ValueError(
+                    "managed_asset_update requires target.role_id and target.managed_asset_path"
+                )
+            if any(
+                value is not None
+                for value in (
+                    self.target.task_id,
+                    self.target.routing_section,
+                )
+            ):
+                raise ValueError(
+                    "managed_asset_update target may only set role_id and managed_asset_path"
+                )
+        else:
+            if self.target.task_id is None or self.target.routing_section is None:
+                raise ValueError(
+                    "routing_policy_update requires target.task_id and target.routing_section"
+                )
+            if any(
+                value is not None
+                for value in (
+                    self.target.role_id,
+                    self.target.managed_asset_path,
+                )
+            ):
+                raise ValueError(
+                    "routing_policy_update target may only set task_id and routing_section"
+                )
+        return self
+
+
 class AssistantResponse(BaseModel):
     request_id: str
     resolution_kind: ResolutionKind
@@ -166,7 +273,7 @@ class AssistantResponse(BaseModel):
     rationale: str
     confidence: ConfidenceLevel = ConfidenceLevel.MEDIUM
     citations: list[str] = Field(default_factory=list)
-    proposed_guidance_updates: list[str] = Field(default_factory=list)
+    proposed_updates: list[AssistantUpdateProposal] = Field(default_factory=list)
     proposed_control_actions: list[ControlActionKind] = Field(default_factory=list)
     created_at: str = Field(default_factory=_utc_now_iso)
 
@@ -178,6 +285,39 @@ class AssistantResponse(BaseModel):
             raise ValueError("answer must not be empty")
         if not self.rationale.strip():
             raise ValueError("rationale must not be empty")
+        return self
+
+
+class AssistantUpdateProposalRecord(BaseModel):
+    proposal_id: str
+    run_id: str
+    instance_id: str
+    interrupt_id: str
+    source_role_id: str
+    requester_task_id: str
+    proposal: AssistantUpdateProposal
+    target_file_path: str
+    status: AssistantUpdateStatus = AssistantUpdateStatus.PROPOSED
+    created_at: str = Field(default_factory=_utc_now_iso)
+    status_updated_at: str = Field(default_factory=_utc_now_iso)
+    status_note: str | None = None
+
+    @model_validator(mode="after")
+    def validate_record(self) -> AssistantUpdateProposalRecord:
+        for field_name in (
+            "proposal_id",
+            "run_id",
+            "instance_id",
+            "interrupt_id",
+            "source_role_id",
+            "requester_task_id",
+            "target_file_path",
+        ):
+            raw_value = getattr(self, field_name)
+            if not raw_value.strip():
+                raise ValueError(f"{field_name} must not be empty")
+        if self.status_note is not None and not self.status_note.strip():
+            raise ValueError("status_note must not be blank")
         return self
 
 

@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from codex_orch.domain import RunRecord, TaskSpec, TaskStatus
+from codex_orch.domain import RunRecord, TaskKind, TaskSpec, TaskStatus
 from codex_orch.runner import CodexExecRunner, TaskRunner
 from codex_orch.scheduler import RunService
 from codex_orch.store import ProjectStore
@@ -66,6 +66,7 @@ def create_app(
             {
                 "tasks": tasks,
                 "compose_example": _compose_example(),
+                "control_example": _control_example(),
             },
         )
 
@@ -82,6 +83,7 @@ def create_app(
                 "task": task,
                 "task_yaml": _task_to_yaml(task),
                 "compose_text": _compose_to_yaml(task),
+                "control_text": _control_to_yaml(task),
                 "assistant_hints_text": _assistant_hints_to_yaml(task),
                 "interaction_policy_text": _interaction_policy_to_yaml(task),
                 "incoming_edges": incoming_edges,
@@ -102,6 +104,7 @@ def create_app(
                 {
                     "tasks": task_pool.list_tasks(),
                     "compose_example": _compose_example(),
+                    "control_example": _control_example(),
                     "error": str(exc),
                 },
             )
@@ -124,6 +127,7 @@ def create_app(
                     "task": existing,
                     "task_yaml": _task_to_yaml(existing),
                     "compose_text": _compose_to_yaml(existing),
+                    "control_text": _control_to_yaml(existing),
                     "assistant_hints_text": _assistant_hints_to_yaml(existing),
                     "interaction_policy_text": _interaction_policy_to_yaml(existing),
                     "incoming_edges": [
@@ -146,6 +150,7 @@ def create_app(
         source = _form_value(form, "source", "")
         target = _form_value(form, "target", "")
         kind = _form_value(form, "kind", "order")
+        scope_alias = _nullable(_form_value(form, "scope_alias", ""))
         consume = _split_lines(_form_value(form, "consume", ""))
         from codex_orch.domain import DependencyKind  # local import to keep module surface small
 
@@ -154,6 +159,7 @@ def create_app(
             target_task_id=target,
             kind=DependencyKind(kind),
             consume=consume,
+            as_=scope_alias,
         )
         task_pool.validate_graph()
         return RedirectResponse(url=f"/tasks/{target}", status_code=303)
@@ -328,6 +334,11 @@ def _task_from_form(
         "status",
         existing.status.value if existing is not None else TaskStatus.DRAFT.value,
     )
+    kind_raw = _form_value(
+        form,
+        "kind",
+        existing.kind.value if existing is not None else TaskKind.WORK.value,
+    )
     description = _form_value(
         form,
         "description",
@@ -341,6 +352,14 @@ def _task_from_form(
     compose_payload = yaml.safe_load(compose_text) if compose_text.strip() else []
     if compose_payload is None:
         compose_payload = []
+    control_text = _form_value(
+        form,
+        "control",
+        _control_to_yaml(existing),
+    )
+    control_payload = yaml.safe_load(control_text) if control_text.strip() else None
+    if control_payload == {}:
+        control_payload = None
     publish = _split_lines(_form_value(form, "publish", "final.md"))
     labels = _split_csv(_form_value(form, "labels", ""))
     assistant_hints_text = _form_value(
@@ -409,12 +428,14 @@ def _task_from_form(
         id=task_id,
         title=title,
         agent=agent,
+        kind=TaskKind(kind_raw),
         status=TaskStatus(status_raw),
         description=description,
         labels=labels,
         depends_on=[] if existing is None else existing.depends_on,
         compose=compose_payload,
         publish=publish,
+        control=control_payload,
         assistant_hints=assistant_hints,
         interaction_policy=interaction_policy,
         model=model,
@@ -426,13 +447,22 @@ def _task_from_form(
 
 
 def _task_to_yaml(task: TaskSpec) -> str:
-    return yaml.safe_dump(task.model_dump(mode="json"), sort_keys=False)
+    return yaml.safe_dump(task.model_dump(mode="json", by_alias=True), sort_keys=False)
 
 
 def _compose_to_yaml(task: TaskSpec | None) -> str:
     if task is None:
         return _compose_example()
-    payload = [step.model_dump(mode="json", exclude_none=True) for step in task.compose]
+    payload = [
+        step.model_dump(mode="json", exclude_none=True, by_alias=True) for step in task.compose
+    ]
+    return yaml.safe_dump(payload, sort_keys=False)
+
+
+def _control_to_yaml(task: TaskSpec | None) -> str:
+    if task is None or task.control is None:
+        return yaml.safe_dump({}, sort_keys=False)
+    payload = task.control.model_dump(mode="json", exclude_none=True, by_alias=True)
     return yaml.safe_dump(payload, sort_keys=False)
 
 
@@ -454,8 +484,22 @@ def _compose_example() -> str:
     return yaml.safe_dump(
         [
             {"kind": "file", "path": "prompts/analyze.md"},
-            {"kind": "user_input", "key": "brief"},
+            {"kind": "ref", "ref": "inputs.brief"},
         ],
+        sort_keys=False,
+    )
+
+
+def _control_example() -> str:
+    return yaml.safe_dump(
+        {
+            "routes": [
+                {
+                    "label": "done",
+                    "targets": ["publish_summary"],
+                }
+            ]
+        },
         sort_keys=False,
     )
 

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import signal
 import time
 import uuid
+from itertools import product
 from datetime import UTC, datetime
 from pathlib import Path
 from textwrap import dedent
 
 from codex_orch.domain import (
-    ComposeStepKind,
     DependencyKind,
     InterruptReplyKind,
     InterruptStatus,
@@ -24,10 +25,10 @@ from codex_orch.domain import (
     RunInstanceWaitReason,
     RunRecord,
     RunStatus,
+    TaskKind,
     TaskSpec,
     TaskStatus,
 )
-from codex_orch.prompt_context import ensure_staged_compose_program_file
 from codex_orch.runner import NodeExecutionRequest, NodeExecutionResult, TaskRunner
 from codex_orch.scheduler.composer import PromptComposer
 from codex_orch.store import ProjectStore
@@ -39,7 +40,7 @@ class RunService:
         self.store = store
         self.runner = runner
         self.task_pool = TaskPoolService(store)
-        self.composer = PromptComposer(store.paths.root)
+        self.composer = PromptComposer(store)
         self._run_locks: dict[str, asyncio.Lock] = {}
 
     def create_snapshot(
@@ -63,51 +64,26 @@ class RunService:
                 task.id for task in tasks.values() if set(task.labels) & set(labels)
             )
         run_id = self._new_run_id()
-        task_to_instance_id = {
-            task_id: self._new_instance_id(task_id)
-            for task_id in sorted(selected)
+        materialized_tasks = {
+            task_id: self._materialize_task(project, task)
+            for task_id, task in selected.items()
         }
-        instances: dict[str, RunInstanceState] = {}
-        for task_id, task in selected.items():
-            materialized = self._materialize_task(project, task)
-            instances[task_to_instance_id[task_id]] = RunInstanceState(
-                instance_id=task_to_instance_id[task_id],
-                task_id=task_id,
-                task=materialized,
-                dependency_instances={
-                    dependency.task: task_to_instance_id[dependency.task]
-                    for dependency in materialized.depends_on
-                    if dependency.task in task_to_instance_id
-                },
-            )
         run = RunRecord(
             id=run_id,
             roots=sorted(resolved_roots),
             user_inputs=merged_inputs,
             project=project,
-            instances=instances,
+            tasks=materialized_tasks,
+            instances={},
         )
-        self._refresh_runnable_instances(run)
-        self.store.save_run(run)
         self.store.append_event(
             run.id,
             "run_created",
-            payload={"roots": run.roots, "instance_ids": sorted(run.instances)},
+            payload={"roots": run.roots, "task_ids": sorted(run.tasks)},
         )
-        for instance in run.instances.values():
-            self.store.append_event(
-                run.id,
-                "instance_created",
-                instance_id=instance.instance_id,
-                payload={"task_id": instance.task_id},
-            )
-            if instance.status is RunInstanceStatus.RUNNABLE:
-                self.store.append_event(
-                    run.id,
-                    "instance_runnable",
-                    instance_id=instance.instance_id,
-                    payload={"task_id": instance.task_id},
-                )
+        self._sync_instances(run)
+        self._refresh_runnable_instances(run)
+        self.store.save_run(run)
         return run
 
     async def start_run(
@@ -180,10 +156,10 @@ class RunService:
                     finished_at=runtime.finished_at,
                 )
                 changed = True
+            self._sync_instances(run)
             self._refresh_runnable_instances(run)
             self._finalize_run_state(run)
-            if changed:
-                self.store.save_run(run)
+            self.store.save_run(run)
             return run
 
     async def abort_run(self, run_id: str) -> RunRecord:
@@ -242,6 +218,7 @@ class RunService:
             lock = self._run_lock(run_id)
             async with lock:
                 run = self.store.get_run(run_id)
+                self._sync_instances(run)
                 self._refresh_runnable_instances(run)
                 runnable_ids = [
                     instance.instance_id
@@ -276,34 +253,26 @@ class RunService:
         async with lock:
             run = self.store.get_run(run_id)
             instance = run.instances[instance_id]
+            task = run.tasks[instance.task_id]
             if instance.status is not RunInstanceStatus.RUNNABLE:
                 return
             next_attempt = instance.attempt + 1
             attempt_dir = self.store.get_attempt_dir(run_id, instance_id, next_attempt)
-            self._materialize_attempt_context(instance.task, attempt_dir)
+            self._materialize_attempt_context(task, attempt_dir)
             prompt = self._build_attempt_prompt(run, instance, attempt_dir)
-            dependency_dirs = {
-                dependency.task: self.store.get_instance_dir(
-                    run_id,
-                    instance.dependency_instances[dependency.task],
-                )
-                for dependency in instance.task.depends_on
-                if dependency.task in instance.dependency_instances
-            }
             project_workspace_dir = self._resolve_project_workspace_dir(run.project)
-            workspace_dir = self._resolve_task_workspace_dir(run.project, instance.task)
+            workspace_dir = self._resolve_task_workspace_dir(run.project, task)
             extra_writable_roots = tuple(
                 Path(root)
                 for root in self._resolve_task_extra_writable_roots(
-                    instance.task,
+                    task,
                     workspace_dir,
                 )
             )
             rendered_prompt = self.composer.render(
-                instance.task,
+                run=run,
+                instance=instance,
                 node_dir=attempt_dir,
-                user_inputs=dict(run.user_inputs),
-                dependency_node_dirs=dependency_dirs,
             )
             full_prompt = "\n\n".join(
                 section for section in [rendered_prompt, prompt] if section
@@ -334,7 +303,7 @@ class RunService:
                 attempt_dir=attempt_dir,
                 resume_session_id=instance.session_id,
                 project=run.project,
-                task=instance.task,
+                task=task,
                 prompt=full_prompt,
             )
 
@@ -343,6 +312,7 @@ class RunService:
         async with lock:
             run = self.store.get_run(run_id)
             instance = run.instances[instance_id]
+            task = run.tasks[instance.task_id]
             instance.finished_at = datetime.now(UTC).isoformat()
             instance.termination_reason = self._result_termination_reason(result)
             if result.session_id is not None:
@@ -365,15 +335,23 @@ class RunService:
                 )
             elif result.success:
                 try:
+                    self._materialize_instance_result(
+                        run.id,
+                        task,
+                        instance_id,
+                        instance.attempt,
+                    )
                     instance.published = self._promote_artifacts(
                         run.id,
                         instance,
+                        task,
                         instance.attempt,
                     )
                 except ValueError as exc:
                     instance.status = RunInstanceStatus.FAILED
                     instance.waiting_reason = None
                     instance.error = str(exc)
+                    self.store.delete_instance_result(run.id, instance_id)
                     self._set_task_pool_status(instance.task_id, TaskStatus.FAILED)
                 else:
                     instance.status = RunInstanceStatus.DONE
@@ -390,6 +368,7 @@ class RunService:
                 instance.status = RunInstanceStatus.FAILED
                 instance.waiting_reason = None
                 instance.error = result.error
+                self.store.delete_instance_result(run.id, instance_id)
                 self._set_task_pool_status(instance.task_id, TaskStatus.FAILED)
                 self.store.append_event(
                     run.id,
@@ -416,17 +395,18 @@ class RunService:
         instance: RunInstanceState,
         attempt_dir: Path,
     ) -> str:
+        task = run.tasks[instance.task_id]
         if instance.session_id is None:
             return self._execution_contract_appendix(
-                task=instance.task,
+                task=task,
                 attempt_dir=attempt_dir,
                 project_workspace_dir=self._resolve_project_workspace_dir(run.project),
-                workspace_dir=self._resolve_task_workspace_dir(run.project, instance.task),
+                workspace_dir=self._resolve_task_workspace_dir(run.project, task),
                 extra_writable_roots=tuple(
                     Path(root)
                     for root in self._resolve_task_extra_writable_roots(
-                        instance.task,
-                        self._resolve_task_workspace_dir(run.project, instance.task),
+                        task,
+                        self._resolve_task_workspace_dir(run.project, task),
                     )
                 ),
             )
@@ -503,6 +483,7 @@ class RunService:
 
     def _refresh_runnable_instances(self, run: RunRecord) -> None:
         for instance in run.instances.values():
+            task = run.tasks[instance.task_id]
             self._refresh_instance_interrupts(run.id, instance)
             if instance.status is RunInstanceStatus.WAITING:
                 if instance.blocking_interrupts:
@@ -526,7 +507,7 @@ class RunService:
                 instance.error = "upstream dependency failed"
                 self._set_task_pool_status(instance.task_id, TaskStatus.BLOCKED)
                 continue
-            if self._dependencies_satisfied(run, instance):
+            if self._dependencies_satisfied(run, instance, task):
                 instance.status = RunInstanceStatus.RUNNABLE
                 instance.waiting_reason = None
                 self.store.append_event(
@@ -540,8 +521,9 @@ class RunService:
         self,
         run: RunRecord,
         instance: RunInstanceState,
+        task: TaskSpec,
     ) -> bool:
-        for dependency in instance.task.depends_on:
+        for dependency in task.depends_on:
             upstream_instance_id = instance.dependency_instances.get(dependency.task)
             if upstream_instance_id is None:
                 return False
@@ -555,7 +537,8 @@ class RunService:
         return True
 
     def _dependency_failed(self, run: RunRecord, instance: RunInstanceState) -> bool:
-        for dependency in instance.task.depends_on:
+        task = run.tasks[instance.task_id]
+        for dependency in task.depends_on:
             upstream_instance_id = instance.dependency_instances.get(dependency.task)
             if upstream_instance_id is None:
                 return False
@@ -563,6 +546,222 @@ class RunService:
             if upstream.status in {RunInstanceStatus.FAILED, RunInstanceStatus.SKIPPED}:
                 return True
         return False
+
+    def _sync_instances(self, run: RunRecord) -> None:
+        lineage_cache: dict[str, dict[str, str]] = {}
+        while True:
+            created = False
+            existing_keys = {
+                (
+                    instance.task_id,
+                    tuple(sorted(instance.dependency_instances.items())),
+                )
+                for instance in run.instances.values()
+            }
+            for task_id in sorted(run.tasks):
+                task = run.tasks[task_id]
+                for dependency_instances, activation_bindings in self._candidate_instance_bindings(
+                    run,
+                    task,
+                    lineage_cache,
+                ):
+                    key = (task_id, tuple(sorted(dependency_instances.items())))
+                    if key in existing_keys:
+                        continue
+                    instance = RunInstanceState(
+                        instance_id=self._new_instance_id(task_id),
+                        task_id=task_id,
+                        dependency_instances=dependency_instances,
+                        activation_bindings=activation_bindings,
+                    )
+                    run.instances[instance.instance_id] = instance
+                    existing_keys.add(key)
+                    self.store.append_event(
+                        run.id,
+                        "instance_created",
+                        instance_id=instance.instance_id,
+                        payload={
+                            "task_id": task_id,
+                            "dependency_instances": dependency_instances,
+                            "activation_bindings": activation_bindings,
+                        },
+                    )
+                    lineage_cache.clear()
+                    created = True
+            if not created:
+                return
+
+    def _candidate_instance_bindings(
+        self,
+        run: RunRecord,
+        task: TaskSpec,
+        lineage_cache: dict[str, dict[str, str]],
+    ) -> list[tuple[dict[str, str], dict[str, str]]]:
+        if not task.depends_on:
+            return [({}, {})]
+
+        dependency_candidates: list[list[RunInstanceState]] = []
+        routing_controller_id = self._task_route_controller_id(run.tasks, task.id)
+        for dependency in task.depends_on:
+            candidates = self._dependency_candidate_instances(
+                run,
+                task,
+                dependency.task,
+                routing_controller_id=routing_controller_id,
+            )
+            if not candidates:
+                return []
+            dependency_candidates.append(candidates)
+
+        bindings: list[tuple[dict[str, str], dict[str, str]]] = []
+        for combo in product(*dependency_candidates):
+            dependency_instances = {
+                dependency.task: candidate.instance_id
+                for dependency, candidate in zip(task.depends_on, combo, strict=True)
+            }
+            merged_lineage: dict[str, str] = {}
+            activation_bindings: dict[str, str] = {}
+            valid = True
+            for candidate in combo:
+                if not self._merge_mapping(
+                    merged_lineage,
+                    self._instance_lineage(run, candidate.instance_id, lineage_cache),
+                ):
+                    valid = False
+                    break
+                if not self._merge_mapping(
+                    activation_bindings,
+                    candidate.activation_bindings,
+                ):
+                    valid = False
+                    break
+            if not valid:
+                continue
+            if routing_controller_id is not None:
+                controller_instance_id = dependency_instances.get(routing_controller_id)
+                if controller_instance_id is None:
+                    continue
+                current = activation_bindings.get(routing_controller_id)
+                if current is not None and current != controller_instance_id:
+                    continue
+                activation_bindings[routing_controller_id] = controller_instance_id
+            bindings.append((dependency_instances, activation_bindings))
+        return bindings
+
+    def _dependency_candidate_instances(
+        self,
+        run: RunRecord,
+        task: TaskSpec,
+        dependency_task_id: str,
+        *,
+        routing_controller_id: str | None,
+    ) -> list[RunInstanceState]:
+        candidates = sorted(
+            (
+                instance
+                for instance in run.instances.values()
+                if instance.task_id == dependency_task_id
+            ),
+            key=lambda instance: instance.instance_id,
+        )
+        if routing_controller_id != dependency_task_id:
+            return candidates
+        return [
+            instance
+            for instance in candidates
+            if self._controller_instance_selects_target(run, instance, task.id)
+        ]
+
+    def _task_route_controller_id(
+        self,
+        tasks: dict[str, TaskSpec],
+        task_id: str,
+    ) -> str | None:
+        for candidate in tasks.values():
+            if candidate.kind is not TaskKind.CONTROLLER or candidate.control is None:
+                continue
+            for route in candidate.control.routes:
+                if task_id in route.targets:
+                    return candidate.id
+        return None
+
+    def _controller_instance_selects_target(
+        self,
+        run: RunRecord,
+        instance: RunInstanceState,
+        target_task_id: str,
+    ) -> bool:
+        task = run.tasks[instance.task_id]
+        if task.kind is not TaskKind.CONTROLLER or task.control is None:
+            return False
+        labels = self._controller_labels_for_instance(run.id, instance.instance_id)
+        if labels is None:
+            return False
+        for route in task.control.routes:
+            if route.label in labels and target_task_id in route.targets:
+                return True
+        return False
+
+    def _controller_labels_for_instance(
+        self,
+        run_id: str,
+        instance_id: str,
+    ) -> set[str] | None:
+        payload = self.store.maybe_get_instance_result(run_id, instance_id)
+        if not isinstance(payload, dict):
+            return None
+        control = payload.get("control")
+        if not isinstance(control, dict):
+            return None
+        labels = control.get("labels")
+        if not isinstance(labels, list):
+            return None
+        normalized: set[str] = set()
+        for label in labels:
+            if not isinstance(label, str) or not label.strip():
+                return None
+            normalized.add(label)
+        return normalized
+
+    def _instance_lineage(
+        self,
+        run: RunRecord,
+        instance_id: str,
+        lineage_cache: dict[str, dict[str, str]],
+    ) -> dict[str, str]:
+        cached = lineage_cache.get(instance_id)
+        if cached is not None:
+            return dict(cached)
+        instance = run.instances[instance_id]
+        lineage = {instance.task_id: instance.instance_id}
+        for dependency_instance_id in instance.dependency_instances.values():
+            if dependency_instance_id not in run.instances:
+                raise ValueError(
+                    f"instance {instance.instance_id} references missing dependency instance {dependency_instance_id}"
+                )
+            dependency_lineage = self._instance_lineage(
+                run,
+                dependency_instance_id,
+                lineage_cache,
+            )
+            if not self._merge_mapping(lineage, dependency_lineage):
+                raise ValueError(
+                    f"instance {instance.instance_id} has ambiguous lineage"
+                )
+        lineage_cache[instance_id] = dict(lineage)
+        return lineage
+
+    def _merge_mapping(
+        self,
+        target: dict[str, str],
+        source: dict[str, str],
+    ) -> bool:
+        for key, value in source.items():
+            current = target.get(key)
+            if current is not None and current != value:
+                return False
+            target[key] = value
+        return True
 
     def _finalize_run_state(self, run: RunRecord) -> None:
         statuses = {instance.status for instance in run.instances.values()}
@@ -610,6 +809,7 @@ class RunService:
         runtime: NodeExecutionRuntime,
     ) -> None:
         instance = run.instances[instance_id]
+        task = run.tasks[instance.task_id]
         termination_reason = self._resolve_runtime_termination_reason(runtime)
         instance.finished_at = runtime.finished_at
         instance.termination_reason = termination_reason
@@ -622,12 +822,20 @@ class RunService:
                 self._set_task_pool_status(instance.task_id, TaskStatus.BLOCKED)
                 return
             try:
+                self._materialize_instance_result(
+                    run.id,
+                    task,
+                    instance_id,
+                    instance.attempt,
+                )
                 instance.published = self._promote_artifacts(
                     run.id,
                     instance,
+                    task,
                     instance.attempt,
                 )
             except ValueError as exc:
+                self.store.delete_instance_result(run.id, instance_id)
                 self._mark_instance_failed(
                     run,
                     instance_id,
@@ -641,6 +849,7 @@ class RunService:
                 instance.error = None
                 self._set_task_pool_status(instance.task_id, TaskStatus.DONE)
             return
+        self.store.delete_instance_result(run.id, instance_id)
         self._mark_instance_failed(
             run,
             instance_id,
@@ -731,6 +940,7 @@ class RunService:
         self,
         run_id: str,
         instance: RunInstanceState,
+        task: TaskSpec,
         attempt_no: int,
     ) -> list[PublishedArtifact]:
         attempt_dir = self.store.get_attempt_dir(run_id, instance.instance_id, attempt_no)
@@ -740,7 +950,7 @@ class RunService:
         published_dir.mkdir(parents=True, exist_ok=True)
 
         artifacts: list[PublishedArtifact] = []
-        for relative_path in instance.task.publish:
+        for relative_path in task.publish:
             source = attempt_dir / relative_path
             if not source.exists():
                 raise ValueError(
@@ -751,6 +961,105 @@ class RunService:
             shutil.copy2(source, destination)
             artifacts.append(PublishedArtifact(relative_path=relative_path))
         return artifacts
+
+    def _materialize_instance_result(
+        self,
+        run_id: str,
+        task: TaskSpec,
+        instance_id: str,
+        attempt_no: int,
+    ) -> None:
+        payload = self._load_attempt_result_payload(
+            run_id=run_id,
+            instance_id=instance_id,
+            task=task,
+            attempt_no=attempt_no,
+        )
+        if payload is None:
+            self.store.delete_instance_result(run_id, instance_id)
+            return
+        labels: list[str] | None = None
+        if task.kind is TaskKind.CONTROLLER:
+            labels = self._validate_controller_result(task, payload)
+        self.store.save_instance_result(run_id, instance_id, payload)
+        self.store.append_event(
+            run_id,
+            "result_materialized",
+            instance_id=instance_id,
+            payload={"task_id": task.id},
+        )
+        if task.kind is not TaskKind.CONTROLLER:
+            return
+        assert labels is not None
+        self.store.append_event(
+            run_id,
+            "control_emitted",
+            instance_id=instance_id,
+            payload={"labels": labels},
+        )
+        assert task.control is not None
+        label_set = set(labels)
+        for route in task.control.routes:
+            self.store.append_event(
+                run_id,
+                "route_selected" if route.label in label_set else "route_unselected",
+                instance_id=instance_id,
+                payload={"label": route.label, "targets": route.targets},
+            )
+
+    def _load_attempt_result_payload(
+        self,
+        *,
+        run_id: str,
+        instance_id: str,
+        task: TaskSpec,
+        attempt_no: int,
+    ) -> object | None:
+        result_path = self.store.get_attempt_dir(run_id, instance_id, attempt_no) / "result.json"
+        if not result_path.exists():
+            if task.kind is TaskKind.CONTROLLER:
+                raise ValueError(f"controller task {task.id} did not produce result.json")
+            if task.result_schema is not None or "result.json" in task.publish:
+                raise ValueError(f"task {task.id} did not produce required result.json")
+            return None
+        try:
+            return json.loads(result_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"task {task.id} produced invalid result.json: {exc}") from exc
+
+    def _validate_controller_result(
+        self,
+        task: TaskSpec,
+        payload: object,
+    ) -> list[str]:
+        if not isinstance(payload, dict):
+            raise ValueError(f"controller task {task.id} result.json must be a JSON object")
+        control = payload.get("control")
+        if not isinstance(control, dict):
+            raise ValueError(f"controller task {task.id} result.json must include control")
+        unsupported_keys = sorted(set(control) - {"labels"})
+        if unsupported_keys:
+            raise ValueError(
+                f"controller task {task.id} emitted unsupported control keys: {', '.join(unsupported_keys)}"
+            )
+        labels = control.get("labels")
+        if not isinstance(labels, list):
+            raise ValueError(f"controller task {task.id} control.labels must be a list")
+        normalized: list[str] = []
+        for label in labels:
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError(
+                    f"controller task {task.id} control.labels must contain non-empty strings"
+                )
+            normalized.append(label)
+        assert task.control is not None
+        declared_labels = {route.label for route in task.control.routes}
+        undeclared = sorted(label for label in set(normalized) if label not in declared_labels)
+        if undeclared:
+            raise ValueError(
+                f"controller task {task.id} emitted undeclared labels: {', '.join(undeclared)}"
+            )
+        return normalized
 
     def _materialize_task(self, project: ProjectSpec, task: TaskSpec) -> TaskSpec:
         effective_sandbox = task.sandbox or project.default_sandbox
@@ -783,13 +1092,6 @@ class RunService:
         return task.model_copy(update=updates)
 
     def _materialize_attempt_context(self, task: TaskSpec, attempt_dir: Path) -> None:
-        for step in task.compose:
-            if step.kind is ComposeStepKind.FILE and step.path is not None:
-                ensure_staged_compose_program_file(
-                    program_dir=self.store.paths.root,
-                    node_dir=attempt_dir,
-                    relative_path=step.path,
-                )
         self._write_interrupt_help_doc(attempt_dir=attempt_dir, task=task)
 
     def _interrupt_help_doc_path(self, attempt_dir: Path) -> Path:
@@ -931,6 +1233,17 @@ class RunService:
         )
         if task.result_schema is not None:
             sections.append(f"### Result Schema\n- `{task.result_schema}`")
+        if task.kind is TaskKind.CONTROLLER:
+            sections.append(
+                "\n".join(
+                    [
+                        "### Controller Result Contract",
+                        "- Your final response must be a JSON object saved as `result.json`.",
+                        '- It must include a top-level `control` object with `labels: string[]`.',
+                        "- `control` may not contain loop or channel fields in this runtime.",
+                    ]
+                )
+            )
         sections.append(
             "\n".join(
                 [

@@ -8,8 +8,11 @@ from pathlib import Path
 
 import yaml
 
+from codex_orch.assistant_docs import program_assistant_operating_model_path
 from codex_orch.domain import (
     AssistantRoleSpec,
+    AssistantUpdateProposalRecord,
+    AssistantUpdateStatus,
     DependencyEdge,
     DependencyKind,
     InterruptAudience,
@@ -120,7 +123,10 @@ class ProjectStore:
         return TaskSpec.model_validate(payload)
 
     def save_task(self, task: TaskSpec) -> None:
-        _write_yaml(self._task_path(task.id), task.model_dump(mode="json"))
+        _write_yaml(
+            self._task_path(task.id),
+            task.model_dump(mode="json", by_alias=True),
+        )
 
     def delete_task(self, task_id: str) -> None:
         path = self._task_path(task_id)
@@ -141,6 +147,7 @@ class ProjectStore:
         target_task_id: str,
         kind: DependencyKind,
         consume: list[str],
+        as_: str | None = None,
     ) -> TaskSpec:
         target = self.get_task(target_task_id)
         filtered = [
@@ -149,7 +156,7 @@ class ProjectStore:
             if dependency.task != source_task_id or dependency.kind is not kind
         ]
         filtered.append(
-            DependencyEdge(task=source_task_id, kind=kind, consume=consume)
+            DependencyEdge(task=source_task_id, kind=kind, consume=consume, as_=as_)
         )
         updated = target.model_copy(update={"depends_on": filtered})
         self.save_task(updated)
@@ -214,6 +221,17 @@ class ProjectStore:
         workspace_dir = self.paths.assistant_role_workspaces_dir / role_id / "workspace"
         workspace_dir.mkdir(parents=True, exist_ok=True)
         return workspace_dir
+
+    def get_assistant_operating_model_path(self) -> Path:
+        return program_assistant_operating_model_path(self.paths.root)
+
+    def load_assistant_operating_model(self) -> str:
+        path = self.get_assistant_operating_model_path()
+        if not path.exists():
+            raise KeyError(
+                "assistant operating model is missing; install assistant_roles/_shared/operating-model.md first"
+            )
+        return path.read_text(encoding="utf-8").strip()
 
     def _resolve_assistant_role_asset_path(self, role_dir: Path, relative_path: str) -> Path:
         role_local_path = role_dir / relative_path
@@ -281,10 +299,16 @@ class ProjectStore:
         _write_json(
             self.get_run_state_path(run.id),
             {
-                **run.model_dump(mode="json", exclude={"instances"}),
+                **run.model_dump(mode="json", exclude={"instances", "tasks"}),
+                "task_ids": sorted(run.tasks),
                 "instance_ids": sorted(run.instances),
             },
         )
+        for task_id, task in run.tasks.items():
+            _write_json(
+                self.get_run_task_path(run.id, task_id),
+                task.model_dump(mode="json", by_alias=True),
+            )
         for instance_id, instance in run.instances.items():
             _write_json(
                 self.get_instance_state_path(run.id, instance_id),
@@ -302,15 +326,23 @@ class ProjectStore:
         if not run_path.exists():
             raise KeyError(f"run {run_id} does not exist")
         summary = _read_json(run_path)
+        task_ids = summary.pop("task_ids", None)
+        if not isinstance(task_ids, list):
+            raise ValueError("run state task_ids must be a list")
         instance_ids = summary.pop("instance_ids", [])
         if not isinstance(instance_ids, list):
             raise ValueError("run state instance_ids must be a list")
+        tasks: dict[str, TaskSpec] = {}
+        for task_id in task_ids:
+            payload = _read_json(self.get_run_task_path(run_id, str(task_id)))
+            task = TaskSpec.model_validate(payload)
+            tasks[task.id] = task
         instances: dict[str, RunInstanceState] = {}
         for instance_id in instance_ids:
             payload = _read_json(self.get_instance_state_path(run_id, str(instance_id)))
             instance = RunInstanceState.model_validate(payload)
             instances[instance.instance_id] = instance
-        return RunRecord.model_validate({**summary, "instances": instances})
+        return RunRecord.model_validate({**summary, "tasks": tasks, "instances": instances})
 
     def get_run_dir(self, run_id: str) -> Path:
         run_dir = self.paths.runs_dir / run_id
@@ -329,6 +361,36 @@ class ProjectStore:
         path = self.get_run_state_dir(run_id) / "instances"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def get_run_tasks_dir(self, run_id: str) -> Path:
+        path = self.get_run_state_dir(run_id) / "tasks"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_run_task_path(self, run_id: str, task_id: str) -> Path:
+        return self.get_run_tasks_dir(run_id) / f"{task_id}.json"
+
+    def get_results_state_dir(self, run_id: str) -> Path:
+        path = self.get_run_state_dir(run_id) / "results"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_result_state_path(self, run_id: str, instance_id: str) -> Path:
+        return self.get_results_state_dir(run_id) / f"{instance_id}.json"
+
+    def save_instance_result(self, run_id: str, instance_id: str, payload: object) -> None:
+        _write_json(self.get_result_state_path(run_id, instance_id), payload)
+
+    def maybe_get_instance_result(self, run_id: str, instance_id: str) -> object | None:
+        path = self.get_result_state_path(run_id, instance_id)
+        if not path.exists():
+            return None
+        return _read_json(path)
+
+    def delete_instance_result(self, run_id: str, instance_id: str) -> None:
+        path = self.get_result_state_path(run_id, instance_id)
+        if path.exists():
+            path.unlink()
 
     def get_instance_state_path(self, run_id: str, instance_id: str) -> Path:
         return self.get_instances_state_dir(run_id) / f"{instance_id}.json"
@@ -447,6 +509,14 @@ class ProjectStore:
     def get_reply_path(self, run_id: str, interrupt_id: str) -> Path:
         return self.get_replies_dir(run_id) / f"{interrupt_id}.json"
 
+    def get_proposals_dir(self, run_id: str) -> Path:
+        path = self.get_run_dir(run_id) / "proposals"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_proposal_path(self, run_id: str, proposal_id: str) -> Path:
+        return self.get_proposals_dir(run_id) / f"{proposal_id}.json"
+
     def create_interrupt(
         self,
         *,
@@ -509,6 +579,20 @@ class ProjectStore:
             self.get_interrupt_path(interrupt.run_id, interrupt.interrupt_id),
             interrupt.model_dump(mode="json"),
         )
+
+    def save_proposal(self, proposal: AssistantUpdateProposalRecord) -> None:
+        _write_json(
+            self.get_proposal_path(proposal.run_id, proposal.proposal_id),
+            proposal.model_dump(mode="json"),
+        )
+
+    def delete_proposals_for_interrupt(self, run_id: str, interrupt_id: str) -> None:
+        for proposal in self.list_proposals(run_id=run_id):
+            if proposal.interrupt_id != interrupt_id:
+                continue
+            path = self.get_proposal_path(run_id, proposal.proposal_id)
+            if path.exists():
+                path.unlink()
 
     def save_interrupt_reply(
         self,
@@ -589,6 +673,72 @@ class ProjectStore:
             return None
         return InterruptReply.model_validate(_read_json(path))
 
+    def get_proposal(
+        self,
+        run_id: str,
+        proposal_id: str,
+    ) -> AssistantUpdateProposalRecord:
+        path = self.get_proposal_path(run_id, proposal_id)
+        if not path.exists():
+            raise KeyError(f"proposal {proposal_id} does not exist in run {run_id}")
+        return AssistantUpdateProposalRecord.model_validate(_read_json(path))
+
+    def list_proposals(
+        self,
+        *,
+        run_id: str | None = None,
+        status: AssistantUpdateStatus | None = None,
+    ) -> list[AssistantUpdateProposalRecord]:
+        run_ids: list[str]
+        if run_id is not None:
+            run_ids = [run_id]
+        else:
+            run_ids = [path.name for path in sorted(self.paths.runs_dir.iterdir()) if path.is_dir()]
+        proposals: list[AssistantUpdateProposalRecord] = []
+        for current_run_id in run_ids:
+            proposals_dir = self.get_proposals_dir(current_run_id)
+            for path in sorted(proposals_dir.glob("*.json")):
+                proposal = AssistantUpdateProposalRecord.model_validate(_read_json(path))
+                if status is not None and proposal.status is not status:
+                    continue
+                proposals.append(proposal)
+        return proposals
+
+    def find_proposal(self, proposal_id: str) -> AssistantUpdateProposalRecord:
+        for proposal in self.list_proposals():
+            if proposal.proposal_id == proposal_id:
+                return proposal
+        raise KeyError(f"proposal {proposal_id} does not exist")
+
+    def mark_proposal_status(
+        self,
+        proposal_id: str,
+        *,
+        status: AssistantUpdateStatus,
+        note: str | None = None,
+    ) -> AssistantUpdateProposalRecord:
+        proposal = self.find_proposal(proposal_id)
+        updated = AssistantUpdateProposalRecord.model_validate(
+            proposal.model_dump(mode="python")
+            | {
+                "status": status,
+                "status_updated_at": datetime.now(UTC).isoformat(),
+                "status_note": note,
+            }
+        )
+        self.save_proposal(updated)
+        self.append_event(
+            updated.run_id,
+            "proposal_status_updated",
+            instance_id=updated.instance_id,
+            payload={
+                "proposal_id": updated.proposal_id,
+                "status": updated.status.value,
+                "note": note,
+            },
+        )
+        return updated
+
     def list_interrupts(
         self,
         *,
@@ -650,17 +800,19 @@ class ProjectStore:
             run = self.get_run(run_id)
         except KeyError:
             return None
-        for instance in run.instances.values():
-            if instance.task_id == task_id:
-                return instance.task
-        return None
+        return run.tasks.get(task_id)
 
-    def get_instance_for_task(self, run_id: str, task_id: str) -> RunInstanceState:
+    def list_instances_for_task(
+        self,
+        run_id: str,
+        task_id: str,
+    ) -> list[RunInstanceState]:
         run = self.get_run(run_id)
-        for instance in run.instances.values():
-            if instance.task_id == task_id:
-                return instance
-        raise KeyError(f"task {task_id} does not exist in run {run_id}")
+        return [
+            instance
+            for instance in run.instances.values()
+            if instance.task_id == task_id
+        ]
 
     def _task_path(self, task_id: str) -> Path:
         return self.paths.tasks_dir / f"{task_id}.yaml"

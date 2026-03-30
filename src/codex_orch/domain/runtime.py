@@ -156,9 +156,7 @@ class InterruptRequest(BaseModel):
                 raise ValueError(
                     "assistant interrupts must include resolved_target_role_id"
                 )
-            if not self.resolved_target_role_id:
-                raise ValueError("resolved_target_role_id must not be blank")
-            if self.target_resolution_reason is None or not self.target_resolution_reason:
+            if self.target_resolution_reason is None:
                 raise ValueError(
                     "assistant interrupts must include target_resolution_reason"
                 )
@@ -170,9 +168,7 @@ class InterruptRequest(BaseModel):
                 "target_resolution_reason",
             ):
                 if getattr(self, field_name) is not None:
-                    raise ValueError(
-                        f"human interrupts must not set {field_name}"
-                    )
+                    raise ValueError(f"human interrupts must not set {field_name}")
         return self
 
 
@@ -201,8 +197,8 @@ class InterruptReply(BaseModel):
 class RunInstanceState(BaseModel):
     instance_id: str
     task_id: str
-    task: TaskSpec
     dependency_instances: dict[str, str] = Field(default_factory=dict)
+    activation_bindings: dict[str, str] = Field(default_factory=dict)
     status: RunInstanceStatus = RunInstanceStatus.PENDING
     waiting_reason: RunInstanceWaitReason | None = None
     published: list[PublishedArtifact] = Field(default_factory=list)
@@ -220,8 +216,13 @@ class RunInstanceState(BaseModel):
             raise ValueError("instance_id must not be empty")
         if not self.task_id.strip():
             raise ValueError("task_id must not be empty")
-        if self.task.id != self.task_id:
-            raise ValueError("task.id must match task_id")
+        for mapping_name in ("dependency_instances", "activation_bindings"):
+            raw_mapping = getattr(self, mapping_name)
+            for key, value in raw_mapping.items():
+                if not key.strip():
+                    raise ValueError(f"{mapping_name} keys must not be empty")
+                if not value.strip():
+                    raise ValueError(f"{mapping_name} values must not be empty")
         return self
 
 
@@ -233,6 +234,7 @@ class RunRecord(BaseModel):
     status: RunStatus = RunStatus.PENDING
     user_inputs: dict[str, str] = Field(default_factory=dict)
     project: ProjectSpec
+    tasks: dict[str, TaskSpec]
     instances: dict[str, RunInstanceState]
 
     @model_validator(mode="after")
@@ -241,6 +243,14 @@ class RunRecord(BaseModel):
             raise ValueError("id must not be empty")
         if not self.roots:
             raise ValueError("roots must not be empty")
-        if not self.instances:
-            raise ValueError("instances must not be empty")
+        if not self.tasks:
+            raise ValueError("tasks must not be empty")
+        for task_id, task in self.tasks.items():
+            if task.id != task_id:
+                raise ValueError("run task snapshot keys must match task ids")
+        for instance in self.instances.values():
+            if instance.task_id not in self.tasks:
+                raise ValueError(
+                    f"instance {instance.instance_id} references missing task {instance.task_id}"
+                )
         return self

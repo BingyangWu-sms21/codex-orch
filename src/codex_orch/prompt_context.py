@@ -99,6 +99,63 @@ def ensure_staged_dependency_file(
     )
 
 
+def ensure_staged_ref_file(
+    *,
+    node_dir: Path,
+    source_kind: str,
+    source_reference: str,
+    source_path: Path,
+    staged_relative_path: str,
+    require_text: bool,
+    missing_error: str,
+    non_file_error: str,
+) -> StagedPromptFile:
+    return _ensure_staged_file(
+        node_dir=node_dir,
+        source_kind=source_kind,
+        source_reference=source_reference,
+        source_path=source_path,
+        staged_path=node_dir / staged_relative_path,
+        require_text=require_text,
+        missing_error=missing_error,
+        non_file_error=non_file_error,
+    )
+
+
+def ensure_staged_generated_text(
+    *,
+    node_dir: Path,
+    source_kind: str,
+    source_reference: str,
+    staged_relative_path: str,
+    text: str,
+) -> StagedPromptFile:
+    staged_path = node_dir / staged_relative_path
+    raw = text.encode("utf-8")
+    staged_path.parent.mkdir(parents=True, exist_ok=True)
+    staged_path.write_bytes(raw)
+    is_text, inline_text, preview_text, truncated = _classify_content(
+        raw,
+        require_text=True,
+        error_label=source_reference,
+    )
+    staged_file = StagedPromptFile(
+        source_kind=source_kind,
+        source_reference=source_reference,
+        source_path=staged_path,
+        staged_path=staged_path,
+        staged_relative_path=str(staged_path.relative_to(node_dir)),
+        byte_size=len(raw),
+        sha256=hashlib.sha256(raw).hexdigest(),
+        is_text=is_text,
+        inline_text=inline_text,
+        preview_text=preview_text,
+        truncated=truncated,
+    )
+    upsert_context_manifest_entry(node_dir, staged_file)
+    return staged_file
+
+
 def upsert_context_manifest_entry(node_dir: Path, staged_file: StagedPromptFile) -> None:
     manifest_path = node_dir / "context" / "manifest.json"
     payload = {"entries": []}
