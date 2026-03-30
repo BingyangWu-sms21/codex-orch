@@ -1,4 +1,10 @@
-# Storage and execution spec
+# Current storage and execution spec
+
+This document describes the current implemented storage and execution model.
+
+For the future controller-driven runtime that supports first-class branching,
+loops, instance-level scheduling, and interrupt channels, see
+[docs/controller-runtime.md](./controller-runtime.md).
 
 ## Global layer
 

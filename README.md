@@ -8,6 +8,10 @@ materializes a subgraph from a task pool, freezes it into a snapshot, then
 executes nodes with `codex exec` while `Prefect` provides orchestration,
 concurrency, and run metadata.
 
+The current implementation is still a static DAG snapshot runtime. The target
+controller-driven branching and loop runtime is documented separately in
+[docs/controller-runtime.md](./docs/controller-runtime.md).
+
 ## Features
 
 - File-backed task pool with CRUD operations
@@ -32,6 +36,13 @@ codex-orch/
 ├── docs/
 └── examples/
 ```
+
+Key docs:
+
+- [docs/spec.md](./docs/spec.md): current implemented storage and execution
+  model
+- [docs/controller-runtime.md](./docs/controller-runtime.md): target
+  controller-driven runtime for branching, loops, and interrupt-backed resume
 
 ## Program layout
 
