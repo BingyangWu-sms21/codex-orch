@@ -188,10 +188,11 @@ async def _iter_stream_lines(stream: asyncio.StreamReader) -> AsyncIterator[str]
 
 class CodexExecRunner:
     async def run(self, request: NodeExecutionRequest) -> NodeExecutionResult:
-        request.node_dir.mkdir(parents=True, exist_ok=True)
-        (request.node_dir / "published").mkdir(parents=True, exist_ok=True)
-        (request.node_dir / "scratch").mkdir(parents=True, exist_ok=True)
-        (request.node_dir / "prompt.md").write_text(
+        request.instance_dir.mkdir(parents=True, exist_ok=True)
+        request.attempt_dir.mkdir(parents=True, exist_ok=True)
+        (request.instance_dir / "published").mkdir(parents=True, exist_ok=True)
+        (request.attempt_dir / "scratch").mkdir(parents=True, exist_ok=True)
+        (request.attempt_dir / "prompt.md").write_text(
             request.prompt,
             encoding="utf-8",
         )
@@ -213,12 +214,13 @@ class CodexExecRunner:
                 success=False,
                 return_code=127,
                 final_message="",
+                session_id=request.resume_session_id,
                 error=str(exc),
             )
 
-        events_path = request.node_dir / "events.jsonl"
-        stderr_path = request.node_dir / "stderr.log"
-        runtime_path = request.node_dir / "runtime.json"
+        events_path = request.attempt_dir / "events.jsonl"
+        stderr_path = request.attempt_dir / "stderr.log"
+        runtime_path = request.attempt_dir / "runtime.json"
         runtime_tracker = _RuntimeTracker(
             path=runtime_path,
             cwd=request.workspace_dir,
@@ -252,7 +254,7 @@ class CodexExecRunner:
         return_code = await process.wait()
         await stdin_task
         watchdog_reason = await watchdog_task
-        final_message = await stdout_task
+        final_message, session_id = await stdout_task
         stderr_output = await stderr_task
         termination_reason = self._resolve_termination_reason(
             return_code,
@@ -263,18 +265,46 @@ class CodexExecRunner:
             termination_reason=termination_reason,
         )
 
-        (request.node_dir / "final.md").write_text(final_message, encoding="utf-8")
+        resolved_session_id = session_id or request.resume_session_id
+        if resolved_session_id is not None:
+            (request.instance_dir / "session.json").write_text(
+                json.dumps({"session_id": resolved_session_id}, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+
+        (request.attempt_dir / "final.md").write_text(final_message, encoding="utf-8")
         self._maybe_write_result_json(request, final_message)
 
         return NodeExecutionResult(
             success=termination_reason is NodeExecutionTerminationReason.COMPLETED,
             return_code=return_code,
             final_message=final_message,
+            session_id=resolved_session_id,
             error=self._build_error(stderr_output, termination_reason),
             termination_reason=termination_reason,
         )
 
     def _build_command(self, request: NodeExecutionRequest) -> list[str]:
+        if request.resume_session_id is not None:
+            command = [
+                "codex",
+                "exec",
+                "resume",
+                request.resume_session_id,
+                "--json",
+                "--skip-git-repo-check",
+            ]
+            model = request.task.model or request.project.default_model
+            if model is not None:
+                command.extend(["--model", model])
+            if self._sandbox(request) == "workspace-write":
+                command.append("--full-auto")
+            elif self._sandbox(request) == "danger-full-access":
+                command.append("--dangerously-bypass-approvals-and-sandbox")
+            command.append("-")
+            return command
+
         sandbox = self._sandbox(request)
         command = [
             "codex",
@@ -314,8 +344,10 @@ class CodexExecRunner:
             {
                 "CODEX_ORCH_PROGRAM_DIR": str(request.program_dir),
                 "CODEX_ORCH_RUN_ID": request.run_id,
+                "CODEX_ORCH_INSTANCE_ID": request.instance_id,
                 "CODEX_ORCH_TASK_ID": request.task.id,
-                "CODEX_ORCH_NODE_DIR": str(request.node_dir),
+                "CODEX_ORCH_INSTANCE_DIR": str(request.instance_dir),
+                "CODEX_ORCH_ATTEMPT_DIR": str(request.attempt_dir),
                 "CODEX_ORCH_PROJECT_WORKSPACE_DIR": str(request.project_workspace_dir),
                 "CODEX_ORCH_WORKSPACE_DIR": str(request.workspace_dir),
             }
@@ -326,7 +358,7 @@ class CodexExecRunner:
         return request.task.sandbox or request.project.default_sandbox
 
     def _command_writable_roots(self, request: NodeExecutionRequest) -> tuple[Path, ...]:
-        candidates = [request.node_dir]
+        candidates = [request.attempt_dir]
         candidates.extend(request.extra_writable_roots)
         deduped: list[Path] = []
         seen: set[str] = set()
@@ -372,18 +404,20 @@ class CodexExecRunner:
         process: asyncio.subprocess.Process,
         path: Path,
         runtime_tracker: _RuntimeTracker,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         if process.stdout is None:
-            return ""
+            return "", None
 
         final_message = ""
+        session_id: str | None = None
         with path.open("w", encoding="utf-8") as handle:
             async for text in _iter_stream_lines(process.stdout):
                 handle.write(text)
                 handle.flush()
                 await runtime_tracker.note_stdout(text)
                 final_message = self._extract_agent_message(text, final_message)
-        return final_message
+                session_id = self._extract_session_id(text, session_id)
+        return final_message, session_id
 
     async def _capture_stderr(
         self,
@@ -526,8 +560,43 @@ class CodexExecRunner:
             payload = json.loads(final_message)
         except json.JSONDecodeError:
             return
-        result_path = request.node_dir / "result.json"
+        result_path = request.attempt_dir / "result.json"
         result_path.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    def _extract_session_id(self, raw_line: str, current: str | None) -> str | None:
+        stripped = raw_line.strip()
+        if not stripped:
+            return current
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            return current
+        extracted = self._find_session_id(payload)
+        return extracted or current
+
+    def _find_session_id(self, payload: object) -> str | None:
+        if isinstance(payload, dict):
+            for key in (
+                "session_id",
+                "sessionId",
+                "conversation_id",
+                "conversationId",
+                "thread_id",
+                "threadId",
+            ):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            for value in payload.values():
+                found = self._find_session_id(value)
+                if found is not None:
+                    return found
+        if isinstance(payload, list):
+            for value in payload:
+                found = self._find_session_id(value)
+                if found is not None:
+                    return found
+        return None

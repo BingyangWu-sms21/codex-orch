@@ -11,10 +11,18 @@ from codex_orch.assistant.base import (
     AssistantBackend,
     AssistantBackendRequest,
 )
-from codex_orch.domain import AssistantBackendKind, ResolutionKind, TaskSpec
+from codex_orch.domain import (
+    AssistantBackendKind,
+    AssistantRequest,
+    DecisionKind,
+    InterruptAudience,
+    InterruptReplyKind,
+    ResolutionKind,
+    TaskSpec,
+)
 from codex_orch.prompt_context import ensure_staged_assistant_artifact
 from codex_orch.scheduler import RunService
-from codex_orch.store import AssistantRequestRecord, ProjectStore
+from codex_orch.store import InterruptRecord, ProjectStore
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +62,10 @@ class AssistantWorkerService:
         handed_off = 0
         skipped_no_profile = 0
         failed = 0
-        for record in self.store.list_assistant_requests(unresolved_only=True):
+        for record in self.store.list_interrupts(
+            audience=InterruptAudience.ASSISTANT,
+            unresolved_only=True,
+        ):
             scanned += 1
             outcome = self._process_record(record)
             if outcome == "processed:auto_reply":
@@ -81,18 +92,17 @@ class AssistantWorkerService:
             self.run_once()
             time.sleep(poll_interval_sec)
 
-    def _process_record(self, record: AssistantRequestRecord) -> str:
-        request_id = record.request.request_id
-        profile_id = self.store.resolve_assistant_profile_id(record.run_id, record.task_id)
-        if profile_id is None:
+    def _process_record(self, record: InterruptRecord) -> str:
+        interrupt_id = record.interrupt.interrupt_id
+        profile = self.store.resolve_assistant_profile(record.run_id, record.task_id)
+        if profile is None:
             self._report_request_issue(
-                request_id,
-                "assistant request has no effective assistant profile; leaving unresolved",
+                interrupt_id,
+                "assistant interrupt has no effective assistant profile; leaving unresolved",
             )
             return "skipped:no_profile"
 
         try:
-            profile = self.store.load_assistant_profile(profile_id)
             task = self._resolve_task(record)
             project = self.store.load_project()
             backend_request = AssistantBackendRequest(
@@ -100,7 +110,8 @@ class AssistantWorkerService:
                 profile=profile,
                 project=project,
                 task=task,
-                assistant_request=record.request,
+                instance_id=record.instance_id,
+                assistant_request=self._to_assistant_request(record),
                 artifacts=tuple(self._load_artifacts(record)),
             )
             backend = self._resolve_backend(profile.spec.backend)
@@ -112,24 +123,54 @@ class AssistantWorkerService:
                 raise ValueError(
                     "automated assistant must return auto_reply or handoff_to_human"
                 )
-            self.store.save_assistant_response_by_request_id(
-                request_id,
-                resolution_kind=result.resolution_kind,
-                answer=result.answer,
+            if result.resolution_kind is ResolutionKind.AUTO_REPLY:
+                self.store.save_interrupt_reply(
+                    interrupt_id,
+                    audience=InterruptAudience.ASSISTANT,
+                    reply_kind=InterruptReplyKind.ANSWER,
+                    text=result.answer,
+                    payload={},
+                    rationale=result.rationale,
+                    confidence=result.confidence,
+                    citations=list(result.citations),
+                )
+                self._reported_request_issues.pop(interrupt_id, None)
+                asyncio.run(self.run_service.resume_run(record.run_id))
+                return "processed:auto_reply"
+
+            self.store.save_interrupt_reply(
+                interrupt_id,
+                audience=InterruptAudience.ASSISTANT,
+                reply_kind=InterruptReplyKind.HANDOFF_TO_HUMAN,
+                text=result.answer,
+                payload={},
                 rationale=result.rationale,
                 confidence=result.confidence,
                 citations=list(result.citations),
-                proposed_guidance_updates=list(result.proposed_guidance_updates),
-                proposed_control_actions=list(result.proposed_control_actions),
             )
-            self._reported_request_issues.pop(request_id, None)
-            if result.resolution_kind is ResolutionKind.AUTO_REPLY:
-                asyncio.run(self.run_service.resume_run(record.run_id))
-                return "processed:auto_reply"
+            self.store.create_interrupt(
+                run_id=record.run_id,
+                instance_id=record.instance_id,
+                audience=InterruptAudience.HUMAN,
+                blocking=record.interrupt.blocking,
+                request_kind=record.interrupt.request_kind,
+                question=record.interrupt.question,
+                decision_kind=record.interrupt.decision_kind,
+                options=list(record.interrupt.options),
+                context_artifacts=list(record.interrupt.context_artifacts),
+                reply_schema=record.interrupt.reply_schema,
+                priority=record.interrupt.priority,
+                metadata={
+                    "assistant_summary": result.answer,
+                    "assistant_rationale": result.rationale,
+                    "assistant_citations": list(result.citations),
+                },
+            )
+            self._reported_request_issues.pop(interrupt_id, None)
             return "processed:handoff"
-        except Exception as exc:  # pragma: no cover - exercised by higher-level tests
+        except Exception as exc:  # pragma: no cover - defensive
             self._report_request_issue(
-                request_id,
+                interrupt_id,
                 f"assistant worker failed: {exc}",
                 exc=exc,
             )
@@ -144,23 +185,36 @@ class AssistantWorkerService:
             raise ValueError(f"assistant backend {backend_kind.value} is not registered")
         return backend
 
-    def _resolve_task(self, record: AssistantRequestRecord) -> TaskSpec:
+    def _resolve_task(self, record: InterruptRecord) -> TaskSpec:
         task = self.store.maybe_get_run_task(record.run_id, record.task_id)
         if task is not None:
             return task
         return self.store.get_task(record.task_id)
 
+    def _to_assistant_request(self, record: InterruptRecord) -> AssistantRequest:
+        return AssistantRequest(
+            request_id=record.interrupt.interrupt_id,
+            run_id=record.run_id,
+            requester_task_id=record.task_id,
+            request_kind=record.interrupt.request_kind,
+            question=record.interrupt.question,
+            decision_kind=record.interrupt.decision_kind or DecisionKind.RECOVERY,
+            options=list(record.interrupt.options),
+            context_artifacts=list(record.interrupt.context_artifacts),
+            priority=record.interrupt.priority,
+        )
+
     def _load_artifacts(
         self,
-        record: AssistantRequestRecord,
+        record: InterruptRecord,
     ) -> list[AssistantArtifactContext]:
         artifacts: list[AssistantArtifactContext] = []
-        node_dir = self.store.get_node_dir(record.run_id, record.task_id)
-        for relative_path in record.request.context_artifacts:
+        instance_dir = self.store.get_instance_dir(record.run_id, record.instance_id)
+        for relative_path in record.interrupt.context_artifacts:
             artifacts.append(
                 ensure_staged_assistant_artifact(
                     program_dir=self.store.paths.root,
-                    node_dir=node_dir,
+                    node_dir=instance_dir,
                     relative_path=relative_path,
                 )
             )

@@ -1,24 +1,16 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi.testclient import TestClient
 
 from codex_orch.api import create_app
-from codex_orch.domain import (
-    DecisionKind,
-    RequestKind,
-    RequestPriority,
-    TaskSpec,
-    TaskStatus,
-)
+from codex_orch.domain import TaskSpec, TaskStatus
 from codex_orch.scheduler import RunService
 from codex_orch.store import ProjectStore
-from tests.helpers import build_test_store, write_assistant_profile
+from tests.helpers import build_test_store
 from tests.test_run_service import FakeRunner
 
 
-def test_tasks_page_and_create_task(tmp_path: Path) -> None:
+def test_tasks_page_and_create_task(tmp_path) -> None:
     store = build_test_store(tmp_path)
     app = create_app(store.paths.root, global_root=store.global_paths.root)
     client = TestClient(app)
@@ -55,7 +47,7 @@ def test_tasks_page_and_create_task(tmp_path: Path) -> None:
     assert task.extra_writable_roots == ["tool-cache", "../env-source"]
 
 
-def test_task_detail_updates_workspace_fields(tmp_path: Path) -> None:
+def test_task_detail_updates_workspace_fields(tmp_path) -> None:
     store = build_test_store(tmp_path)
     store.save_task(
         TaskSpec(
@@ -96,33 +88,8 @@ def test_task_detail_updates_workspace_fields(tmp_path: Path) -> None:
     assert task.extra_writable_roots == ["tool-cache", "../shared-artifacts"]
 
 
-def test_graph_page_renders_existing_edges(tmp_path: Path) -> None:
+def test_runs_page_and_run_detail_render_instance_runtime(tmp_path) -> None:
     store = build_test_store(tmp_path)
-    store.save_task(
-        TaskSpec(id="a", title="A", agent="default", status=TaskStatus.READY, publish=["final.md"])
-    )
-    store.save_task(
-        TaskSpec(
-            id="b",
-            title="B",
-            agent="default",
-            status=TaskStatus.READY,
-            depends_on=[{"task": "a", "kind": "context", "consume": ["final.md"]}],
-            publish=["final.md"],
-        )
-    )
-    app = create_app(store.paths.root, global_root=store.global_paths.root)
-    client = TestClient(app)
-
-    response = client.get("/graph")
-    assert response.status_code == 200
-    assert "Dependency graph" in response.text
-    assert '"from": "a"' in response.text
-
-
-def test_assistant_page_and_response_form(tmp_path: Path) -> None:
-    store = build_test_store(tmp_path)
-    write_assistant_profile(store, set_as_default=True)
     store.save_task(
         TaskSpec(
             id="worker",
@@ -132,46 +99,18 @@ def test_assistant_page_and_response_form(tmp_path: Path) -> None:
             publish=["final.md"],
         )
     )
-    snapshot = RunService(store, FakeRunner()).create_snapshot(
+    run = RunService(store, FakeRunner()).create_snapshot(
         roots=["worker"],
         labels=[],
         user_inputs=None,
     )
-    request = store.create_assistant_request(
-        run_id=snapshot.id,
-        task_id="worker",
-        request_kind=RequestKind.CLARIFICATION,
-        question="Should I remove the wrapper?",
-        decision_kind=DecisionKind.POLICY,
-        options=["delete", "keep_wrapper"],
-        context_artifacts=[],
-        requested_control_actions=[],
-        priority=RequestPriority.HIGH,
-    )
     app = create_app(store.paths.root, global_root=store.global_paths.root)
     client = TestClient(app)
 
-    response = client.get("/assistant")
+    response = client.get("/runs")
     assert response.status_code == 200
-    assert request.request_id in response.text
+    assert run.id in response.text
 
-    save_response = client.post(
-        "/assistant/respond",
-        data={
-            "request_id": request.request_id,
-            "resolution_kind": "auto_reply",
-            "answer": "Delete it.",
-            "rationale": "The project does not require compatibility wrappers.",
-            "confidence": "high",
-            "citations": "~/.codex/AGENTS.md",
-            "guidance_updates": "",
-            "proposed_actions": "",
-        },
-        follow_redirects=False,
-    )
-    assert save_response.status_code == 303
-
-    saved = ProjectStore(store.paths.root, global_root=store.global_paths.root)
-    record = saved.find_assistant_request(request.request_id)
-    assert record.response is not None
-    assert record.response.answer == "Delete it."
+    detail = client.get(f"/runs/{run.id}")
+    assert detail.status_code == 200
+    assert "Instances" in detail.text

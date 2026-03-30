@@ -45,20 +45,11 @@
           <td>{{ run.status.value }}</td>
           <td>{{ run.roots | join(", ") }}</td>
           <td>
-            <div>running={{ activity.running_nodes | length }}</div>
+            <div>running={{ activity.running_instances | length }}</div>
             <div>{% if activity.last_progress_at %}{{ activity.last_progress_at }}{% else %}-{% endif %}</div>
             <div>{% if activity.last_event_summary %}{{ activity.last_event_summary }}{% else %}-{% endif %}</div>
           </td>
-          <td>
-            {% if run.prefect_flow_run_id %}
-            <div>{{ run.prefect_flow_run_id }}</div>
-            {% if prefect_ui_url %}
-            <a href="{{ prefect_ui_url }}" target="_blank" rel="noreferrer">Open UI</a>
-            {% endif %}
-            {% else %}
-            -
-            {% endif %}
-          </td>
+          <td>-</td>
         </tr>
         {% endfor %}
       </tbody>

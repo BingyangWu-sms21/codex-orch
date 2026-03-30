@@ -2,14 +2,13 @@
 
 `codex-orch` is a local-first task orchestrator for Codex CLI.
 
-It keeps tasks, presets, dependency edges, run snapshots, assistant protocol
-artifacts, and published outputs on disk instead of in a database. A run
-materializes a subgraph from a task pool, freezes it into a snapshot, then
-executes nodes with `codex exec` while `Prefect` provides orchestration,
-concurrency, and run metadata.
+It keeps tasks, presets, runtime state, interrupts, and published outputs on
+disk instead of in a database. A run materializes a static task subgraph,
+creates one runtime instance per selected task, and executes those instances
+through `codex exec` / `codex exec resume` with a built-in instance scheduler.
 
-The current implementation is still a static DAG snapshot runtime. The target
-controller-driven branching and loop runtime is documented separately in
+The current implemented runtime is documented in [docs/spec.md](./docs/spec.md).
+The future controller-driven branching and loop runtime is documented in
 [docs/controller-runtime.md](./docs/controller-runtime.md).
 
 ## Features
@@ -18,14 +17,11 @@ controller-driven branching and loop runtime is documented separately in
 - Two dependency kinds: `order` and `context`
 - `compose.from_dep` reads only from explicitly consumed `context` artifacts
 - Global presets under `~/.codex-orch/` plus per-program presets
-- Prefect-backed run snapshots and resumable execution
-- Published-artifact handoff between tasks
-- Assistant control-plane protocol:
-  `assistant_request.json`, `assistant_response.json`, `assistant_control_action.json`
-- Manual-gate protocol:
-  `manual_gate.json`, `human_request.json`, `human_response.json`
-- Built-in worker assistant escalation contract plus bundled `operate-codex-orch` operator skill
-- Local web board for task lists, kanban, dependency graph, presets, runs, assistant inbox, and manual gates
+- Run-centered instance runtime with attempts, published artifacts, and event log
+- Codex session-aware resume via `codex exec resume`
+- Runtime inbox with interrupt requests and replies for assistant and human interaction
+- Built-in assistant worker plus bundled `operate-codex-orch` operator skill
+- Local web UI for task and run inspection
 
 ## Repository layout
 
@@ -39,10 +35,8 @@ codex-orch/
 
 Key docs:
 
-- [docs/spec.md](./docs/spec.md): current implemented storage and execution
-  model
-- [docs/controller-runtime.md](./docs/controller-runtime.md): target
-  controller-driven runtime for branching, loops, and interrupt-backed resume
+- [docs/spec.md](./docs/spec.md): current implemented storage and execution model
+- [docs/controller-runtime.md](./docs/controller-runtime.md): target controller-driven runtime for branching and loops
 
 ## Program layout
 
@@ -77,23 +71,24 @@ codex-orch --version
 codex-orch task list .
 ```
 
-## Assistant helper flow
+## Interrupt helper flow
 
-Worker-side assistant escalation is built into each node's runtime prompt plus a
-node-local helper doc at:
+Worker-side external interaction is built into each attempt's runtime prompt
+plus a helper doc at:
 
 ```text
-.runs/<run-id>/nodes/<task-id>/context/assistant/requesting-help.md
+.runs/<run-id>/instances/<instance-id>/attempts/<attempt-no>/context/interrupt/requesting-help.md
 ```
 
-Workers should use the stable CLI helper instead of hand-writing protocol
-files:
+Workers should use the CLI helper instead of hand-writing inbox files:
 
 ```bash
-codex-orch assistant request create \
+codex-orch interrupt create \
   --program-dir /path/to/program \
   --run-id 20260319010101-deadbeef \
+  --instance-id executeRefactor-a1b2c3d4 \
   --task-id executeRefactor \
+  --audience assistant \
   --kind clarification \
   --decision-kind policy \
   --question "Can I delete the legacy wrapper?" \
@@ -105,49 +100,45 @@ When a worker runs inside `codex-orch`, the helper can infer:
 
 - `CODEX_ORCH_PROGRAM_DIR`
 - `CODEX_ORCH_RUN_ID`
+- `CODEX_ORCH_INSTANCE_ID`
 - `CODEX_ORCH_TASK_ID`
-- `CODEX_ORCH_NODE_DIR`
+- `CODEX_ORCH_INSTANCE_DIR`
+- `CODEX_ORCH_ATTEMPT_DIR`
 - `CODEX_ORCH_PROJECT_WORKSPACE_DIR`
 - `CODEX_ORCH_WORKSPACE_DIR`
 
-Assistant artifacts passed with `--artifact` must be relative to
+Context artifacts passed with `--artifact` must be relative to
 `CODEX_ORCH_PROGRAM_DIR`.
 
-An `auto_reply` is reinjected only into the same task continuation on resume. A
-`handoff_to_human` reply materializes `manual_gate.json` and
-`human_request.json` for that node and pauses execution until a human responds
-and the gate is approved or rejected.
+Blocking interrupts do not immediately stop the current attempt. Instead,
+`codex-orch` waits until the attempt ends, moves the instance to `waiting` if
+any blocking interrupts remain unresolved, and resumes the same Codex session
+after all blocking interrupts are resolved.
 
-Assistant or human responses are written back with:
+Assistant or human replies are written back through the inbox:
 
 ```bash
-codex-orch assistant respond /path/to/program <request-id> \
-  --resolution-kind auto_reply \
-  --answer "Delete it." \
-  --rationale "The repository does not need compatibility wrappers."
+codex-orch inbox list /path/to/program --json
+codex-orch inbox show /path/to/program <interrupt-id> --json
+codex-orch inbox reply /path/to/program <interrupt-id> \
+  --text "Delete it." \
+  --reply-kind answer \
+  --resume
 ```
 
-Control-plane actions are stored separately from replies:
+The built-in assistant worker processes unresolved assistant interrupts:
 
 ```bash
-codex-orch assistant action create /path/to/program <request-id> \
-  --action-kind append_guidance_proposal \
-  --requested-by assistant \
-  --target-kind user_guidance \
-  --target-path "~/.codex/AGENTS.md" \
-  --reason "Promote a repeated decision to long-term guidance."
+codex-orch inbox worker /path/to/program --once --json
 ```
 
 ## Skill export
 
-`codex-orch` ships a canonical `operate-codex-orch` skill template for
-external or user-controlled agents operating a program from outside a worker
-node. It is not the worker-side escalation mechanism. The skill assumes the
-operator is in the target program directory and that `codex-orch` was installed
-separately, typically with `pipx install codex-orch`.
+`codex-orch` ships a canonical `operate-codex-orch` skill template for external
+or user-controlled agents operating a program from outside a worker instance. It
+is not the worker-side escalation mechanism.
 
-Maintainers can still export it from this repository or install it into a
-repo-local `.codex/skills/` folder explicitly:
+Maintainers can export and install it with:
 
 ```bash
 uv run codex-orch skill list
@@ -155,44 +146,15 @@ uv run codex-orch skill export operate-codex-orch /tmp/exported-skills
 uv run codex-orch skill install operate-codex-orch --repo-dir /path/to/repo
 ```
 
-The exported skill contains:
-
-- `SKILL.md`
-- `references/quickstart.md`
-- `references/operator-runbook.md`
-
-## Manual gates
-
-When an assistant response chooses `handoff_to_human`, `codex-orch` now
-materializes:
-
-- `manual_gate.json`
-- `human_request.json`
-- `human_response.json` after a human replies
-
-The CLI exposes the minimal human-control surface:
-
-```bash
-codex-orch manual-gate list /path/to/program
-codex-orch manual-gate show /path/to/program <gate-id>
-codex-orch manual-gate respond /path/to/program <gate-id> \
-  --answer "Delete the wrapper."
-codex-orch manual-gate approve /path/to/program <gate-id> --resume
-```
-
-The web UI exposes the same flow at `/manual-gates`.
-
 ## Waiting semantics
 
-Run snapshots still use `waiting` at the top level, but node-level waiting now
-records a specific reason:
+Run state still exposes `waiting`, but instance-level waiting is now driven by
+blocking interrupts:
 
-- `assistant_pending`
-- `handoff_to_human`
-- `manual_gate_blocked`
-
-This makes `resume` deterministic: unresolved gates stay blocked, approved gates
-resume, and rejected gates fail the run instead of remaining ambiguous.
+- unresolved blocking interrupts keep the instance in `waiting`
+- resolved replies are injected only into that instance's next
+  `codex exec resume` prompt
+- assistant `handoff_to_human` becomes a new human interrupt on the same instance
 
 ## Status
 

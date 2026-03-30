@@ -53,13 +53,25 @@ codex-orch run reconcile . <run-id> --json
 codex-orch run abort . <run-id> --json
 ```
 
+## Inbox control
+
+```bash
+codex-orch interrupt list . --json
+codex-orch inbox list . --json
+codex-orch inbox show . <interrupt-id> --json
+codex-orch inbox reply . <interrupt-id> --text "Answer" --resume
+codex-orch inbox worker . --once --json
+```
+
 ## File-backed truth sources
 
 When CLI output is not enough, inspect:
 
 - `project.yaml`
 - `tasks/*.yaml`
-- `.runs/<run-id>/snapshot.json`
-- `.runs/<run-id>/nodes/<task-id>/meta.json`
-- `.runs/<run-id>/nodes/<task-id>/runtime.json`
-- `.runs/<run-id>/nodes/<task-id>/published/`
+- `.runs/<run-id>/state/run.json`
+- `.runs/<run-id>/state/instances/<instance-id>.json`
+- `.runs/<run-id>/inbox/interrupts/`
+- `.runs/<run-id>/inbox/replies/`
+- `.runs/<run-id>/instances/<instance-id>/attempts/<attempt-no>/runtime.json`
+- `.runs/<run-id>/instances/<instance-id>/published/`

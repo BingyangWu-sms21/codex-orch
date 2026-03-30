@@ -1,9 +1,7 @@
 # Current storage and execution spec
 
-This document describes the current implemented storage and execution model.
-
-For the future controller-driven runtime that supports first-class branching,
-loops, instance-level scheduling, and interrupt channels, see
+This document describes the current implemented runtime. For the future
+controller-driven runtime that supports first-class branching and loops, see
 [docs/controller-runtime.md](./controller-runtime.md).
 
 ## Global layer
@@ -19,8 +17,8 @@ loops, instance-level scheduling, and interrupt channels, see
 
 ## Program layer
 
-Each program is a file-backed task pool with local prompts, inputs, presets, and
-run artifacts.
+Each program is a file-backed task pool with local prompts, inputs, presets,
+and run artifacts.
 
 ```text
 program/
@@ -38,10 +36,11 @@ Each task is stored as `tasks/<task-id>.yaml`.
 
 Execution boundary fields on each task:
 
-- `workspace`: optional task-local cwd override. Relative values are resolved against
-  `project.workspace` when the run snapshot is created.
-- `extra_writable_roots`: optional extra writable directories for writable sandboxes.
-  Relative values are resolved against the task's effective workspace.
+- `workspace`: optional task-local cwd override. Relative values are resolved
+  against `project.workspace` when the run is created.
+- `extra_writable_roots`: optional extra writable directories for writable
+  sandboxes. Relative values are resolved against the task's effective
+  workspace.
 
 Dependencies live on the target task in `depends_on`. There are two dependency
 kinds:
@@ -49,33 +48,42 @@ kinds:
 - `order`: execution order only
 - `context`: execution order plus explicit artifact consumption
 
-Prompt composition can also consume dependency artifacts with
+Prompt composition can consume dependency artifacts with
 `compose.kind == from_dep`, but only under an explicit `context` dependency:
 
 - `from_dep.task` must name a task in `depends_on`
 - that dependency must be `context`
 - `from_dep.path` must be listed in the matching dependency edge's `consume`
 
-## Run snapshots
+## Run model
 
-When a run starts, `codex-orch` resolves a subgraph from the task pool,
-compiles it into a Prefect flow, and writes a snapshot file under
-`.runs/<run-id>/snapshot.json`.
+When a run starts, `codex-orch` resolves a static subgraph from the task pool,
+creates one runtime instance per selected task, and writes run-centered state
+under `.runs/<run-id>/`.
 
-Task definitions inside the snapshot are immutable for that run. Later edits to
-the task pool do not mutate the in-flight run.
+Task definitions inside the run are materialized and frozen for that run. Later
+edits to the task pool do not mutate the in-flight run.
 
-Snapshot metadata also carries the Prefect flow run reference:
+Run state is split into four areas:
 
-- `prefect_flow_run_id`
-- `prefect_flow_run_name`
-- `updated_at`
+- `state/run.json`: run metadata and instance ids
+- `state/instances/<instance-id>.json`: instance state
+- `events/*.json`: append-only runtime events
+- `inbox/interrupts/*.json` and `inbox/replies/*.json`: external interaction
+  envelopes
 
-## Node directories
+## Instance directories
 
-Each run node uses `.runs/<run-id>/nodes/<task-id>/`.
+Each runtime instance uses `.runs/<run-id>/instances/<instance-id>/`.
 
 Standard files:
+
+- `session.json` with the stable Codex session id for that instance
+- `published/` with artifacts visible to downstream `context` dependencies
+- `attempts/<attempt-no>/` for prompt, logs, runtime, final output, and scratch
+  files
+
+Each attempt directory contains:
 
 - `prompt.md`
 - `events.jsonl`
@@ -83,20 +91,13 @@ Standard files:
 - `runtime.json`
 - `final.md`
 - `result.json` when applicable
-- `meta.json`
-- `assistant_request.json` when a worker asks the control-plane assistant
-- `assistant_response.json` when the assistant answers
-- `assistant_control_action.json` when the assistant proposes or records a control action
-- `manual_gate.json` when the assistant escalates to a human gate
-- `human_request.json` when a human handoff is materialized
-- `human_response.json` when a human responds
-- `published/`
 - `scratch/`
 
 Only files copied into `published/` are visible to downstream `context`
 dependencies.
 
-`runtime.json` is the node-local liveness record for worker execution. It tracks:
+`runtime.json` is the attempt-local liveness record for worker execution. It
+tracks:
 
 - worker `pid`
 - actual `cwd`
@@ -110,22 +111,22 @@ dependencies.
 - `last_event_summary`
 - `stdout_line_count` / `stderr_line_count`
 - timeout budget (`wall_timeout_sec`, `idle_timeout_sec`)
-- terminal reason (`completed`, `nonzero_exit`, `wall_timeout`, `idle_timeout`, `terminated`, `orphaned`)
+- terminal reason (`completed`, `nonzero_exit`, `wall_timeout`, `idle_timeout`,
+  `terminated`, `orphaned`)
 
-## Assistant control-plane helpers
+## Interrupt helpers
 
-`assistant_request.json` is generated by the framework/helper layer, not by the
-worker hand-writing envelope metadata. Each node also materializes a helper doc
-at:
+Worker-side escalation is modeled as runtime interrupts. Each attempt
+materializes a helper doc at:
 
 ```text
-.runs/<run-id>/nodes/<task-id>/context/assistant/requesting-help.md
+.runs/<run-id>/instances/<instance-id>/attempts/<attempt-no>/context/interrupt/requesting-help.md
 ```
 
-The stable entrypoint remains the CLI helper:
+The stable entrypoint is:
 
 ```bash
-codex-orch assistant request create \
+codex-orch interrupt create \
   --kind clarification \
   --decision-kind policy \
   --question-file /tmp/question.md
@@ -135,92 +136,64 @@ The helper reads runtime context from:
 
 - `CODEX_ORCH_PROGRAM_DIR`
 - `CODEX_ORCH_RUN_ID`
+- `CODEX_ORCH_INSTANCE_ID`
 - `CODEX_ORCH_TASK_ID`
-- `CODEX_ORCH_NODE_DIR`
+- `CODEX_ORCH_INSTANCE_DIR`
+- `CODEX_ORCH_ATTEMPT_DIR`
 - `CODEX_ORCH_PROJECT_WORKSPACE_DIR`
 - `CODEX_ORCH_WORKSPACE_DIR`
 
 Artifact paths passed with `--artifact` must be relative to
 `CODEX_ORCH_PROGRAM_DIR`.
 
-Field ownership is split deliberately:
+## Inbox protocol
 
-- framework/helper owns `request_id`, `run_id`, `requester_task_id`, `created_at`
-- worker owns `request_kind`, `question`, `decision_kind`, `options`, `context_artifacts`
-- assistant owns the semantic contents of `assistant_response.json`
-- scheduler or human gate owns control-action lifecycle fields like `status`
+Interrupt requests are stored under `inbox/interrupts/` and replies under
+`inbox/replies/`.
 
-## Bundled skill export
+Request fields include:
 
-`codex-orch` ships a canonical `operate-codex-orch` skill resource under the
-package itself for external operators. It covers install/bootstrap, task and
-run inspection, assistant inbox handling, manual gates, and recovery/debugging.
-It is not the worker-side escalation mechanism.
+- `interrupt_id`
+- `run_id`
+- `instance_id`
+- `task_id`
+- `audience`
+- `blocking`
+- `request_kind`
+- `question`
+- `decision_kind`
+- `options`
+- `context_artifacts`
+- `reply_schema`
+- `priority`
+- `metadata`
 
-The exported skill assumes:
+Reply fields include:
 
-- the operator is already in the target program directory
-- `codex-orch` was installed separately and is available on `PATH`
-- the recommended install path is `pipx install codex-orch`
+- `interrupt_id`
+- `audience`
+- `reply_kind`
+- `text`
+- `payload`
+- optional `rationale`, `confidence`, and `citations`
 
-Maintainers can export and install the skill resource with:
-
-```bash
-codex-orch skill export operate-codex-orch /tmp/exported-skills
-codex-orch skill install operate-codex-orch --repo-dir /path/to/repo
-```
-
-The exported skill directory contains:
-
-- `SKILL.md`
-- `references/quickstart.md`
-- `references/operator-runbook.md`
-
-Worker-side assistant requests still flow through
-`codex-orch assistant request create`.
-
-## Manual gate protocol
-
-When `assistant_response.json.resolution_kind == handoff_to_human`,
-`codex-orch` materializes a node-local gate:
-
-- `manual_gate.json`
-- `human_request.json`
-- `human_response.json` after a human reply
-
-`manual_gate.json` connects:
-
-- the originating `request_id`
-- the waiting node and run
-- the gate lifecycle status
-- the recovery path for resume
-
-`human_request.json` carries:
-
-- the original worker question
-- the assistant summary and rationale for the escalation
-- citations and relevant context artifacts
-
-`human_response.json` is human-authored and kept separate from
-`assistant_response.json` so actor ownership stays explicit.
+Assistant replies with `reply_kind=handoff_to_human` are recorded on the
+assistant interrupt and then materialize a new human interrupt on the same
+instance.
 
 ## Waiting semantics
 
-Run status still exposes `waiting`, but node state now records
-`waiting_reason` with one of:
-
-- `assistant_pending`
-- `handoff_to_human`
-- `manual_gate_blocked`
+Run status still exposes `waiting`, but instance state now records
+`waiting_reason=interrupts_pending`.
 
 `resume_run()` applies these rules:
 
-- unresolved assistant replies stay blocked
-- unresolved manual gates stay blocked
-- approved manual gates are resumed and marked applied when execution restarts
-- rejected manual gates fail the blocked node and propagate run failure
+- unresolved blocking interrupts keep the instance in `waiting`
+- once all blocking interrupts are resolved, the instance becomes runnable again
+- resolved replies are injected only into that instance's next
+  `codex exec resume` prompt
 - before rescheduling work, `resume_run()` first reconciles stale `running`
-  nodes using `runtime.json`
+  instances using the active attempt `runtime.json`
 
 ## Timeout and recovery semantics
 
@@ -229,15 +202,16 @@ Worker execution is guarded by two runner-level timeouts:
 - `node_wall_timeout_sec`
 - `node_idle_timeout_sec`
 
-When a timeout is hit, `codex-orch` first sends a terminate signal, then escalates
-to kill after the configured grace period if the worker does not exit.
+When a timeout is hit, `codex-orch` first sends a terminate signal, then
+escalates to kill after the configured grace period if the worker does not
+exit.
 
 Recovery entrypoints:
 
-- `codex-orch run reconcile <run-id>` to reconcile stale or orphaned `running` nodes
-- `codex-orch run abort <run-id>` to stop active worker processes and fail the run
-
-The Web UI exposes the same operations from the run detail page.
+- `codex-orch run reconcile <run-id>` to reconcile stale or orphaned `running`
+  instances
+- `codex-orch run abort <run-id>` to stop active worker processes and fail the
+  run
 
 ## Workspace and access scope
 
@@ -245,8 +219,7 @@ The Web UI exposes the same operations from the run detail page.
 
 - the effective worker cwd comes from `task.workspace` when present, otherwise
   `project.workspace`
-- `workspace-write` tasks automatically receive node-local artifact write access so
-  helpers can still write `assistant_request.json`, `manual_gate.json`, and related
-  node files
+- `workspace-write` tasks automatically receive attempt-local artifact write
+  access so prompts, logs, `final.md`, and `result.json` can be materialized
 - `extra_writable_roots` maps directly to Codex CLI `--add-dir`
 - full filesystem access should use `sandbox: danger-full-access`

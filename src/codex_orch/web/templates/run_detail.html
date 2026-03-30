@@ -5,11 +5,7 @@
   <h2>Run {{ run.id }}</h2>
   <p>Status: <strong>{{ run.status.value }}</strong></p>
   <p>Roots: {{ run.roots | join(", ") }}</p>
-  <p>Prefect flow run: {{ run.prefect_flow_run_id or "-" }}</p>
   <p>Updated at: {{ run.updated_at }}</p>
-  {% if prefect_ui_url %}
-  <p><a href="{{ prefect_ui_url }}" target="_blank" rel="noreferrer">Open Prefect UI</a></p>
-  {% endif %}
   <form method="post" action="/runs/{{ run.id }}/resume">
     <button type="submit">Resume run</button>
   </form>
@@ -22,10 +18,11 @@
 </section>
 
 <section class="card">
-  <h2>Nodes</h2>
+  <h2>Instances</h2>
   <table>
     <thead>
       <tr>
+        <th>Instance</th>
         <th>Task</th>
         <th>Status</th>
         <th>Waiting reason</th>
@@ -39,17 +36,18 @@
         <th>Last event</th>
         <th>Termination reason</th>
         <th>Artifacts</th>
-        <th>Node dir</th>
+        <th>Instance dir</th>
       </tr>
     </thead>
     <tbody>
-      {% for node_id, node in run.nodes.items() %}
-      {% set runtime = node_runtimes[node_id] %}
+      {% for instance_id, instance in run.instances.items() %}
+      {% set runtime = instance_runtimes[instance_id] %}
       <tr>
-        <td>{{ node_id }}</td>
-        <td>{{ node.status.value }}</td>
-        <td>{% if node.waiting_reason %}{{ node.waiting_reason.value }}{% else %}-{% endif %}</td>
-        <td>{{ node.attempt }}</td>
+        <td>{{ instance_id }}</td>
+        <td>{{ instance.task_id }}</td>
+        <td>{{ instance.status.value }}</td>
+        <td>{% if instance.waiting_reason %}{{ instance.waiting_reason.value }}{% else %}-{% endif %}</td>
+        <td>{{ instance.attempt }}</td>
         <td>{% if runtime and runtime.pid %}{{ runtime.pid }}{% else %}-{% endif %}</td>
         <td>{% if runtime %}{{ runtime.cwd }}{% else %}-{% endif %}</td>
         <td>{% if runtime and runtime.project_workspace_dir %}{{ runtime.project_workspace_dir }}{% else %}-{% endif %}</td>
@@ -66,8 +64,8 @@
         <td>{% if runtime and runtime.last_progress_at %}{{ runtime.last_progress_at }}{% else %}-{% endif %}</td>
         <td>{% if runtime and runtime.last_event_summary %}{{ runtime.last_event_summary }}{% else %}-{% endif %}</td>
         <td>
-          {% if node.termination_reason %}
-          {{ node.termination_reason.value }}
+          {% if instance.termination_reason %}
+          {{ instance.termination_reason.value }}
           {% elif runtime and runtime.termination_reason %}
           {{ runtime.termination_reason.value }}
           {% else %}
@@ -75,11 +73,11 @@
           {% endif %}
         </td>
         <td>
-          {% for artifact in node.published %}
+          {% for artifact in instance.published %}
           <div>{{ artifact.relative_path }}</div>
           {% endfor %}
         </td>
-        <td>{{ node_dirs[node_id] }}</td>
+        <td>{{ instance_dirs[instance_id] }}</td>
       </tr>
       {% endfor %}
     </tbody>

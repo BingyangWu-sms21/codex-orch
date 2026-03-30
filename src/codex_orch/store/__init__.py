@@ -7,8 +7,7 @@ from codex_orch.store.layout import (
     get_program_paths,
 )
 from codex_orch.store.project_store import (
-    AssistantRequestRecord,
-    ManualGateRecord,
+    InterruptRecord,
     ProjectStore,
     ResolvedAssistantProfile,
     ResolvedPreset,
@@ -17,8 +16,7 @@ from codex_orch.store.project_store import (
 __all__ = [
     "GlobalPaths",
     "ProgramPaths",
-    "AssistantRequestRecord",
-    "ManualGateRecord",
+    "InterruptRecord",
     "ProjectStore",
     "ResolvedAssistantProfile",
     "ResolvedPreset",

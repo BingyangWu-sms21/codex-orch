@@ -1,62 +1,37 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import signal
 import shutil
-import threading
+import signal
 import time
 import uuid
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from textwrap import dedent
 
-from prefect import flow, task
-from prefect.futures import PrefectFuture
-from prefect.runtime import flow_run as prefect_flow_run
-from prefect.task_runners import ThreadPoolTaskRunner
-
 from codex_orch.domain import (
     ComposeStepKind,
     DependencyKind,
-    ManualGateStatus,
+    InterruptReplyKind,
+    InterruptStatus,
     NodeExecutionRuntime,
     NodeExecutionTerminationReason,
     ProjectSpec,
     PublishedArtifact,
-    ResolutionKind,
-    RunNodeState,
-    RunNodeStatus,
-    RunNodeWaitReason,
-    RunSnapshot,
+    RunInstanceState,
+    RunInstanceStatus,
+    RunInstanceWaitReason,
+    RunRecord,
     RunStatus,
     TaskSpec,
     TaskStatus,
 )
-from codex_orch.prompt_context import (
-    ensure_staged_assistant_artifact,
-    ensure_staged_compose_program_file,
-)
+from codex_orch.prompt_context import ensure_staged_compose_program_file
 from codex_orch.runner import NodeExecutionRequest, NodeExecutionResult, TaskRunner
 from codex_orch.scheduler.composer import PromptComposer
 from codex_orch.store import ProjectStore
 from codex_orch.task_pool import TaskPoolService
-
-
-@dataclass
-class _RunFlowContext:
-    project: ProjectSpec
-    snapshot: RunSnapshot
-    lock: threading.Lock
-
-
-@dataclass(frozen=True)
-class NodeExecutionOutcome:
-    task_id: str
-    status: RunNodeStatus
-    error: str | None = None
 
 
 class RunService:
@@ -65,6 +40,7 @@ class RunService:
         self.runner = runner
         self.task_pool = TaskPoolService(store)
         self.composer = PromptComposer(store.paths.root)
+        self._run_locks: dict[str, asyncio.Lock] = {}
 
     def create_snapshot(
         self,
@@ -72,7 +48,7 @@ class RunService:
         roots: list[str],
         labels: list[str],
         user_inputs: dict[str, str] | None = None,
-    ) -> RunSnapshot:
+    ) -> RunRecord:
         self.task_pool.validate_graph()
         project = self.store.load_project()
         selected = self.task_pool.select_subgraph(roots=roots, labels=labels)
@@ -80,20 +56,59 @@ class RunService:
         if user_inputs is not None:
             merged_inputs.update(user_inputs)
 
-        nodes = {
-            task_id: RunNodeState(task=self._materialize_task(project, task))
-            for task_id, task in selected.items()
-        }
+        tasks = self.store.load_task_map()
+        resolved_roots = set(roots)
+        if labels:
+            resolved_roots.update(
+                task.id for task in tasks.values() if set(task.labels) & set(labels)
+            )
         run_id = self._new_run_id()
-        snapshot = RunSnapshot(
+        task_to_instance_id = {
+            task_id: self._new_instance_id(task_id)
+            for task_id in sorted(selected)
+        }
+        instances: dict[str, RunInstanceState] = {}
+        for task_id, task in selected.items():
+            materialized = self._materialize_task(project, task)
+            instances[task_to_instance_id[task_id]] = RunInstanceState(
+                instance_id=task_to_instance_id[task_id],
+                task_id=task_id,
+                task=materialized,
+                dependency_instances={
+                    dependency.task: task_to_instance_id[dependency.task]
+                    for dependency in materialized.depends_on
+                    if dependency.task in task_to_instance_id
+                },
+            )
+        run = RunRecord(
             id=run_id,
-            roots=sorted(roots),
+            roots=sorted(resolved_roots),
             user_inputs=merged_inputs,
-            nodes=nodes,
+            project=project,
+            instances=instances,
         )
-        self._materialize_snapshot_node_context(snapshot)
-        self.store.save_run(snapshot)
-        return snapshot
+        self._refresh_runnable_instances(run)
+        self.store.save_run(run)
+        self.store.append_event(
+            run.id,
+            "run_created",
+            payload={"roots": run.roots, "instance_ids": sorted(run.instances)},
+        )
+        for instance in run.instances.values():
+            self.store.append_event(
+                run.id,
+                "instance_created",
+                instance_id=instance.instance_id,
+                payload={"task_id": instance.task_id},
+            )
+            if instance.status is RunInstanceStatus.RUNNABLE:
+                self.store.append_event(
+                    run.id,
+                    "instance_runnable",
+                    instance_id=instance.instance_id,
+                    payload={"task_id": instance.task_id},
+                )
+        return run
 
     async def start_run(
         self,
@@ -101,469 +116,534 @@ class RunService:
         roots: list[str],
         labels: list[str],
         user_inputs: dict[str, str] | None = None,
-    ) -> RunSnapshot:
-        snapshot = self.create_snapshot(
+    ) -> RunRecord:
+        run = self.create_snapshot(
             roots=roots,
             labels=labels,
             user_inputs=user_inputs,
         )
-        return await self.run_snapshot(snapshot.id)
+        return await self.run_snapshot(run.id)
 
-    async def reconcile_run(self, run_id: str) -> RunSnapshot:
-        return await asyncio.to_thread(self._reconcile_run_sync, run_id)
-
-    async def abort_run(self, run_id: str) -> RunSnapshot:
-        return await asyncio.to_thread(self._abort_run_sync, run_id)
-
-    async def resume_run(self, run_id: str) -> RunSnapshot:
-        snapshot = await self.reconcile_run(run_id)
-        if any(node.status is RunNodeStatus.RUNNING for node in snapshot.nodes.values()):
-            return snapshot
-        for node in snapshot.nodes.values():
-            if node.status is RunNodeStatus.DONE:
-                continue
-            wait_reason = self._wait_reason_for_node(snapshot.id, node.task.id)
-            gate_error = self._manual_gate_terminal_error(snapshot.id, node.task.id)
-            if gate_error is not None:
-                node.status = RunNodeStatus.FAILED
-                node.waiting_reason = None
-                node.error = gate_error
-                self._set_task_pool_status(node.task.id, TaskStatus.FAILED)
-                continue
-            if node.status is RunNodeStatus.WAITING and wait_reason is not None:
-                node.waiting_reason = wait_reason
-                node.error = self._wait_reason_message(wait_reason)
-                self._set_task_pool_status(node.task.id, TaskStatus.BLOCKED)
-                continue
-            node.status = RunNodeStatus.PENDING
-            node.waiting_reason = None
-            node.error = None
-            node.started_at = None
-            node.finished_at = None
-            node.termination_reason = None
-            self._set_task_pool_status(node.task.id, TaskStatus.READY)
-        snapshot.status = RunStatus.PENDING
-        self.store.save_run(snapshot)
-        return await self.run_snapshot(run_id)
-
-    async def run_snapshot(self, run_id: str) -> RunSnapshot:
-        return await asyncio.to_thread(self._run_snapshot_sync, run_id)
-
-    def _reconcile_run_sync(self, run_id: str) -> RunSnapshot:
-        snapshot = self.store.get_run(run_id)
-        project = self.store.load_project()
-        changed = False
-        for task_id, node in snapshot.nodes.items():
-            runtime = self.store.maybe_get_runtime(run_id, task_id)
-            if node.status is not RunNodeStatus.RUNNING:
-                continue
-            if runtime is None:
-                self._mark_node_failed(
-                    snapshot,
-                    task_id,
-                    error="node runtime is missing while task is marked running",
-                    termination_reason=NodeExecutionTerminationReason.ORPHANED,
-                    finished_at=datetime.now(UTC).isoformat(),
+    async def reconcile_run(self, run_id: str) -> RunRecord:
+        lock = self._run_lock(run_id)
+        async with lock:
+            run = self.store.get_run(run_id)
+            changed = False
+            for instance in run.instances.values():
+                if instance.status is not RunInstanceStatus.RUNNING:
+                    continue
+                runtime = self.store.maybe_get_attempt_runtime(
+                    run_id,
+                    instance.instance_id,
+                    instance.attempt,
                 )
-                changed = True
-                continue
-            if runtime.finished_at is not None:
-                self._reconcile_finished_runtime(snapshot, task_id, runtime)
-                changed = True
-                continue
-            pid = runtime.pid
-            if pid is None or not self._pid_exists(pid):
+                if runtime is None:
+                    self._mark_instance_failed(
+                        run,
+                        instance.instance_id,
+                        error="instance runtime is missing while instance is marked running",
+                        termination_reason=NodeExecutionTerminationReason.ORPHANED,
+                        finished_at=datetime.now(UTC).isoformat(),
+                    )
+                    changed = True
+                    continue
+                if runtime.finished_at is not None:
+                    self._reconcile_finished_runtime(run, instance.instance_id, runtime)
+                    changed = True
+                    continue
+                pid = runtime.pid
+                if pid is None or not self._pid_exists(pid):
+                    runtime.finished_at = datetime.now(UTC).isoformat()
+                    runtime.return_code = -1
+                    runtime.termination_reason = NodeExecutionTerminationReason.ORPHANED
+                    self._mark_instance_failed(
+                        run,
+                        instance.instance_id,
+                        error="worker process disappeared while instance was running",
+                        termination_reason=NodeExecutionTerminationReason.ORPHANED,
+                        finished_at=runtime.finished_at,
+                    )
+                    changed = True
+                    continue
+                stale_reason = self._stale_runtime_reason(runtime)
+                if stale_reason is None:
+                    continue
+                self._terminate_pid(pid, run.project.node_terminate_grace_sec)
                 runtime.finished_at = datetime.now(UTC).isoformat()
                 runtime.return_code = -1
-                runtime.termination_reason = NodeExecutionTerminationReason.ORPHANED
-                self.store.save_runtime(run_id, task_id, runtime)
-                self._mark_node_failed(
-                    snapshot,
-                    task_id,
-                    error="worker process disappeared while node was marked running",
-                    termination_reason=NodeExecutionTerminationReason.ORPHANED,
+                runtime.termination_reason = stale_reason
+                self._mark_instance_failed(
+                    run,
+                    instance.instance_id,
+                    error=self._termination_reason_message(stale_reason),
+                    termination_reason=stale_reason,
                     finished_at=runtime.finished_at,
                 )
                 changed = True
-                continue
-            stale_reason = self._stale_runtime_reason(runtime)
-            if stale_reason is None:
-                continue
-            self._terminate_pid(pid, project.node_terminate_grace_sec)
-            runtime.finished_at = datetime.now(UTC).isoformat()
-            runtime.return_code = -1
-            runtime.termination_reason = stale_reason
-            self.store.save_runtime(run_id, task_id, runtime)
-            self._mark_node_failed(
-                snapshot,
-                task_id,
-                error=self._termination_reason_message(stale_reason),
-                termination_reason=stale_reason,
-                finished_at=runtime.finished_at,
-            )
-            changed = True
-        if changed:
-            self._finalize_snapshot_state(snapshot)
-            self.store.save_run(snapshot)
-        return snapshot
+            self._refresh_runnable_instances(run)
+            self._finalize_run_state(run)
+            if changed:
+                self.store.save_run(run)
+            return run
 
-    def _abort_run_sync(self, run_id: str) -> RunSnapshot:
-        snapshot = self.store.get_run(run_id)
-        project = self.store.load_project()
-        changed = False
-        finished_at = datetime.now(UTC).isoformat()
-        for task_id, node in snapshot.nodes.items():
-            if node.status is RunNodeStatus.DONE:
-                continue
-            if node.status is RunNodeStatus.SKIPPED:
-                continue
-            if node.status is RunNodeStatus.FAILED:
-                continue
-            runtime = self.store.maybe_get_runtime(run_id, task_id)
-            if node.status is RunNodeStatus.RUNNING and runtime is not None and runtime.pid is not None:
-                self._terminate_pid(runtime.pid, project.node_terminate_grace_sec)
-                runtime.finished_at = finished_at
-                runtime.return_code = -1
-                runtime.termination_reason = NodeExecutionTerminationReason.TERMINATED
-                self.store.save_runtime(run_id, task_id, runtime)
-            if node.status is RunNodeStatus.PENDING:
-                node.status = RunNodeStatus.SKIPPED
-                node.error = "run aborted by user"
-            else:
-                node.status = RunNodeStatus.FAILED
-                node.error = "run aborted by user"
-            node.waiting_reason = None
-            node.finished_at = finished_at
-            node.termination_reason = NodeExecutionTerminationReason.TERMINATED
-            self._set_task_pool_status(node.task.id, TaskStatus.FAILED)
-            self._write_node_meta(run_id, task_id, snapshot)
-            changed = True
-        if changed:
-            snapshot.status = RunStatus.FAILED
-            self.store.save_run(snapshot)
-        return snapshot
-
-    def _run_snapshot_sync(self, run_id: str) -> RunSnapshot:
-        snapshot = self.store.get_run(run_id)
-        project = self.store.load_project()
-        run_context = _RunFlowContext(
-            project=project,
-            snapshot=snapshot,
-            lock=threading.Lock(),
-        )
-
-        @task
-        def execute_node(task_id: str) -> NodeExecutionOutcome:
-            return self._execute_node(run_context, task_id)
-
-        @flow(
-            name="codex-orch-run",
-            task_runner=ThreadPoolTaskRunner(max_workers=project.max_concurrency),
-        )
-        def run_flow() -> None:
-            self._mark_snapshot_running(run_context)
-            self._attach_prefect_flow_metadata(run_context)
-            futures: dict[str, PrefectFuture[NodeExecutionOutcome]] = {}
-            for task_id in self._topological_order(run_context.snapshot):
-                dependency_futures = [
-                    futures[dependency.task]
-                    for dependency in run_context.snapshot.nodes[task_id].task.depends_on
-                    if dependency.task in futures
-                ]
-                futures[task_id] = execute_node.with_options(
-                    name=f"node-{task_id}"
-                ).submit(task_id, wait_for=dependency_futures)
-            for future in futures.values():
-                future.result()
-            self._finalize_snapshot(run_context)
-
-        run_flow()
-        return self.store.get_run(run_id)
-
-    def _mark_snapshot_running(self, run_context: _RunFlowContext) -> None:
-        with run_context.lock:
-            run_context.snapshot.status = RunStatus.RUNNING
-            self.store.save_run(run_context.snapshot)
-
-    def _attach_prefect_flow_metadata(self, run_context: _RunFlowContext) -> None:
-        flow_run_id = prefect_flow_run.get_id()
-        with run_context.lock:
-            run_context.snapshot.prefect_flow_run_id = flow_run_id
-            self.store.save_run(run_context.snapshot)
-
-    def _execute_node(
-        self,
-        run_context: _RunFlowContext,
-        task_id: str,
-    ) -> NodeExecutionOutcome:
-        try:
-            return self._execute_node_inner(run_context, task_id)
-        except Exception as exc:  # pragma: no cover - defensive guard
-            with run_context.lock:
-                node = run_context.snapshot.nodes[task_id]
-                node.status = RunNodeStatus.FAILED
-                node.waiting_reason = None
-                node.error = str(exc)
-                node.finished_at = datetime.now(UTC).isoformat()
-                self._set_task_pool_status(node.task.id, TaskStatus.FAILED)
-                self._write_node_meta(run_context.snapshot.id, task_id, run_context.snapshot)
-                self.store.save_run(run_context.snapshot)
-            return NodeExecutionOutcome(
-                task_id=task_id,
-                status=RunNodeStatus.FAILED,
-                error=str(exc),
-            )
-
-    def _execute_node_inner(
-        self,
-        run_context: _RunFlowContext,
-        task_id: str,
-    ) -> NodeExecutionOutcome:
-        with run_context.lock:
-            snapshot = run_context.snapshot
-            node = snapshot.nodes[task_id]
-            if self._published_artifacts_complete(snapshot.id, node.task):
-                node.published = self._load_published_artifacts(node.task)
-                node.status = RunNodeStatus.DONE
-                node.waiting_reason = None
-                node.error = None
-                self._set_task_pool_status(node.task.id, TaskStatus.DONE)
-                self._write_node_meta(snapshot.id, task_id, snapshot)
-                self.store.save_run(snapshot)
-                return NodeExecutionOutcome(task_id=task_id, status=node.status)
-
-            if self._dependency_failed(snapshot, node.task):
-                node.status = RunNodeStatus.SKIPPED
-                node.waiting_reason = None
-                node.error = "upstream dependency failed"
-                node.finished_at = datetime.now(UTC).isoformat()
-                self._set_task_pool_status(node.task.id, TaskStatus.BLOCKED)
-                self._write_node_meta(snapshot.id, task_id, snapshot)
-                self.store.save_run(snapshot)
-                return NodeExecutionOutcome(task_id=task_id, status=node.status, error=node.error)
-
-            if not self._dependencies_satisfied(snapshot, node.task):
-                return NodeExecutionOutcome(task_id=task_id, status=node.status)
-
-            gate_error = self._manual_gate_terminal_error(snapshot.id, task_id)
-            if gate_error is not None:
-                node.status = RunNodeStatus.FAILED
-                node.waiting_reason = None
-                node.error = gate_error
-                node.finished_at = datetime.now(UTC).isoformat()
-                self._set_task_pool_status(node.task.id, TaskStatus.FAILED)
-                self._write_node_meta(snapshot.id, task_id, snapshot)
-                self.store.save_run(snapshot)
-                return NodeExecutionOutcome(
-                    task_id=task_id,
-                    status=node.status,
-                    error=node.error,
-                )
-
-            wait_reason = self._wait_reason_for_node(snapshot.id, task_id)
-            if wait_reason is not None:
-                node.status = RunNodeStatus.WAITING
-                node.waiting_reason = wait_reason
-                node.error = self._wait_reason_message(wait_reason)
-                self._set_task_pool_status(node.task.id, TaskStatus.BLOCKED)
-                self._write_node_meta(snapshot.id, task_id, snapshot)
-                self.store.save_run(snapshot)
-                return NodeExecutionOutcome(
-                    task_id=task_id,
-                    status=node.status,
-                    error=node.error,
-                )
-
-            dependency_dirs = {
-                dependency.task: self.store.get_node_dir(snapshot.id, dependency.task)
-                for dependency in node.task.depends_on
-                if snapshot.nodes[dependency.task].status is RunNodeStatus.DONE
-            }
-            user_inputs = dict(snapshot.user_inputs)
-            task = node.task
-            node.status = RunNodeStatus.RUNNING
-            node.waiting_reason = None
-            node.error = None
-            node.attempt += 1
-            node.termination_reason = None
-            node.started_at = datetime.now(UTC).isoformat()
-            self._set_task_pool_status(node.task.id, TaskStatus.RUNNING)
-            self._write_node_meta(snapshot.id, task_id, snapshot)
-            self.store.save_run(snapshot)
-
-        self._consume_approved_manual_gate(run_context.snapshot.id, task_id)
-
-        result = asyncio.run(
-            self._run_single_node(
-                project=run_context.project,
-                run_id=run_context.snapshot.id,
-                task=task,
-                user_inputs=user_inputs,
-                dependency_dirs=dependency_dirs,
-            )
-        )
-
-        with run_context.lock:
-            snapshot = run_context.snapshot
-            node = snapshot.nodes[task_id]
-            node.finished_at = datetime.now(UTC).isoformat()
-            node.termination_reason = self._result_termination_reason(result)
-            gate_error = self._manual_gate_terminal_error(snapshot.id, task_id)
-            wait_reason = self._wait_reason_for_node(snapshot.id, task_id)
-            if gate_error is not None:
-                node.status = RunNodeStatus.FAILED
-                node.waiting_reason = None
-                node.error = gate_error
-                self._set_task_pool_status(node.task.id, TaskStatus.FAILED)
-            elif wait_reason is not None:
-                node.status = RunNodeStatus.WAITING
-                node.waiting_reason = wait_reason
-                node.error = self._wait_reason_message(wait_reason)
-                self._set_task_pool_status(node.task.id, TaskStatus.BLOCKED)
-            elif result.success:
-                try:
-                    node.published = self._promote_artifacts(snapshot.id, node.task)
-                except ValueError as exc:
-                    node.status = RunNodeStatus.FAILED
-                    node.waiting_reason = None
-                    node.error = str(exc)
-                    self._set_task_pool_status(node.task.id, TaskStatus.FAILED)
+    async def abort_run(self, run_id: str) -> RunRecord:
+        lock = self._run_lock(run_id)
+        async with lock:
+            run = self.store.get_run(run_id)
+            finished_at = datetime.now(UTC).isoformat()
+            for instance in run.instances.values():
+                if instance.status in {
+                    RunInstanceStatus.DONE,
+                    RunInstanceStatus.SKIPPED,
+                    RunInstanceStatus.FAILED,
+                }:
+                    continue
+                runtime = None
+                if instance.attempt > 0:
+                    runtime = self.store.maybe_get_attempt_runtime(
+                        run.id,
+                        instance.instance_id,
+                        instance.attempt,
+                    )
+                if (
+                    instance.status is RunInstanceStatus.RUNNING
+                    and runtime is not None
+                    and runtime.pid is not None
+                ):
+                    self._terminate_pid(runtime.pid, run.project.node_terminate_grace_sec)
+                if instance.status in {
+                    RunInstanceStatus.PENDING,
+                    RunInstanceStatus.RUNNABLE,
+                }:
+                    instance.status = RunInstanceStatus.SKIPPED
+                    instance.error = "run aborted by user"
                 else:
-                    node.status = RunNodeStatus.DONE
-                    node.waiting_reason = None
-                    node.error = None
-                    self._set_task_pool_status(node.task.id, TaskStatus.DONE)
-            else:
-                node.status = RunNodeStatus.FAILED
-                node.waiting_reason = None
-                node.error = result.error
-                self._set_task_pool_status(node.task.id, TaskStatus.FAILED)
-            self._write_node_meta(snapshot.id, task_id, snapshot)
-            self.store.save_run(snapshot)
-            return NodeExecutionOutcome(task_id=task_id, status=node.status, error=node.error)
+                    instance.status = RunInstanceStatus.FAILED
+                    instance.error = "run aborted by user"
+                instance.waiting_reason = None
+                instance.finished_at = finished_at
+                instance.termination_reason = NodeExecutionTerminationReason.TERMINATED
+                self._set_task_pool_status(instance.task_id, TaskStatus.FAILED)
+            run.status = RunStatus.FAILED
+            self.store.save_run(run)
+            return run
 
-    async def _run_single_node(
+    async def resume_run(self, run_id: str) -> RunRecord:
+        run = await self.reconcile_run(run_id)
+        if any(
+            instance.status is RunInstanceStatus.RUNNING
+            for instance in run.instances.values()
+        ):
+            return run
+        return await self.run_snapshot(run_id)
+
+    async def run_snapshot(self, run_id: str) -> RunRecord:
+        while True:
+            lock = self._run_lock(run_id)
+            async with lock:
+                run = self.store.get_run(run_id)
+                self._refresh_runnable_instances(run)
+                runnable_ids = [
+                    instance.instance_id
+                    for instance in run.instances.values()
+                    if instance.status is RunInstanceStatus.RUNNABLE
+                ]
+                if not runnable_ids:
+                    self._finalize_run_state(run)
+                    self.store.save_run(run)
+                    return run
+                run.status = RunStatus.RUNNING
+                self.store.save_run(run)
+            semaphore = asyncio.Semaphore(run.project.max_concurrency)
+            await asyncio.gather(
+                *(
+                    self._run_instance_with_semaphore(run_id, instance_id, semaphore)
+                    for instance_id in runnable_ids
+                )
+            )
+
+    async def _run_instance_with_semaphore(
         self,
-        *,
-        project: ProjectSpec,
         run_id: str,
-        task: TaskSpec,
-        user_inputs: dict[str, str],
-        dependency_dirs: dict[str, Path],
-    ) -> NodeExecutionResult:
-        node_dir = self.store.get_node_dir(run_id, task.id)
-        self._materialize_node_context(task, node_dir)
-        prompt = self.composer.render(
-            task,
-            node_dir=node_dir,
-            user_inputs=user_inputs,
-            dependency_node_dirs=dependency_dirs,
-        )
-        project_workspace_dir = self._resolve_project_workspace_dir(project)
-        workspace_dir = self._resolve_task_workspace_dir(project, task)
-        extra_writable_roots = tuple(
-            Path(root)
-            for root in self._resolve_task_extra_writable_roots(task, workspace_dir)
-        )
-        appendices = [
-            self._execution_contract_appendix(
-                task=task,
-                node_dir=node_dir,
-                project_workspace_dir=project_workspace_dir,
-                workspace_dir=workspace_dir,
-                extra_writable_roots=extra_writable_roots,
-            ),
-            self._assistant_auto_reply_prompt_appendix(run_id, task.id),
-            self._manual_gate_prompt_appendix(run_id, task.id),
-        ]
-        prompt_sections = [prompt, *appendices]
-        prompt = "\n\n".join(section for section in prompt_sections if section)
-        return await self.runner.run(
-            NodeExecutionRequest(
-                run_id=run_id,
+        instance_id: str,
+        semaphore: asyncio.Semaphore,
+    ) -> None:
+        async with semaphore:
+            await self._execute_instance(run_id, instance_id)
+
+    async def _execute_instance(self, run_id: str, instance_id: str) -> None:
+        lock = self._run_lock(run_id)
+        async with lock:
+            run = self.store.get_run(run_id)
+            instance = run.instances[instance_id]
+            if instance.status is not RunInstanceStatus.RUNNABLE:
+                return
+            next_attempt = instance.attempt + 1
+            attempt_dir = self.store.get_attempt_dir(run_id, instance_id, next_attempt)
+            self._materialize_attempt_context(instance.task, attempt_dir)
+            prompt = self._build_attempt_prompt(run, instance, attempt_dir)
+            dependency_dirs = {
+                dependency.task: self.store.get_instance_dir(
+                    run_id,
+                    instance.dependency_instances[dependency.task],
+                )
+                for dependency in instance.task.depends_on
+                if dependency.task in instance.dependency_instances
+            }
+            project_workspace_dir = self._resolve_project_workspace_dir(run.project)
+            workspace_dir = self._resolve_task_workspace_dir(run.project, instance.task)
+            extra_writable_roots = tuple(
+                Path(root)
+                for root in self._resolve_task_extra_writable_roots(
+                    instance.task,
+                    workspace_dir,
+                )
+            )
+            rendered_prompt = self.composer.render(
+                instance.task,
+                node_dir=attempt_dir,
+                user_inputs=dict(run.user_inputs),
+                dependency_node_dirs=dependency_dirs,
+            )
+            full_prompt = "\n\n".join(
+                section for section in [rendered_prompt, prompt] if section
+            )
+            instance.status = RunInstanceStatus.RUNNING
+            instance.waiting_reason = None
+            instance.error = None
+            instance.attempt = next_attempt
+            instance.termination_reason = None
+            instance.started_at = datetime.now(UTC).isoformat()
+            self._set_task_pool_status(instance.task_id, TaskStatus.RUNNING)
+            self.store.append_event(
+                run.id,
+                "attempt_started",
+                instance_id=instance_id,
+                payload={"attempt": next_attempt},
+            )
+            self.store.save_run(run)
+            request = NodeExecutionRequest(
+                run_id=run.id,
+                instance_id=instance_id,
+                attempt_no=next_attempt,
                 program_dir=self.store.paths.root,
                 project_workspace_dir=project_workspace_dir,
                 workspace_dir=workspace_dir,
                 extra_writable_roots=extra_writable_roots,
-                node_dir=node_dir,
-                project=project,
-                task=task,
-                prompt=prompt,
+                instance_dir=self.store.get_instance_dir(run.id, instance_id),
+                attempt_dir=attempt_dir,
+                resume_session_id=instance.session_id,
+                project=run.project,
+                task=instance.task,
+                prompt=full_prompt,
             )
-        )
 
-    def _finalize_snapshot(self, run_context: _RunFlowContext) -> None:
-        with run_context.lock:
-            snapshot = run_context.snapshot
-            self._finalize_snapshot_state(snapshot)
-            self.store.save_run(snapshot)
+        result = await self.runner.run(request)
 
-    def _finalize_snapshot_state(self, snapshot: RunSnapshot) -> None:
-        self._mark_blocked_nodes(snapshot)
-        statuses = {node.status for node in snapshot.nodes.values()}
-        if RunNodeStatus.RUNNING in statuses:
-            snapshot.status = RunStatus.RUNNING
-            return
-        if RunNodeStatus.FAILED in statuses:
-            snapshot.status = RunStatus.FAILED
-            return
-        if RunNodeStatus.WAITING in statuses or RunNodeStatus.PENDING in statuses:
-            snapshot.status = RunStatus.WAITING
-            return
-        if all(status is RunNodeStatus.DONE for status in statuses):
-            snapshot.status = RunStatus.DONE
-            return
-        snapshot.status = RunStatus.FAILED
+        async with lock:
+            run = self.store.get_run(run_id)
+            instance = run.instances[instance_id]
+            instance.finished_at = datetime.now(UTC).isoformat()
+            instance.termination_reason = self._result_termination_reason(result)
+            if result.session_id is not None:
+                instance.session_id = result.session_id
 
-    def _mark_node_failed(
+            if request.resume_session_id is not None or result.session_id is not None:
+                self._mark_resolved_interrupts_applied(run.id, instance_id)
+
+            blocking_interrupts = self._refresh_instance_interrupts(run.id, instance)
+            if blocking_interrupts:
+                instance.status = RunInstanceStatus.WAITING
+                instance.waiting_reason = RunInstanceWaitReason.INTERRUPTS_PENDING
+                instance.error = "interrupt replies are still pending"
+                self._set_task_pool_status(instance.task_id, TaskStatus.BLOCKED)
+                self.store.append_event(
+                    run.id,
+                    "instance_waiting",
+                    instance_id=instance_id,
+                    payload={"interrupt_ids": blocking_interrupts},
+                )
+            elif result.success:
+                try:
+                    instance.published = self._promote_artifacts(
+                        run.id,
+                        instance,
+                        instance.attempt,
+                    )
+                except ValueError as exc:
+                    instance.status = RunInstanceStatus.FAILED
+                    instance.waiting_reason = None
+                    instance.error = str(exc)
+                    self._set_task_pool_status(instance.task_id, TaskStatus.FAILED)
+                else:
+                    instance.status = RunInstanceStatus.DONE
+                    instance.waiting_reason = None
+                    instance.error = None
+                    self._set_task_pool_status(instance.task_id, TaskStatus.DONE)
+                    self.store.append_event(
+                        run.id,
+                        "instance_done",
+                        instance_id=instance_id,
+                        payload={"task_id": instance.task_id},
+                    )
+            else:
+                instance.status = RunInstanceStatus.FAILED
+                instance.waiting_reason = None
+                instance.error = result.error
+                self._set_task_pool_status(instance.task_id, TaskStatus.FAILED)
+                self.store.append_event(
+                    run.id,
+                    "instance_failed",
+                    instance_id=instance_id,
+                    payload={"error": result.error},
+                )
+
+            self.store.append_event(
+                run.id,
+                "attempt_finished",
+                instance_id=instance_id,
+                payload={
+                    "attempt": instance.attempt,
+                    "termination_reason": instance.termination_reason.value,
+                    "success": result.success,
+                },
+            )
+            self.store.save_run(run)
+
+    def _build_attempt_prompt(
         self,
-        snapshot: RunSnapshot,
-        task_id: str,
+        run: RunRecord,
+        instance: RunInstanceState,
+        attempt_dir: Path,
+    ) -> str:
+        if instance.session_id is None:
+            return self._execution_contract_appendix(
+                task=instance.task,
+                attempt_dir=attempt_dir,
+                project_workspace_dir=self._resolve_project_workspace_dir(run.project),
+                workspace_dir=self._resolve_task_workspace_dir(run.project, instance.task),
+                extra_writable_roots=tuple(
+                    Path(root)
+                    for root in self._resolve_task_extra_writable_roots(
+                        instance.task,
+                        self._resolve_task_workspace_dir(run.project, instance.task),
+                    )
+                ),
+            )
+        return self._resume_prompt(run.id, instance.instance_id)
+
+    def _resume_prompt(self, run_id: str, instance_id: str) -> str:
+        records = [
+            record
+            for record in self.store.list_instance_interrupts(run_id, instance_id)
+            if record.interrupt.status is InterruptStatus.RESOLVED
+        ]
+        if not records:
+            return "Continue the task using the existing session context."
+        sections = [
+            "## Resume Context",
+            "Continue the task using the existing session context and the newly resolved external replies below.",
+        ]
+        for record in records:
+            reply = record.reply
+            if reply is None:
+                continue
+            if reply.audience.value == "assistant":
+                sections.extend(
+                    [
+                        "### Assistant Reply",
+                        f"Original Question: {record.interrupt.question.rstrip()}",
+                        f"Answer: {reply.text.rstrip()}",
+                    ]
+                )
+                if reply.rationale:
+                    sections.append(f"Rationale: {reply.rationale.rstrip()}")
+                if reply.citations:
+                    sections.append(
+                        "Citations: " + ", ".join(reply.citations)
+                    )
+            else:
+                sections.extend(
+                    [
+                        "### Human Reply",
+                        f"Original Question: {record.interrupt.question.rstrip()}",
+                        f"Answer: {reply.text.rstrip()}",
+                    ]
+                )
+                summary = record.interrupt.metadata.get("assistant_summary")
+                rationale = record.interrupt.metadata.get("assistant_rationale")
+                if isinstance(summary, str) and summary.strip():
+                    sections.append(f"Assistant Summary: {summary.rstrip()}")
+                if isinstance(rationale, str) and rationale.strip():
+                    sections.append(f"Assistant Rationale: {rationale.rstrip()}")
+        return "\n\n".join(sections)
+
+    def _mark_resolved_interrupts_applied(self, run_id: str, instance_id: str) -> None:
+        for record in self.store.list_instance_interrupts(run_id, instance_id):
+            if record.interrupt.status is not InterruptStatus.RESOLVED:
+                continue
+            self.store.mark_interrupt_applied(run_id, record.interrupt.interrupt_id)
+
+    def _refresh_instance_interrupts(
+        self,
+        run_id: str,
+        instance: RunInstanceState,
+    ) -> list[str]:
+        interrupt_ids = [
+            record.interrupt.interrupt_id
+            for record in self.store.list_instance_interrupts(
+                run_id,
+                instance.instance_id,
+                blocking_only=True,
+            )
+            if record.interrupt.status is InterruptStatus.OPEN
+        ]
+        instance.blocking_interrupts = interrupt_ids
+        return interrupt_ids
+
+    def _refresh_runnable_instances(self, run: RunRecord) -> None:
+        for instance in run.instances.values():
+            self._refresh_instance_interrupts(run.id, instance)
+            if instance.status is RunInstanceStatus.WAITING:
+                if instance.blocking_interrupts:
+                    instance.waiting_reason = RunInstanceWaitReason.INTERRUPTS_PENDING
+                    continue
+                instance.status = RunInstanceStatus.RUNNABLE
+                instance.waiting_reason = None
+                instance.error = None
+                self.store.append_event(
+                    run.id,
+                    "instance_resumed",
+                    instance_id=instance.instance_id,
+                    payload={"task_id": instance.task_id},
+                )
+                continue
+            if instance.status is not RunInstanceStatus.PENDING:
+                continue
+            if self._dependency_failed(run, instance):
+                instance.status = RunInstanceStatus.SKIPPED
+                instance.waiting_reason = None
+                instance.error = "upstream dependency failed"
+                self._set_task_pool_status(instance.task_id, TaskStatus.BLOCKED)
+                continue
+            if self._dependencies_satisfied(run, instance):
+                instance.status = RunInstanceStatus.RUNNABLE
+                instance.waiting_reason = None
+                self.store.append_event(
+                    run.id,
+                    "instance_runnable",
+                    instance_id=instance.instance_id,
+                    payload={"task_id": instance.task_id},
+                )
+
+    def _dependencies_satisfied(
+        self,
+        run: RunRecord,
+        instance: RunInstanceState,
+    ) -> bool:
+        for dependency in instance.task.depends_on:
+            upstream_instance_id = instance.dependency_instances.get(dependency.task)
+            if upstream_instance_id is None:
+                return False
+            upstream = run.instances[upstream_instance_id]
+            if upstream.status is not RunInstanceStatus.DONE:
+                return False
+            if dependency.kind is DependencyKind.CONTEXT:
+                published_paths = {artifact.relative_path for artifact in upstream.published}
+                if any(consumed not in published_paths for consumed in dependency.consume):
+                    return False
+        return True
+
+    def _dependency_failed(self, run: RunRecord, instance: RunInstanceState) -> bool:
+        for dependency in instance.task.depends_on:
+            upstream_instance_id = instance.dependency_instances.get(dependency.task)
+            if upstream_instance_id is None:
+                return False
+            upstream = run.instances[upstream_instance_id]
+            if upstream.status in {RunInstanceStatus.FAILED, RunInstanceStatus.SKIPPED}:
+                return True
+        return False
+
+    def _finalize_run_state(self, run: RunRecord) -> None:
+        statuses = {instance.status for instance in run.instances.values()}
+        if RunInstanceStatus.RUNNING in statuses:
+            run.status = RunStatus.RUNNING
+            return
+        if RunInstanceStatus.FAILED in statuses:
+            run.status = RunStatus.FAILED
+            return
+        if RunInstanceStatus.WAITING in statuses:
+            run.status = RunStatus.WAITING
+            return
+        if RunInstanceStatus.RUNNABLE in statuses or RunInstanceStatus.PENDING in statuses:
+            run.status = RunStatus.PENDING
+            return
+        run.status = RunStatus.DONE
+
+    def _mark_instance_failed(
+        self,
+        run: RunRecord,
+        instance_id: str,
         *,
         error: str,
         termination_reason: NodeExecutionTerminationReason,
         finished_at: str,
     ) -> None:
-        node = snapshot.nodes[task_id]
-        node.status = RunNodeStatus.FAILED
-        node.waiting_reason = None
-        node.error = error
-        node.finished_at = finished_at
-        node.termination_reason = termination_reason
-        self._set_task_pool_status(node.task.id, TaskStatus.FAILED)
-        self._write_node_meta(snapshot.id, task_id, snapshot)
+        instance = run.instances[instance_id]
+        instance.status = RunInstanceStatus.FAILED
+        instance.waiting_reason = None
+        instance.error = error
+        instance.finished_at = finished_at
+        instance.termination_reason = termination_reason
+        self._set_task_pool_status(instance.task_id, TaskStatus.FAILED)
+        self.store.append_event(
+            run.id,
+            "instance_failed",
+            instance_id=instance_id,
+            payload={"error": error, "termination_reason": termination_reason.value},
+        )
 
     def _reconcile_finished_runtime(
         self,
-        snapshot: RunSnapshot,
-        task_id: str,
+        run: RunRecord,
+        instance_id: str,
         runtime: NodeExecutionRuntime,
     ) -> None:
-        node = snapshot.nodes[task_id]
+        instance = run.instances[instance_id]
         termination_reason = self._resolve_runtime_termination_reason(runtime)
-        node.finished_at = runtime.finished_at
-        node.termination_reason = termination_reason
+        instance.finished_at = runtime.finished_at
+        instance.termination_reason = termination_reason
         if termination_reason is NodeExecutionTerminationReason.COMPLETED:
+            blocking_interrupts = self._refresh_instance_interrupts(run.id, instance)
+            if blocking_interrupts:
+                instance.status = RunInstanceStatus.WAITING
+                instance.waiting_reason = RunInstanceWaitReason.INTERRUPTS_PENDING
+                instance.error = "interrupt replies are still pending"
+                self._set_task_pool_status(instance.task_id, TaskStatus.BLOCKED)
+                return
             try:
-                node.published = self._promote_artifacts(snapshot.id, node.task)
+                instance.published = self._promote_artifacts(
+                    run.id,
+                    instance,
+                    instance.attempt,
+                )
             except ValueError as exc:
-                self._mark_node_failed(
-                    snapshot,
-                    task_id,
+                self._mark_instance_failed(
+                    run,
+                    instance_id,
                     error=str(exc),
                     termination_reason=NodeExecutionTerminationReason.NONZERO_EXIT,
                     finished_at=runtime.finished_at or datetime.now(UTC).isoformat(),
                 )
             else:
-                node.status = RunNodeStatus.DONE
-                node.waiting_reason = None
-                node.error = None
-                self._set_task_pool_status(node.task.id, TaskStatus.DONE)
-                self._write_node_meta(snapshot.id, task_id, snapshot)
+                instance.status = RunInstanceStatus.DONE
+                instance.waiting_reason = None
+                instance.error = None
+                self._set_task_pool_status(instance.task_id, TaskStatus.DONE)
             return
-        self._mark_node_failed(
-            snapshot,
-            task_id,
+        self._mark_instance_failed(
+            run,
+            instance_id,
             error=self._termination_reason_message(termination_reason),
             termination_reason=termination_reason,
             finished_at=runtime.finished_at or datetime.now(UTC).isoformat(),
@@ -618,7 +698,7 @@ class RunService:
         if termination_reason is NodeExecutionTerminationReason.IDLE_TIMEOUT:
             return "codex exec exceeded idle timeout"
         if termination_reason is NodeExecutionTerminationReason.ORPHANED:
-            return "worker process disappeared while node was running"
+            return "worker process disappeared while instance was running"
         if termination_reason is NodeExecutionTerminationReason.TERMINATED:
             return "codex exec terminated"
         return "codex exec failed"
@@ -650,20 +730,21 @@ class RunService:
     def _promote_artifacts(
         self,
         run_id: str,
-        task: TaskSpec,
+        instance: RunInstanceState,
+        attempt_no: int,
     ) -> list[PublishedArtifact]:
-        node_dir = self.store.get_node_dir(run_id, task.id)
-        published_dir = node_dir / "published"
+        attempt_dir = self.store.get_attempt_dir(run_id, instance.instance_id, attempt_no)
+        published_dir = self.store.get_instance_published_dir(run_id, instance.instance_id)
         if published_dir.exists():
             shutil.rmtree(published_dir)
         published_dir.mkdir(parents=True, exist_ok=True)
 
         artifacts: list[PublishedArtifact] = []
-        for relative_path in task.publish:
-            source = node_dir / relative_path
+        for relative_path in instance.task.publish:
+            source = attempt_dir / relative_path
             if not source.exists():
                 raise ValueError(
-                    f"task {task.id} declared publish file {relative_path} but it was not produced"
+                    f"task {instance.task_id} declared publish file {relative_path} but it was not produced"
                 )
             destination = published_dir / relative_path
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -671,372 +752,10 @@ class RunService:
             artifacts.append(PublishedArtifact(relative_path=relative_path))
         return artifacts
 
-    def _published_artifacts_complete(self, run_id: str, task: TaskSpec) -> bool:
-        published_dir = self.store.get_node_dir(run_id, task.id) / "published"
-        return all((published_dir / relative_path).exists() for relative_path in task.publish)
-
-    def _load_published_artifacts(self, task: TaskSpec) -> list[PublishedArtifact]:
-        return [
-            PublishedArtifact(relative_path=relative_path)
-            for relative_path in task.publish
-        ]
-
-    def _dependencies_satisfied(self, snapshot: RunSnapshot, task: TaskSpec) -> bool:
-        for dependency in task.depends_on:
-            upstream = snapshot.nodes[dependency.task]
-            if upstream.status is not RunNodeStatus.DONE:
-                return False
-            if dependency.kind is DependencyKind.CONTEXT:
-                published_paths = {artifact.relative_path for artifact in upstream.published}
-                if any(consumed not in published_paths for consumed in dependency.consume):
-                    return False
-        return True
-
-    def _dependency_failed(self, snapshot: RunSnapshot, task: TaskSpec) -> bool:
-        for dependency in task.depends_on:
-            upstream = snapshot.nodes[dependency.task]
-            if upstream.status in {RunNodeStatus.FAILED, RunNodeStatus.SKIPPED}:
-                return True
-        return False
-
-    def _mark_blocked_nodes(self, snapshot: RunSnapshot) -> None:
-        for node in snapshot.nodes.values():
-            if node.status is not RunNodeStatus.PENDING:
-                continue
-            if not self._dependency_failed(snapshot, node.task):
-                continue
-            node.status = RunNodeStatus.SKIPPED
-            node.waiting_reason = None
-            node.error = "upstream dependency failed"
-            self._set_task_pool_status(node.task.id, TaskStatus.BLOCKED)
-            self._write_node_meta(snapshot.id, node.task.id, snapshot)
-
-    def _wait_reason_for_node(
-        self,
-        run_id: str,
-        task_id: str,
-    ) -> RunNodeWaitReason | None:
-        request = self.store.maybe_get_assistant_request(run_id, task_id)
-        if request is None:
-            return None
-        response = self.store.maybe_get_assistant_response(run_id, task_id)
-        if response is None:
-            return RunNodeWaitReason.ASSISTANT_PENDING
-        if response.resolution_kind is ResolutionKind.AUTO_REPLY:
-            return None
-        if response.resolution_kind is ResolutionKind.HANDOFF_TO_HUMAN:
-            gate = self.store.ensure_manual_gate_for_request(request.request_id)
-            if gate.status is ManualGateStatus.WAITING_FOR_HUMAN:
-                return RunNodeWaitReason.HANDOFF_TO_HUMAN
-            if gate.status is ManualGateStatus.ANSWERED:
-                return RunNodeWaitReason.MANUAL_GATE_BLOCKED
-            if gate.status in {
-                ManualGateStatus.APPROVED,
-                ManualGateStatus.APPLIED,
-            }:
-                return None
-            return RunNodeWaitReason.MANUAL_GATE_BLOCKED
-        return RunNodeWaitReason.MANUAL_GATE_BLOCKED
-
-    def _manual_gate_terminal_error(self, run_id: str, task_id: str) -> str | None:
-        request = self.store.maybe_get_assistant_request(run_id, task_id)
-        if request is None:
-            return None
-        gate = self.store.maybe_get_manual_gate(run_id, task_id)
-        if gate is None:
-            return None
-        if gate.status is ManualGateStatus.REJECTED:
-            return "manual gate rejected by human"
-        if gate.status is ManualGateStatus.FAILED:
-            return "manual gate failed"
-        return None
-
-    def _consume_approved_manual_gate(self, run_id: str, task_id: str) -> None:
-        request = self.store.maybe_get_assistant_request(run_id, task_id)
-        if request is None:
-            return
-        gate = self.store.maybe_get_manual_gate(run_id, task_id)
-        if gate is None:
-            return
-        if gate.status is not ManualGateStatus.APPROVED:
-            return
-        self.store.update_manual_gate_status_by_request_id(
-            request.request_id,
-            ManualGateStatus.APPLIED,
-        )
-
-    def _execution_contract_appendix(
-        self,
-        *,
-        task: TaskSpec,
-        node_dir: Path,
-        project_workspace_dir: Path,
-        workspace_dir: Path,
-        extra_writable_roots: tuple[Path, ...],
-    ) -> str:
-        sandbox = task.sandbox or "workspace-write"
-        assistant_helper_path = self._assistant_requesting_help_doc_path(node_dir)
-        assistant_profile = task.assistant_profile or "<none>"
-        sections = [
-            "## Execution Contract",
-            "\n".join(
-                [
-                    f"- workspace_dir (cwd): `{workspace_dir}`",
-                    f"- project_workspace_dir: `{project_workspace_dir}`",
-                    f"- node_dir: `{node_dir}`",
-                    f"- sandbox: `{sandbox}`",
-                ]
-            ),
-        ]
-        writable_roots = self._declared_writable_roots(
-            sandbox=sandbox,
-            workspace_dir=workspace_dir,
-            node_dir=node_dir,
-            extra_writable_roots=extra_writable_roots,
-        )
-        if writable_roots is None:
-            sections.append(
-                "### Writable Roots\n- unrestricted via `danger-full-access` sandbox"
-            )
-        elif writable_roots:
-            sections.append(
-                "### Writable Roots\n"
-                + "\n".join(f"- `{root}`" for root in writable_roots)
-            )
-        else:
-            sections.append("### Writable Roots\n- none")
-        sections.append(
-            "### Publish Targets\n"
-            + "\n".join(f"- `{path}`" for path in task.publish)
-        )
-        if task.result_schema is not None:
-            sections.append(f"### Result Schema\n- `{task.result_schema}`")
-        sections.append(
-            "\n".join(
-                [
-                    "### Assistant Escalation Contract",
-                    "- Escalate only for policy ambiguity, missing user preference, required approval, or codex-orch control-plane help.",
-                    f"- Read `{assistant_helper_path}` before escalating.",
-                    "- Create requests with `codex-orch assistant request create`; do not hand-write `assistant_request.json`.",
-                    f"- Effective assistant profile for this task: `{assistant_profile}`.",
-                    "- Requests succeed only when this task has an effective assistant profile.",
-                    "- Runtime env vars are available: `CODEX_ORCH_PROGRAM_DIR`, `CODEX_ORCH_RUN_ID`, `CODEX_ORCH_TASK_ID`, `CODEX_ORCH_NODE_DIR`, `CODEX_ORCH_PROJECT_WORKSPACE_DIR`, `CODEX_ORCH_WORKSPACE_DIR`.",
-                    "- Pass `--artifact` paths relative to `CODEX_ORCH_PROGRAM_DIR`.",
-                    "- `auto_reply` and approved manual-gate continuations apply only to this task continuation, not downstream tasks.",
-                    "- `handoff_to_human` creates `manual_gate.json` and `human_request.json` for this node and pauses execution.",
-                ]
-            )
-        )
-        return "\n\n".join(sections)
-
-    def _assistant_auto_reply_prompt_appendix(
-        self, run_id: str, task_id: str
-    ) -> str | None:
-        request = self.store.maybe_get_assistant_request(run_id, task_id)
-        if request is None:
-            return None
-        response = self.store.maybe_get_assistant_response(run_id, task_id)
-        if response is None:
-            return None
-        if response.resolution_kind is not ResolutionKind.AUTO_REPLY:
-            return None
-
-        sections = [
-            "## Assistant Continuation Context",
-            (
-                "Apply this assistant answer only to this task continuation. "
-                "Use it as the resolved assistant guidance for this task."
-            ),
-            f"### Original Question\n{request.question.rstrip()}",
-            f"### Assistant Answer\n{response.answer.rstrip()}",
-            f"### Assistant Rationale\n{response.rationale.rstrip()}",
-        ]
-        if response.citations:
-            sections.append(
-                "### Citations\n"
-                + "\n".join(f"- {citation}" for citation in response.citations)
-            )
-        if request.context_artifacts:
-            sections.append(
-                "### Context Artifacts\n"
-                + self._assistant_context_artifact_lines(run_id, task_id, request.context_artifacts)
-            )
-        return "\n\n".join(sections)
-
-    def _manual_gate_prompt_appendix(self, run_id: str, task_id: str) -> str | None:
-        gate = self.store.maybe_get_manual_gate(run_id, task_id)
-        if gate is None:
-            return None
-        if gate.status not in {
-            ManualGateStatus.APPROVED,
-            ManualGateStatus.APPLIED,
-        }:
-            return None
-        human_request = self.store.maybe_get_human_request(run_id, task_id)
-        human_response = self.store.maybe_get_human_response(run_id, task_id)
-        if human_request is None or human_response is None:
-            return None
-
-        sections = [
-            "## Human-Approved Continuation Context",
-            (
-                "Apply this decision only to this task continuation. "
-                "The human answer is authoritative."
-            ),
-            f"### Original Question\n{human_request.question.rstrip()}",
-            f"### Assistant Summary\n{human_request.assistant_summary.rstrip()}",
-            f"### Assistant Rationale\n{human_request.assistant_rationale.rstrip()}",
-            f"### Human Answer\n{human_response.answer.rstrip()}",
-        ]
-        if human_request.citations:
-            sections.append(
-                "### Citations\n"
-                + "\n".join(f"- {citation}" for citation in human_request.citations)
-            )
-        if human_request.context_artifacts:
-            sections.append(
-                "### Context Artifacts\n"
-                + self._assistant_context_artifact_lines(
-                    run_id,
-                    task_id,
-                    human_request.context_artifacts,
-                )
-            )
-        return "\n\n".join(sections)
-
-    def _assistant_context_artifact_lines(
-        self,
-        run_id: str,
-        task_id: str,
-        relative_paths: list[str],
-    ) -> str:
-        node_dir = self.store.get_node_dir(run_id, task_id)
-        lines: list[str] = []
-        for relative_path in relative_paths:
-            staged = ensure_staged_assistant_artifact(
-                program_dir=self.store.paths.root,
-                node_dir=node_dir,
-                relative_path=relative_path,
-            )
-            lines.append(
-                f"- source: `{relative_path}`; staged_path: `{staged.staged_path}`"
-            )
-        return "\n".join(lines)
-
-    def _declared_writable_roots(
-        self,
-        *,
-        sandbox: str,
-        workspace_dir: Path,
-        node_dir: Path,
-        extra_writable_roots: tuple[Path, ...],
-    ) -> tuple[Path, ...] | None:
-        if sandbox == "danger-full-access":
-            return None
-        if sandbox == "read-only":
-            return tuple()
-        candidates = [workspace_dir, node_dir, *extra_writable_roots]
-        deduped: list[Path] = []
-        seen: set[str] = set()
-        for path in candidates:
-            normalized = str(path)
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            deduped.append(path)
-        return tuple(deduped)
-
-    def _wait_reason_message(self, reason: RunNodeWaitReason) -> str:
-        if reason is RunNodeWaitReason.ASSISTANT_PENDING:
-            return "assistant request is waiting for a reply"
-        if reason is RunNodeWaitReason.HANDOFF_TO_HUMAN:
-            return "assistant handed off to human gate"
-        return "manual gate is waiting for approval"
-
-    def _topological_order(self, snapshot: RunSnapshot) -> list[str]:
-        ordered: list[str] = []
-        visited: set[str] = set()
-
-        def visit(task_id: str) -> None:
-            if task_id in visited:
-                return
-            visited.add(task_id)
-            for dependency in snapshot.nodes[task_id].task.depends_on:
-                if dependency.task in snapshot.nodes:
-                    visit(dependency.task)
-            ordered.append(task_id)
-
-        for task_id in sorted(snapshot.nodes):
-            visit(task_id)
-        return ordered
-
-    def _set_task_pool_status(self, task_id: str, status: TaskStatus) -> None:
-        task = self.store.get_task(task_id)
-        updated = task.model_copy(update={"status": status})
-        self.store.save_task(updated)
-
-    def _write_node_meta(self, run_id: str, task_id: str, snapshot: RunSnapshot) -> None:
-        node_dir = self.store.get_node_dir(run_id, task_id)
-        node = snapshot.nodes[task_id]
-        runtime_path = self.store.get_runtime_path(run_id, task_id)
-        runtime = self.store.maybe_get_runtime(run_id, task_id)
-        assistant_request = self.store.get_assistant_request_path(run_id, task_id)
-        assistant_response = self.store.get_assistant_response_path(run_id, task_id)
-        assistant_action = self.store.get_assistant_control_action_path(run_id, task_id)
-        manual_gate = self.store.get_manual_gate_path(run_id, task_id)
-        human_request = self.store.get_human_request_path(run_id, task_id)
-        human_response = self.store.get_human_response_path(run_id, task_id)
-        meta = {
-            "run_id": run_id,
-            "task": node.task.model_dump(mode="json"),
-            "status": node.status.value,
-            "waiting_reason": None
-            if node.waiting_reason is None
-            else node.waiting_reason.value,
-            "error": node.error,
-            "attempt": node.attempt,
-            "termination_reason": None
-            if node.termination_reason is None
-            else node.termination_reason.value,
-            "started_at": node.started_at,
-            "finished_at": node.finished_at,
-            "published": [artifact.model_dump(mode="json") for artifact in node.published],
-            "runtime": str(runtime_path) if runtime_path.exists() else None,
-            "runtime_summary": None
-            if runtime is None
-            else {
-                "pid": runtime.pid,
-                "cwd": runtime.cwd,
-                "project_workspace_dir": runtime.project_workspace_dir,
-                "sandbox": runtime.sandbox,
-                "writable_roots": runtime.writable_roots,
-                "last_progress_at": runtime.last_progress_at,
-                "last_event_summary": runtime.last_event_summary,
-                "termination_reason": None
-                if runtime.termination_reason is None
-                else runtime.termination_reason.value,
-                "wall_timeout_sec": runtime.wall_timeout_sec,
-                "idle_timeout_sec": runtime.idle_timeout_sec,
-            },
-            "assistant_request": str(assistant_request) if assistant_request.exists() else None,
-            "assistant_response": str(assistant_response) if assistant_response.exists() else None,
-            "assistant_control_action": str(assistant_action) if assistant_action.exists() else None,
-            "manual_gate": str(manual_gate) if manual_gate.exists() else None,
-            "human_request": str(human_request) if human_request.exists() else None,
-            "human_response": str(human_response) if human_response.exists() else None,
-        }
-        (node_dir / "meta.json").write_text(
-            json.dumps(meta, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-
     def _materialize_task(self, project: ProjectSpec, task: TaskSpec) -> TaskSpec:
         effective_sandbox = task.sandbox or project.default_sandbox
         updates: dict[str, object] = {}
-        if (
-            task.assistant_profile is None
-            and project.default_assistant_profile is not None
-        ):
+        if task.assistant_profile is None and project.default_assistant_profile is not None:
             updates["assistant_profile"] = project.default_assistant_profile
         if task.sandbox is None:
             updates["sandbox"] = project.default_sandbox
@@ -1065,62 +784,44 @@ class RunService:
             return task
         return task.model_copy(update=updates)
 
-    def _materialize_snapshot_node_context(self, snapshot: RunSnapshot) -> None:
-        for task_id, node in snapshot.nodes.items():
-            node_dir = self.store.get_node_dir(snapshot.id, task_id)
-            self._materialize_node_context(node.task, node_dir)
-
-    def _materialize_node_context(self, task: TaskSpec, node_dir: Path) -> None:
+    def _materialize_attempt_context(self, task: TaskSpec, attempt_dir: Path) -> None:
         for step in task.compose:
             if step.kind is ComposeStepKind.FILE and step.path is not None:
                 ensure_staged_compose_program_file(
                     program_dir=self.store.paths.root,
-                    node_dir=node_dir,
+                    node_dir=attempt_dir,
                     relative_path=step.path,
                 )
-        self._write_assistant_requesting_help_doc(node_dir=node_dir, task=task)
+        self._write_interrupt_help_doc(attempt_dir=attempt_dir, task=task)
 
-    def _assistant_requesting_help_doc_path(self, node_dir: Path) -> Path:
-        return node_dir / "context" / "assistant" / "requesting-help.md"
+    def _interrupt_help_doc_path(self, attempt_dir: Path) -> Path:
+        return attempt_dir / "context" / "interrupt" / "requesting-help.md"
 
-    def _write_assistant_requesting_help_doc(
-        self,
-        *,
-        node_dir: Path,
-        task: TaskSpec,
-    ) -> None:
-        helper_path = self._assistant_requesting_help_doc_path(node_dir)
+    def _write_interrupt_help_doc(self, *, attempt_dir: Path, task: TaskSpec) -> None:
+        helper_path = self._interrupt_help_doc_path(attempt_dir)
         assistant_profile = task.assistant_profile or "<none>"
         helper_path.parent.mkdir(parents=True, exist_ok=True)
         helper_path.write_text(
             dedent(
                 f"""\
-                # Requesting Assistant Help
+                # Requesting External Help
 
-                This node can escalate questions to the configured assistant without hand-writing protocol files.
+                This attempt can create runtime interrupts without hand-writing inbox files.
 
                 ## Current Task State
 
                 - task_id: `{task.id}`
                 - effective_assistant_profile: `{assistant_profile}`
 
-                ## When To Escalate
-
-                Use assistant escalation for:
-
-                - policy ambiguity
-                - missing user preference or approval
-                - codex-orch control-plane help such as runs, assistant inbox, manual gates, or resume/recovery
-
-                Do not escalate ordinary implementation choices that can be settled from the repo, task prompt, or dependency context already provided to this node.
-
-                ## Create A Request
+                ## Create An Assistant Interrupt
 
                 ```bash
-                codex-orch assistant request create \\
+                codex-orch interrupt create \\
                   --program-dir "$CODEX_ORCH_PROGRAM_DIR" \\
                   --run-id "$CODEX_ORCH_RUN_ID" \\
+                  --instance-id "$CODEX_ORCH_INSTANCE_ID" \\
                   --task-id "$CODEX_ORCH_TASK_ID" \\
+                  --audience assistant \\
                   --kind clarification \\
                   --decision-kind policy \\
                   --question "Can I delete the legacy wrapper?" \\
@@ -1128,34 +829,109 @@ class RunService:
                   --option keep_wrapper
                 ```
 
-                Use `--question-file /path/to/question.md` for longer prompts or structured decision memos.
-
-                ## Attach Artifacts
-
-                - Pass `--artifact <relative/path>` using paths relative to `CODEX_ORCH_PROGRAM_DIR`.
-                - Attach only files that materially help the assistant answer.
-                - Do not hand-write `assistant_request.json`; the CLI owns envelope fields such as `request_id`, `created_at`, and `requester_task_id`.
-
                 ## Runtime Env Vars
 
                 - `CODEX_ORCH_PROGRAM_DIR`
                 - `CODEX_ORCH_RUN_ID`
+                - `CODEX_ORCH_INSTANCE_ID`
                 - `CODEX_ORCH_TASK_ID`
-                - `CODEX_ORCH_NODE_DIR`
+                - `CODEX_ORCH_INSTANCE_DIR`
+                - `CODEX_ORCH_ATTEMPT_DIR`
                 - `CODEX_ORCH_PROJECT_WORKSPACE_DIR`
                 - `CODEX_ORCH_WORKSPACE_DIR`
 
-                ## Continuation Semantics
+                ## Semantics
 
-                - If this task has no effective assistant profile, request creation fails immediately.
-                - An `auto_reply` is reinjected only into this task continuation when the run resumes.
-                - A `handoff_to_human` reply creates `manual_gate.json` and `human_request.json`; this node waits for a human answer and approval.
-                - Downstream tasks do not automatically receive the assistant or human answer unless this task publishes new artifacts that encode the decision.
+                - Interrupts are resolved through the run inbox, not by mutating task-local files.
+                - Blocking interrupts move this instance to `waiting` after the current attempt ends if they remain unresolved.
+                - The next attempt resumes via the same Codex session after all blocking interrupts are resolved.
                 """
             ).rstrip()
             + "\n",
             encoding="utf-8",
         )
+
+    def _execution_contract_appendix(
+        self,
+        *,
+        task: TaskSpec,
+        attempt_dir: Path,
+        project_workspace_dir: Path,
+        workspace_dir: Path,
+        extra_writable_roots: tuple[Path, ...],
+    ) -> str:
+        sandbox = task.sandbox or "workspace-write"
+        helper_path = self._interrupt_help_doc_path(attempt_dir)
+        sections = [
+            "## Execution Contract",
+            "\n".join(
+                [
+                    f"- workspace_dir (cwd): `{workspace_dir}`",
+                    f"- project_workspace_dir: `{project_workspace_dir}`",
+                    f"- instance_dir: `{attempt_dir.parent.parent}`",
+                    f"- attempt_dir: `{attempt_dir}`",
+                    f"- sandbox: `{sandbox}`",
+                ]
+            ),
+        ]
+        writable_roots = self._declared_writable_roots(
+            sandbox=sandbox,
+            workspace_dir=workspace_dir,
+            attempt_dir=attempt_dir,
+            extra_writable_roots=extra_writable_roots,
+        )
+        if writable_roots is None:
+            sections.append(
+                "### Writable Roots\n- unrestricted via `danger-full-access` sandbox"
+            )
+        elif writable_roots:
+            sections.append(
+                "### Writable Roots\n"
+                + "\n".join(f"- `{root}`" for root in writable_roots)
+            )
+        else:
+            sections.append("### Writable Roots\n- none")
+        sections.append(
+            "### Publish Targets\n"
+            + "\n".join(f"- `{path}`" for path in task.publish)
+        )
+        if task.result_schema is not None:
+            sections.append(f"### Result Schema\n- `{task.result_schema}`")
+        sections.append(
+            "\n".join(
+                [
+                    "### Interrupt Contract",
+                    f"- Read `{helper_path}` before creating runtime interrupts.",
+                    "- Use `codex-orch interrupt create`; do not hand-write inbox files.",
+                    "- Interrupt replies are applied only to this instance resume path, not downstream tasks.",
+                    "- Persist final outputs under the attempt directory so codex-orch can publish them on success.",
+                ]
+            )
+        )
+        return "\n\n".join(sections)
+
+    def _declared_writable_roots(
+        self,
+        *,
+        sandbox: str,
+        workspace_dir: Path,
+        attempt_dir: Path,
+        extra_writable_roots: tuple[Path, ...],
+    ) -> tuple[Path, ...] | None:
+        if sandbox == "danger-full-access":
+            return None
+        if sandbox == "read-only":
+            return tuple()
+        candidates = [workspace_dir, attempt_dir, *extra_writable_roots]
+        deduped: list[Path] = []
+        seen: set[str] = set()
+        for path in candidates:
+            normalized = str(path)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(path)
+        return tuple(deduped)
 
     def _resolve_project_workspace_dir(self, project: ProjectSpec) -> Path:
         return Path(project.workspace).resolve()
@@ -1187,7 +963,22 @@ class RunService:
             resolved_roots.append(resolved_root)
         return resolved_roots
 
+    def _set_task_pool_status(self, task_id: str, status: TaskStatus) -> None:
+        task = self.store.get_task(task_id)
+        updated = task.model_copy(update={"status": status})
+        self.store.save_task(updated)
+
+    def _run_lock(self, run_id: str) -> asyncio.Lock:
+        lock = self._run_locks.get(run_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._run_locks[run_id] = lock
+        return lock
+
     def _new_run_id(self) -> str:
         timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
         suffix = uuid.uuid4().hex[:8]
         return f"{timestamp}-{suffix}"
+
+    def _new_instance_id(self, task_id: str) -> str:
+        return f"{task_id}-{uuid.uuid4().hex[:8]}"

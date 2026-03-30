@@ -129,7 +129,7 @@ class CodexCliAssistantBackend:
                 "CODEX_ORCH_ASSISTANT_PROFILE_DIR": str(request.profile.profile_dir),
                 "CODEX_ORCH_ASSISTANT_WORKSPACE_DIR": str(request.profile.workspace_dir),
                 "CODEX_ORCH_RUN_DIR": str(self._run_dir(request)),
-                "CODEX_ORCH_RUN_NODES_DIR": str(self._run_nodes_dir(request)),
+                "CODEX_ORCH_RUN_INSTANCES_DIR": str(self._run_instances_dir(request)),
             }
         )
         return env
@@ -178,13 +178,13 @@ class CodexCliAssistantBackend:
         for artifact in request.artifacts:
             artifact_sections.append(self._format_artifact_section(artifact))
 
-        requester_node_dir = self._run_nodes_dir(request) / request.task.id
+        requester_instance_dir = self._run_instances_dir(request) / request.instance_id
         accessible_paths = [
             f"- assistant_profile_workspace: `{request.profile.workspace_dir}`",
             f"- program_dir: `{request.program_dir}`",
             f"- run_dir: `{self._run_dir(request)}`",
-            f"- run_nodes_dir: `{self._run_nodes_dir(request)}`",
-            f"- requester_node_dir: `{requester_node_dir}`",
+            f"- run_instances_dir: `{self._run_instances_dir(request)}`",
+            f"- requester_instance_dir: `{requester_instance_dir}`",
             (
                 "- Use the assistant profile workspace for persistent notes and preferences. "
                 "Treat the program and run directories as observational context and do not modify them while answering this request."
@@ -248,7 +248,7 @@ class CodexCliAssistantBackend:
     ) -> tuple[Path, ...]:
         candidates = [
             request.program_dir,
-            self._run_nodes_dir(request),
+            self._run_instances_dir(request),
         ]
         deduped: list[Path] = []
         seen: set[str] = {str(request.profile.workspace_dir)}
@@ -263,8 +263,8 @@ class CodexCliAssistantBackend:
     def _run_dir(self, request: AssistantBackendRequest) -> Path:
         return request.program_dir / ".runs" / request.assistant_request.run_id
 
-    def _run_nodes_dir(self, request: AssistantBackendRequest) -> Path:
-        return self._run_dir(request) / "nodes"
+    def _run_instances_dir(self, request: AssistantBackendRequest) -> Path:
+        return self._run_dir(request) / "instances"
 
     def _extract_final_agent_message(self, stdout: str) -> str:
         final_message = ""

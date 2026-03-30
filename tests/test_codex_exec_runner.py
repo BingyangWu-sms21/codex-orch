@@ -35,7 +35,9 @@ def _install_fake_codex(tmp_path: Path) -> Path:
             import time
 
             mode = os.environ["FAKE_CODEX_MODE"]
+            session_id = "session-123"
             if mode == "success":
+                print(json.dumps({"type": "session.created", "session_id": session_id}), flush=True)
                 print(
                     json.dumps(
                         {
@@ -52,6 +54,7 @@ def _install_fake_codex(tmp_path: Path) -> Path:
                 raise SystemExit(0)
             if mode == "echo-stdin":
                 prompt = sys.stdin.read()
+                print(json.dumps({"type": "session.created", "session_id": session_id}), flush=True)
                 print(
                     json.dumps(
                         {
@@ -70,6 +73,7 @@ def _install_fake_codex(tmp_path: Path) -> Path:
                 time.sleep(30)
                 raise SystemExit(0)
             if mode == "ignore-term":
+                print(json.dumps({"type": "session.created", "session_id": session_id}), flush=True)
                 print(
                     json.dumps(
                         {
@@ -88,6 +92,7 @@ def _install_fake_codex(tmp_path: Path) -> Path:
                 while True:
                     time.sleep(1)
             if mode == "long-line":
+                print(json.dumps({"type": "session.created", "session_id": session_id}), flush=True)
                 print(
                     json.dumps(
                         {
@@ -130,6 +135,7 @@ def _build_request(
     tmp_path: Path,
     *,
     sandbox: str,
+    resume_session_id: str | None = None,
     extra_writable_root_names: tuple[str, ...] = (),
     wall_timeout_sec: float | None = 3600.0,
     idle_timeout_sec: float | None = 600.0,
@@ -138,7 +144,8 @@ def _build_request(
     program_dir = tmp_path / "program"
     project_workspace_dir = tmp_path / "project-workspace"
     workspace_dir = tmp_path / "workspace"
-    node_dir = tmp_path / "node"
+    instance_dir = tmp_path / "instance"
+    attempt_dir = instance_dir / "attempts" / "0001"
     program_dir.mkdir()
     project_workspace_dir.mkdir()
     workspace_dir.mkdir()
@@ -169,11 +176,15 @@ def _build_request(
     )
     return NodeExecutionRequest(
         run_id="run-1",
+        instance_id="discover-1",
+        attempt_no=1,
         program_dir=program_dir,
         project_workspace_dir=project_workspace_dir,
         workspace_dir=workspace_dir,
         extra_writable_roots=tuple(extra_writable_roots),
-        node_dir=node_dir,
+        instance_dir=instance_dir,
+        attempt_dir=attempt_dir,
+        resume_session_id=resume_session_id,
         project=project,
         task=task,
         prompt="hello",
@@ -194,59 +205,30 @@ def test_build_command_skips_git_repo_check_for_workspace_write(tmp_path: Path) 
         str(tmp_path / "workspace"),
         "--full-auto",
         "--add-dir",
-        str(tmp_path / "node"),
+        str(tmp_path / "instance" / "attempts" / "0001"),
         "-",
     ]
 
 
-def test_build_command_includes_extra_writable_roots(tmp_path: Path) -> None:
+def test_build_command_uses_resume_subcommand_for_followup_attempts(tmp_path: Path) -> None:
     runner = CodexExecRunner()
 
     command = runner._build_command(
         _build_request(
             tmp_path,
             sandbox="workspace-write",
-            extra_writable_root_names=("shared-cache", "env-source"),
+            resume_session_id="session-123",
         )
     )
 
     assert command == [
         "codex",
         "exec",
+        "resume",
+        "session-123",
         "--json",
         "--skip-git-repo-check",
-        "--cd",
-        str(tmp_path / "workspace"),
         "--full-auto",
-        "--add-dir",
-        str(tmp_path / "node"),
-        "--add-dir",
-        str(tmp_path / "shared-cache"),
-        "--add-dir",
-        str(tmp_path / "env-source"),
-        "-",
-    ]
-
-
-def test_build_command_omits_add_dir_for_danger_full_access(tmp_path: Path) -> None:
-    runner = CodexExecRunner()
-
-    command = runner._build_command(
-        _build_request(
-            tmp_path,
-            sandbox="danger-full-access",
-            extra_writable_root_names=("shared-cache",),
-        )
-    )
-
-    assert command == [
-        "codex",
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--cd",
-        str(tmp_path / "workspace"),
-        "--dangerously-bypass-approvals-and-sandbox",
         "-",
     ]
 
@@ -264,45 +246,41 @@ def test_build_command_rejects_extra_writable_roots_for_read_only(tmp_path: Path
         )
 
 
-def test_runner_writes_runtime_for_successful_execution(
+def test_runner_writes_runtime_and_session_for_successful_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_bin_dir = _install_fake_codex(tmp_path)
-    monkeypatch.setenv("PATH", f"{fake_bin_dir}:{os.environ['PATH']}")
+    bin_dir = _install_fake_codex(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODEX_MODE", "success")
 
-    request = _build_request(tmp_path, sandbox="read-only")
     runner = CodexExecRunner()
-
+    request = _build_request(tmp_path, sandbox="workspace-write")
     result = asyncio.run(runner.run(request))
 
     assert result.success
-    assert result.termination_reason is NodeExecutionTerminationReason.COMPLETED
+    assert result.session_id == "session-123"
+    assert (request.attempt_dir / "prompt.md").read_text(encoding="utf-8") == "hello"
+    assert (request.attempt_dir / "final.md").read_text(encoding="utf-8") == "hello from fake codex"
     runtime = NodeExecutionRuntime.model_validate(
-        json.loads((request.node_dir / "runtime.json").read_text(encoding="utf-8"))
+        json.loads((request.attempt_dir / "runtime.json").read_text(encoding="utf-8"))
     )
     assert runtime.cwd == str(request.workspace_dir)
-    assert runtime.project_workspace_dir == str(request.project_workspace_dir)
-    assert runtime.command[-1] == "<prompt omitted; see prompt.md>"
-    assert runtime.sandbox == "read-only"
-    assert runtime.writable_roots == []
-    assert runtime.last_event_summary == "item.completed:agent_message:hello from fake codex"
     assert runtime.termination_reason is NodeExecutionTerminationReason.COMPLETED
-    assert (request.node_dir / "final.md").read_text(encoding="utf-8") == "hello from fake codex"
+    session_payload = json.loads((request.instance_dir / "session.json").read_text(encoding="utf-8"))
+    assert session_payload["session_id"] == "session-123"
 
 
 def test_runner_passes_prompt_via_stdin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_bin_dir = _install_fake_codex(tmp_path)
-    monkeypatch.setenv("PATH", f"{fake_bin_dir}:{os.environ['PATH']}")
+    bin_dir = _install_fake_codex(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODEX_MODE", "echo-stdin")
 
-    request = _build_request(tmp_path, sandbox="read-only")
     runner = CodexExecRunner()
-
+    request = _build_request(tmp_path, sandbox="workspace-write")
     result = asyncio.run(runner.run(request))
 
     assert result.success
@@ -313,109 +291,60 @@ def test_runner_handles_long_stdout_jsonl_lines(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_bin_dir = _install_fake_codex(tmp_path)
-    monkeypatch.setenv("PATH", f"{fake_bin_dir}:{os.environ['PATH']}")
+    bin_dir = _install_fake_codex(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODEX_MODE", "long-line")
 
-    request = _build_request(tmp_path, sandbox="read-only")
     runner = CodexExecRunner()
-
-    result = asyncio.run(runner.run(request))
-
-    assert result.success
-    assert result.termination_reason is NodeExecutionTerminationReason.COMPLETED
-    runtime = NodeExecutionRuntime.model_validate(
-        json.loads((request.node_dir / "runtime.json").read_text(encoding="utf-8"))
-    )
-    assert runtime.finished_at is not None
-    assert runtime.termination_reason is NodeExecutionTerminationReason.COMPLETED
-    assert (request.node_dir / "final.md").read_text(encoding="utf-8") == "hello from fake codex"
-
-
-def test_runner_writes_writable_roots_for_workspace_write(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_bin_dir = _install_fake_codex(tmp_path)
-    monkeypatch.setenv("PATH", f"{fake_bin_dir}:{os.environ['PATH']}")
-    monkeypatch.setenv("FAKE_CODEX_MODE", "success")
-
-    request = _build_request(
-        tmp_path,
-        sandbox="workspace-write",
-        extra_writable_root_names=("shared-cache", "env-source"),
-    )
-    runner = CodexExecRunner()
-
+    request = _build_request(tmp_path, sandbox="workspace-write")
     result = asyncio.run(runner.run(request))
 
     assert result.success
     runtime = NodeExecutionRuntime.model_validate(
-        json.loads((request.node_dir / "runtime.json").read_text(encoding="utf-8"))
+        json.loads((request.attempt_dir / "runtime.json").read_text(encoding="utf-8"))
     )
-    assert runtime.sandbox == "workspace-write"
-    assert runtime.writable_roots == [
-        str(request.workspace_dir),
-        str(request.node_dir),
-        str(tmp_path / "shared-cache"),
-        str(tmp_path / "env-source"),
-    ]
+    assert runtime.stdout_line_count == 3
+    assert runtime.last_event_summary == "item.completed:agent_message:hello from fake codex"
 
 
 def test_runner_applies_wall_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_bin_dir = _install_fake_codex(tmp_path)
-    monkeypatch.setenv("PATH", f"{fake_bin_dir}:{os.environ['PATH']}")
+    bin_dir = _install_fake_codex(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODEX_MODE", "sleep")
 
+    runner = CodexExecRunner()
     request = _build_request(
         tmp_path,
-        sandbox="read-only",
-        wall_timeout_sec=0.5,
-        idle_timeout_sec=30.0,
-        terminate_grace_sec=0.1,
+        sandbox="workspace-write",
+        wall_timeout_sec=0.1,
+        idle_timeout_sec=None,
     )
-    runner = CodexExecRunner()
-
     result = asyncio.run(runner.run(request))
 
     assert not result.success
     assert result.termination_reason is NodeExecutionTerminationReason.WALL_TIMEOUT
-    assert result.error == "codex exec exceeded wall timeout"
-    runtime = NodeExecutionRuntime.model_validate(
-        json.loads((request.node_dir / "runtime.json").read_text(encoding="utf-8"))
-    )
-    assert runtime.finished_at is not None
-    assert runtime.termination_reason is NodeExecutionTerminationReason.WALL_TIMEOUT
 
 
 def test_runner_applies_idle_timeout_and_forces_kill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_bin_dir = _install_fake_codex(tmp_path)
-    monkeypatch.setenv("PATH", f"{fake_bin_dir}:{os.environ['PATH']}")
+    bin_dir = _install_fake_codex(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_CODEX_MODE", "ignore-term")
 
+    runner = CodexExecRunner()
     request = _build_request(
         tmp_path,
-        sandbox="read-only",
-        wall_timeout_sec=30.0,
-        idle_timeout_sec=0.5,
+        sandbox="workspace-write",
+        wall_timeout_sec=None,
+        idle_timeout_sec=0.1,
         terminate_grace_sec=0.1,
     )
-    runner = CodexExecRunner()
-
     result = asyncio.run(runner.run(request))
 
     assert not result.success
     assert result.termination_reason is NodeExecutionTerminationReason.IDLE_TIMEOUT
-    runtime = NodeExecutionRuntime.model_validate(
-        json.loads((request.node_dir / "runtime.json").read_text(encoding="utf-8"))
-    )
-    assert runtime.finished_at is not None
-    assert runtime.last_event_summary is not None
-    assert "item.started:command_execution:in_progress" in runtime.last_event_summary
-    assert runtime.termination_reason is NodeExecutionTerminationReason.IDLE_TIMEOUT

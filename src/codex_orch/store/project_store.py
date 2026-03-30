@@ -9,34 +9,22 @@ from pathlib import Path
 import yaml
 
 from codex_orch.domain import (
-    ApprovalMode,
     AssistantProfileSpec,
-    AssistantControlAction,
-    AssistantRequest,
-    AssistantResponse,
-    ConfidenceLevel,
-    ControlActionKind,
-    ControlActionStatus,
-    ControlActor,
-    ControlTarget,
-    DecisionKind,
     DependencyEdge,
     DependencyKind,
-    HumanRequest,
-    HumanResponse,
-    ManualGate,
-    ManualGateReason,
-    ManualGateStatus,
+    InterruptAudience,
+    InterruptReply,
+    InterruptReplyKind,
+    InterruptRequest,
+    InterruptStatus,
     NodeExecutionRuntime,
     PresetSpec,
     ProjectSpec,
-    RunSnapshot,
-    RequestKind,
-    RequestPriority,
-    ResolutionKind,
+    RunEvent,
+    RunInstanceState,
+    RunRecord,
     TaskSpec,
 )
-from codex_orch.prompt_context import ensure_staged_assistant_artifact
 from codex_orch.store.layout import (
     GlobalPaths,
     ProgramPaths,
@@ -60,23 +48,12 @@ class ResolvedAssistantProfile:
 
 
 @dataclass(frozen=True)
-class AssistantRequestRecord:
+class InterruptRecord:
     run_id: str
+    instance_id: str
     task_id: str
-    node_dir: Path
-    request: AssistantRequest
-    response: AssistantResponse | None
-    control_action: AssistantControlAction | None
-
-
-@dataclass(frozen=True)
-class ManualGateRecord:
-    run_id: str
-    task_id: str
-    node_dir: Path
-    gate: ManualGate
-    human_request: HumanRequest | None
-    human_response: HumanResponse | None
+    interrupt: InterruptRequest
+    reply: InterruptReply | None
 
 
 def _read_yaml(path: Path) -> object:
@@ -95,6 +72,7 @@ def _read_json(path: Path) -> object:
 
 
 def _write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -263,37 +241,10 @@ class ProjectStore:
             spec=spec,
         )
 
-    def maybe_get_run_task(self, run_id: str, task_id: str) -> TaskSpec | None:
-        try:
-            snapshot = self.get_run(run_id)
-        except KeyError:
-            return None
-        node = snapshot.nodes.get(task_id)
-        if node is None:
-            return None
-        return node.task
-
-    def resolve_assistant_profile_id(self, run_id: str, task_id: str) -> str | None:
-        run_task = self.maybe_get_run_task(run_id, task_id)
-        if run_task is not None:
-            return run_task.assistant_profile
-        try:
-            task = self.get_task(task_id)
-        except KeyError:
-            return None
+    def resolve_assistant_profile_id_for_task(self, task: TaskSpec) -> str | None:
         if task.assistant_profile is not None:
             return task.assistant_profile
         return self.load_project().default_assistant_profile
-
-    def resolve_assistant_profile(
-        self,
-        run_id: str,
-        task_id: str,
-    ) -> ResolvedAssistantProfile | None:
-        profile_id = self.resolve_assistant_profile_id(run_id, task_id)
-        if profile_id is None:
-            return None
-        return self.load_assistant_profile(profile_id)
 
     def load_default_user_inputs(self) -> dict[str, str]:
         project = self.load_project()
@@ -303,523 +254,397 @@ class ProjectStore:
             inputs[key] = input_path.read_text(encoding="utf-8")
         return inputs
 
-    def save_run(self, snapshot: RunSnapshot) -> None:
-        run_dir = self.get_run_dir(snapshot.id)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_path = run_dir / "snapshot.json"
-        snapshot.updated_at = datetime.now(UTC).isoformat()
-        _write_json(snapshot_path, snapshot.model_dump(mode="json"))
+    def save_run(self, run: RunRecord) -> None:
+        run.updated_at = datetime.now(UTC).isoformat()
+        _write_json(
+            self.get_run_state_path(run.id),
+            {
+                **run.model_dump(mode="json", exclude={"instances"}),
+                "instance_ids": sorted(run.instances),
+            },
+        )
+        for instance_id, instance in run.instances.items():
+            _write_json(
+                self.get_instance_state_path(run.id, instance_id),
+                instance.model_dump(mode="json"),
+            )
 
-    def list_runs(self) -> list[RunSnapshot]:
-        runs: list[RunSnapshot] = []
-        for path in sorted(self.paths.runs_dir.glob("*/snapshot.json")):
-            payload = _read_json(path)
-            runs.append(RunSnapshot.model_validate(payload))
+    def list_runs(self) -> list[RunRecord]:
+        runs: list[RunRecord] = []
+        for path in sorted(self.paths.runs_dir.glob("*/state/run.json")):
+            runs.append(self.get_run(path.parents[1].name))
         return runs
 
-    def get_run(self, run_id: str) -> RunSnapshot:
-        path = self.get_run_dir(run_id) / "snapshot.json"
-        if not path.exists():
+    def get_run(self, run_id: str) -> RunRecord:
+        run_path = self.get_run_state_path(run_id)
+        if not run_path.exists():
             raise KeyError(f"run {run_id} does not exist")
-        payload = _read_json(path)
-        return RunSnapshot.model_validate(payload)
+        summary = _read_json(run_path)
+        instance_ids = summary.pop("instance_ids", [])
+        if not isinstance(instance_ids, list):
+            raise ValueError("run state instance_ids must be a list")
+        instances: dict[str, RunInstanceState] = {}
+        for instance_id in instance_ids:
+            payload = _read_json(self.get_instance_state_path(run_id, str(instance_id)))
+            instance = RunInstanceState.model_validate(payload)
+            instances[instance.instance_id] = instance
+        return RunRecord.model_validate({**summary, "instances": instances})
 
     def get_run_dir(self, run_id: str) -> Path:
-        return self.paths.runs_dir / run_id
+        run_dir = self.paths.runs_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
 
-    def get_node_dir(self, run_id: str, task_id: str) -> Path:
-        node_dir = self.get_run_dir(run_id) / "nodes" / task_id
-        node_dir.mkdir(parents=True, exist_ok=True)
-        return node_dir
+    def get_run_state_dir(self, run_id: str) -> Path:
+        path = self.get_run_dir(run_id) / "state"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
-    def get_runtime_path(self, run_id: str, task_id: str) -> Path:
-        return self.get_node_dir(run_id, task_id) / "runtime.json"
+    def get_run_state_path(self, run_id: str) -> Path:
+        return self.get_run_state_dir(run_id) / "run.json"
 
-    def save_runtime(
+    def get_instances_state_dir(self, run_id: str) -> Path:
+        path = self.get_run_state_dir(run_id) / "instances"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_instance_state_path(self, run_id: str, instance_id: str) -> Path:
+        return self.get_instances_state_dir(run_id) / f"{instance_id}.json"
+
+    def get_events_dir(self, run_id: str) -> Path:
+        path = self.get_run_dir(run_id) / "events"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def append_event(
         self,
         run_id: str,
-        task_id: str,
-        runtime: NodeExecutionRuntime,
-    ) -> None:
-        _write_json(
-            self.get_runtime_path(run_id, task_id),
-            runtime.model_dump(mode="json"),
+        event_type: str,
+        *,
+        instance_id: str | None = None,
+        payload: dict[str, object] | None = None,
+    ) -> RunEvent:
+        events_dir = self.get_events_dir(run_id)
+        sequence = len(list(events_dir.glob("*.json"))) + 1
+        event = RunEvent(
+            event_id=f"{sequence:06d}-{event_type}",
+            run_id=run_id,
+            event_type=event_type,
+            instance_id=instance_id,
+            payload={} if payload is None else payload,
         )
+        _write_json(
+            events_dir / f"{sequence:06d}-{event_type}.json",
+            event.model_dump(mode="json"),
+        )
+        return event
 
-    def maybe_get_runtime(
-        self,
-        run_id: str,
-        task_id: str,
-    ) -> NodeExecutionRuntime | None:
-        path = self.get_runtime_path(run_id, task_id)
+    def list_events(self, run_id: str) -> list[RunEvent]:
+        events: list[RunEvent] = []
+        for path in sorted(self.get_events_dir(run_id).glob("*.json")):
+            events.append(RunEvent.model_validate(_read_json(path)))
+        return events
+
+    def get_instances_dir(self, run_id: str) -> Path:
+        path = self.get_run_dir(run_id) / "instances"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_instance_dir(self, run_id: str, instance_id: str) -> Path:
+        path = self.get_instances_dir(run_id) / instance_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_attempts_dir(self, run_id: str, instance_id: str) -> Path:
+        path = self.get_instance_dir(run_id, instance_id) / "attempts"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_attempt_dir(self, run_id: str, instance_id: str, attempt_no: int) -> Path:
+        path = self.get_attempts_dir(run_id, instance_id) / f"{attempt_no:04d}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_session_path(self, run_id: str, instance_id: str) -> Path:
+        return self.get_instance_dir(run_id, instance_id) / "session.json"
+
+    def maybe_get_session_id(self, run_id: str, instance_id: str) -> str | None:
+        path = self.get_session_path(run_id, instance_id)
         if not path.exists():
             return None
         payload = _read_json(path)
-        return NodeExecutionRuntime.model_validate(payload)
+        if not isinstance(payload, dict):
+            return None
+        session_id = payload.get("session_id")
+        if isinstance(session_id, str) and session_id.strip():
+            return session_id
+        return None
 
-    def get_run_assistant_dir(self, run_id: str) -> Path:
-        assistant_dir = self.get_run_dir(run_id) / "assistant"
-        assistant_dir.mkdir(parents=True, exist_ok=True)
-        return assistant_dir
+    def get_attempt_runtime_path(
+        self,
+        run_id: str,
+        instance_id: str,
+        attempt_no: int,
+    ) -> Path:
+        return self.get_attempt_dir(run_id, instance_id, attempt_no) / "runtime.json"
 
-    def get_assistant_request_path(self, run_id: str, task_id: str) -> Path:
-        return self.get_node_dir(run_id, task_id) / "assistant_request.json"
+    def maybe_get_attempt_runtime(
+        self,
+        run_id: str,
+        instance_id: str,
+        attempt_no: int,
+    ) -> NodeExecutionRuntime | None:
+        path = self.get_attempt_runtime_path(run_id, instance_id, attempt_no)
+        if not path.exists():
+            return None
+        return NodeExecutionRuntime.model_validate(_read_json(path))
 
-    def get_assistant_response_path(self, run_id: str, task_id: str) -> Path:
-        return self.get_node_dir(run_id, task_id) / "assistant_response.json"
+    def get_instance_published_dir(self, run_id: str, instance_id: str) -> Path:
+        path = self.get_instance_dir(run_id, instance_id) / "published"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
-    def get_assistant_control_action_path(self, run_id: str, task_id: str) -> Path:
-        return self.get_node_dir(run_id, task_id) / "assistant_control_action.json"
+    def get_inbox_dir(self, run_id: str) -> Path:
+        path = self.get_run_dir(run_id) / "inbox"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
-    def get_guidance_proposal_path(self, run_id: str) -> Path:
-        return self.get_run_assistant_dir(run_id) / "guidance_update_proposal.md"
+    def get_interrupts_dir(self, run_id: str) -> Path:
+        path = self.get_inbox_dir(run_id) / "interrupts"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
-    def get_manual_gate_path(self, run_id: str, task_id: str) -> Path:
-        return self.get_node_dir(run_id, task_id) / "manual_gate.json"
+    def get_replies_dir(self, run_id: str) -> Path:
+        path = self.get_inbox_dir(run_id) / "replies"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
-    def get_human_request_path(self, run_id: str, task_id: str) -> Path:
-        return self.get_node_dir(run_id, task_id) / "human_request.json"
+    def get_interrupt_path(self, run_id: str, interrupt_id: str) -> Path:
+        return self.get_interrupts_dir(run_id) / f"{interrupt_id}.json"
 
-    def get_human_response_path(self, run_id: str, task_id: str) -> Path:
-        return self.get_node_dir(run_id, task_id) / "human_response.json"
+    def get_reply_path(self, run_id: str, interrupt_id: str) -> Path:
+        return self.get_replies_dir(run_id) / f"{interrupt_id}.json"
 
-    def create_assistant_request(
+    def create_interrupt(
         self,
         *,
         run_id: str,
-        task_id: str,
-        request_kind: RequestKind,
+        instance_id: str,
+        audience: InterruptAudience,
+        blocking: bool,
+        request_kind,
         question: str,
-        decision_kind: DecisionKind,
+        decision_kind,
         options: list[str],
         context_artifacts: list[str],
-        requested_control_actions: list[ControlActionKind],
-        priority: RequestPriority,
-    ) -> AssistantRequest:
-        existing = self.maybe_get_assistant_request(run_id, task_id)
-        if existing is not None:
-            return existing
-        self._validate_assistant_request_target(
+        reply_schema: str | None,
+        priority,
+        metadata: dict[str, object] | None = None,
+    ) -> InterruptRequest:
+        run = self.get_run(run_id)
+        if instance_id not in run.instances:
+            raise KeyError(f"instance {instance_id} does not exist in run {run_id}")
+        interrupt = InterruptRequest(
+            interrupt_id=self._new_event_id(prefix="int"),
             run_id=run_id,
-            task_id=task_id,
-            context_artifacts=context_artifacts,
-        )
-        request = AssistantRequest(
-            request_id=self._new_event_id(prefix="req"),
-            run_id=run_id,
-            requester_task_id=task_id,
+            instance_id=instance_id,
+            task_id=run.instances[instance_id].task_id,
+            audience=audience,
+            blocking=blocking,
             request_kind=request_kind,
             question=question,
             decision_kind=decision_kind,
             options=options,
             context_artifacts=context_artifacts,
-            requested_control_actions=requested_control_actions,
+            reply_schema=reply_schema,
             priority=priority,
+            metadata={} if metadata is None else metadata,
         )
-        node_dir = self.get_node_dir(run_id, task_id)
-        for relative_path in context_artifacts:
-            ensure_staged_assistant_artifact(
-                program_dir=self.paths.root,
-                node_dir=node_dir,
-                relative_path=relative_path,
-            )
-        self.save_assistant_request(run_id, task_id, request)
-        return request
+        self.save_interrupt(interrupt)
+        self.append_event(
+            run_id,
+            "interrupt_requested",
+            instance_id=instance_id,
+            payload={
+                "interrupt_id": interrupt.interrupt_id,
+                "audience": interrupt.audience.value,
+                "blocking": interrupt.blocking,
+            },
+        )
+        return interrupt
 
-    def save_assistant_request(
-        self,
-        run_id: str,
-        task_id: str,
-        request: AssistantRequest,
-    ) -> None:
+    def save_interrupt(self, interrupt: InterruptRequest) -> None:
         _write_json(
-            self.get_assistant_request_path(run_id, task_id),
-            request.model_dump(mode="json"),
+            self.get_interrupt_path(interrupt.run_id, interrupt.interrupt_id),
+            interrupt.model_dump(mode="json"),
         )
 
-    def maybe_get_assistant_request(
-        self, run_id: str, task_id: str
-    ) -> AssistantRequest | None:
-        path = self.get_assistant_request_path(run_id, task_id)
-        if not path.exists():
-            return None
-        payload = _read_json(path)
-        return AssistantRequest.model_validate(payload)
-
-    def maybe_get_assistant_response(
-        self, run_id: str, task_id: str
-    ) -> AssistantResponse | None:
-        path = self.get_assistant_response_path(run_id, task_id)
-        if not path.exists():
-            return None
-        payload = _read_json(path)
-        return AssistantResponse.model_validate(payload)
-
-    def maybe_get_assistant_control_action(
-        self, run_id: str, task_id: str
-    ) -> AssistantControlAction | None:
-        path = self.get_assistant_control_action_path(run_id, task_id)
-        if not path.exists():
-            return None
-        payload = _read_json(path)
-        return AssistantControlAction.model_validate(payload)
-
-    def maybe_get_manual_gate(self, run_id: str, task_id: str) -> ManualGate | None:
-        path = self.get_manual_gate_path(run_id, task_id)
-        if not path.exists():
-            return None
-        payload = _read_json(path)
-        return ManualGate.model_validate(payload)
-
-    def maybe_get_human_request(self, run_id: str, task_id: str) -> HumanRequest | None:
-        path = self.get_human_request_path(run_id, task_id)
-        if not path.exists():
-            return None
-        payload = _read_json(path)
-        return HumanRequest.model_validate(payload)
-
-    def maybe_get_human_response(self, run_id: str, task_id: str) -> HumanResponse | None:
-        path = self.get_human_response_path(run_id, task_id)
-        if not path.exists():
-            return None
-        payload = _read_json(path)
-        return HumanResponse.model_validate(payload)
-
-    def save_assistant_response_by_request_id(
+    def save_interrupt_reply(
         self,
-        request_id: str,
+        interrupt_id: str,
         *,
-        resolution_kind: ResolutionKind,
-        answer: str,
-        rationale: str,
-        confidence: ConfidenceLevel,
-        citations: list[str],
-        proposed_guidance_updates: list[str],
-        proposed_control_actions: list[ControlActionKind],
-    ) -> AssistantResponse:
-        record = self.find_assistant_request(request_id)
-        response = AssistantResponse(
-            request_id=request_id,
-            resolution_kind=resolution_kind,
-            answer=answer,
+        audience: InterruptAudience,
+        reply_kind: InterruptReplyKind,
+        text: str,
+        payload: dict[str, object] | None = None,
+        rationale: str | None = None,
+        confidence=None,
+        citations: list[str] | None = None,
+    ) -> InterruptReply:
+        record = self.find_interrupt(interrupt_id)
+        reply = InterruptReply(
+            interrupt_id=interrupt_id,
+            audience=audience,
+            reply_kind=reply_kind,
+            text=text,
+            payload={} if payload is None else payload,
             rationale=rationale,
             confidence=confidence,
-            citations=citations,
-            proposed_guidance_updates=proposed_guidance_updates,
-            proposed_control_actions=proposed_control_actions,
+            citations=[] if citations is None else citations,
         )
         _write_json(
-            self.get_assistant_response_path(record.run_id, record.task_id),
-            response.model_dump(mode="json"),
+            self.get_reply_path(record.run_id, interrupt_id),
+            reply.model_dump(mode="json"),
         )
-        if resolution_kind is ResolutionKind.HANDOFF_TO_HUMAN:
-            self.ensure_manual_gate_for_request(request_id)
-        return response
+        interrupt = record.interrupt.model_copy(
+            update={
+                "status": InterruptStatus.RESOLVED,
+                "resolved_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        self.save_interrupt(interrupt)
+        self.append_event(
+            record.run_id,
+            "interrupt_resolved",
+            instance_id=record.instance_id,
+            payload={
+                "interrupt_id": interrupt_id,
+                "reply_kind": reply.reply_kind.value,
+                "audience": audience.value,
+            },
+        )
+        return reply
 
-    def save_assistant_control_action_by_request_id(
-        self,
-        request_id: str,
-        *,
-        requested_by: ControlActor,
-        action_kind: ControlActionKind,
-        target_kind: str | None,
-        target_path: str | None,
-        payload: dict[str, object],
-        reason: str,
-        approval_mode: ApprovalMode,
-    ) -> AssistantControlAction:
-        record = self.find_assistant_request(request_id)
-        target = None
-        if target_kind is not None:
-            target = ControlTarget(kind=target_kind, path=target_path)
-        action = AssistantControlAction(
-            action_id=self._new_event_id(prefix="act"),
-            request_id=request_id,
-            requested_by=requested_by,
-            action_kind=action_kind,
-            target=target,
-            payload=payload,
-            reason=reason,
-            approval_mode=approval_mode,
+    def mark_interrupt_applied(self, run_id: str, interrupt_id: str) -> InterruptRequest:
+        interrupt = self.get_interrupt(run_id, interrupt_id)
+        updated = interrupt.model_copy(
+            update={
+                "status": InterruptStatus.APPLIED,
+                "applied_at": datetime.now(UTC).isoformat(),
+            }
         )
-        _write_json(
-            self.get_assistant_control_action_path(record.run_id, record.task_id),
-            action.model_dump(mode="json"),
-        )
-        return action
-
-    def update_assistant_control_action_status(
-        self,
-        request_id: str,
-        status: ControlActionStatus,
-    ) -> AssistantControlAction:
-        record = self.find_assistant_request(request_id)
-        action = record.control_action
-        if action is None:
-            raise KeyError(f"request {request_id} has no control action")
-        updates = {"status": status}
-        updated = action.model_copy(update=updates)
-        _write_json(
-            self.get_assistant_control_action_path(record.run_id, record.task_id),
-            updated.model_dump(mode="json"),
+        self.save_interrupt(updated)
+        self.append_event(
+            run_id,
+            "interrupt_applied",
+            instance_id=updated.instance_id,
+            payload={"interrupt_id": interrupt_id},
         )
         return updated
 
-    def ensure_manual_gate_for_request(self, request_id: str) -> ManualGate:
-        record = self.find_assistant_request(request_id)
-        response = record.response
-        if response is None:
-            raise KeyError(f"request {request_id} has no assistant response")
-        if response.resolution_kind is not ResolutionKind.HANDOFF_TO_HUMAN:
-            raise ValueError(
-                f"request {request_id} is not a handoff_to_human response"
-            )
-        gate = self.maybe_get_manual_gate(record.run_id, record.task_id)
-        if gate is None:
-            gate = ManualGate(
-                gate_id=self._new_event_id(prefix="gate"),
-                request_id=request_id,
-                run_id=record.run_id,
-                requester_task_id=record.task_id,
-                reason=ManualGateReason.HANDOFF_TO_HUMAN,
-            )
-            self._save_manual_gate(record.run_id, record.task_id, gate)
-        if self.maybe_get_human_request(record.run_id, record.task_id) is None:
-            human_request = HumanRequest(
-                gate_id=gate.gate_id,
-                request_id=request_id,
-                run_id=record.run_id,
-                requester_task_id=record.task_id,
-                question=record.request.question,
-                assistant_summary=response.answer,
-                assistant_rationale=response.rationale,
-                citations=response.citations,
-                context_artifacts=record.request.context_artifacts,
-            )
-            _write_json(
-                self.get_human_request_path(record.run_id, record.task_id),
-                human_request.model_dump(mode="json"),
-            )
-        return gate
+    def get_interrupt(self, run_id: str, interrupt_id: str) -> InterruptRequest:
+        path = self.get_interrupt_path(run_id, interrupt_id)
+        if not path.exists():
+            raise KeyError(f"interrupt {interrupt_id} does not exist in run {run_id}")
+        return InterruptRequest.model_validate(_read_json(path))
 
-    def save_human_response_by_request_id(
+    def maybe_get_interrupt_reply(
         self,
-        request_id: str,
-        *,
-        answer: str,
-    ) -> HumanResponse:
-        record = self.find_assistant_request(request_id)
-        gate = self.ensure_manual_gate_for_request(request_id)
-        response = HumanResponse(
-            gate_id=gate.gate_id,
-            request_id=request_id,
-            answer=answer,
-        )
-        _write_json(
-            self.get_human_response_path(record.run_id, record.task_id),
-            response.model_dump(mode="json"),
-        )
-        if gate.status in {
-            ManualGateStatus.WAITING_FOR_HUMAN,
-            ManualGateStatus.ANSWERED,
-        }:
-            gate = gate.model_copy(
-                update={
-                    "status": ManualGateStatus.ANSWERED,
-                    "updated_at": datetime.now(UTC).isoformat(),
-                }
-            )
-            self._save_manual_gate(record.run_id, record.task_id, gate)
-        return response
-
-    def update_manual_gate_status_by_request_id(
-        self,
-        request_id: str,
-        status: ManualGateStatus,
-    ) -> ManualGate:
-        record = self.find_assistant_request(request_id)
-        gate = self.maybe_get_manual_gate(record.run_id, record.task_id)
-        if gate is None:
-            raise KeyError(f"request {request_id} has no manual gate")
-        if status in {
-            ManualGateStatus.APPROVED,
-            ManualGateStatus.REJECTED,
-        } and self.maybe_get_human_response(record.run_id, record.task_id) is None:
-            raise ValueError("manual gate requires human_response.json before approval")
-        updates: dict[str, ManualGateStatus | str] = {
-            "status": status,
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-        if status in {
-            ManualGateStatus.APPROVED,
-            ManualGateStatus.REJECTED,
-            ManualGateStatus.APPLIED,
-            ManualGateStatus.FAILED,
-        }:
-            updates["resolved_at"] = datetime.now(UTC).isoformat()
-        updated = gate.model_copy(update=updates)
-        self._save_manual_gate(record.run_id, record.task_id, updated)
-        return updated
-
-    def list_manual_gates(
-        self,
-        *,
-        run_id: str | None = None,
-        unresolved_only: bool = False,
-    ) -> list[ManualGateRecord]:
-        records: list[ManualGateRecord] = []
-        run_dirs = (
-            [self.get_run_dir(run_id)]
-            if run_id is not None
-            else list(sorted(self.paths.runs_dir.glob("*")))
-        )
-        for run_dir in run_dirs:
-            if not run_dir.exists():
-                continue
-            resolved_run_id = run_dir.name
-            nodes_root = run_dir / "nodes"
-            if not nodes_root.exists():
-                continue
-            for node_dir in sorted(nodes_root.iterdir()):
-                gate = self.maybe_get_manual_gate(resolved_run_id, node_dir.name)
-                if gate is None:
-                    continue
-                if unresolved_only and gate.status not in {
-                    ManualGateStatus.WAITING_FOR_HUMAN,
-                    ManualGateStatus.ANSWERED,
-                }:
-                    continue
-                records.append(
-                    ManualGateRecord(
-                        run_id=resolved_run_id,
-                        task_id=node_dir.name,
-                        node_dir=node_dir,
-                        gate=gate,
-                        human_request=self.maybe_get_human_request(
-                            resolved_run_id,
-                            node_dir.name,
-                        ),
-                        human_response=self.maybe_get_human_response(
-                            resolved_run_id,
-                            node_dir.name,
-                        ),
-                    )
-                )
-        return records
-
-    def find_manual_gate_by_request_id(self, request_id: str) -> ManualGateRecord:
-        record = self.find_assistant_request(request_id)
-        gate = self.maybe_get_manual_gate(record.run_id, record.task_id)
-        if gate is None:
-            raise KeyError(f"request {request_id} has no manual gate")
-        return ManualGateRecord(
-            run_id=record.run_id,
-            task_id=record.task_id,
-            node_dir=record.node_dir,
-            gate=gate,
-            human_request=self.maybe_get_human_request(record.run_id, record.task_id),
-            human_response=self.maybe_get_human_response(record.run_id, record.task_id),
-        )
-
-    def find_manual_gate_by_gate_id(self, gate_id: str) -> ManualGateRecord:
-        for record in self.list_manual_gates():
-            if record.gate.gate_id == gate_id:
-                return record
-        raise KeyError(f"manual gate {gate_id} does not exist")
-
-    def list_assistant_requests(
-        self,
-        *,
-        run_id: str | None = None,
-        unresolved_only: bool = False,
-    ) -> list[AssistantRequestRecord]:
-        records: list[AssistantRequestRecord] = []
-        run_dirs = [self.get_run_dir(run_id)] if run_id is not None else list(
-            sorted(self.paths.runs_dir.glob("*"))
-        )
-        for run_dir in run_dirs:
-            if not run_dir.exists():
-                continue
-            resolved_run_id = run_dir.name
-            nodes_root = run_dir / "nodes"
-            if not nodes_root.exists():
-                continue
-            for node_dir in sorted(nodes_root.iterdir()):
-                request_path = node_dir / "assistant_request.json"
-                if not request_path.exists():
-                    continue
-                request = AssistantRequest.model_validate(_read_json(request_path))
-                response = self.maybe_get_assistant_response(resolved_run_id, node_dir.name)
-                action = self.maybe_get_assistant_control_action(
-                    resolved_run_id, node_dir.name
-                )
-                if unresolved_only and response is not None:
-                    continue
-                records.append(
-                    AssistantRequestRecord(
-                        run_id=resolved_run_id,
-                        task_id=node_dir.name,
-                        node_dir=node_dir,
-                        request=request,
-                        response=response,
-                        control_action=action,
-                    )
-                )
-        return records
-
-    def find_assistant_request(self, request_id: str) -> AssistantRequestRecord:
-        for record in self.list_assistant_requests():
-            if record.request.request_id == request_id:
-                return record
-        raise KeyError(f"assistant request {request_id} does not exist")
-
-    def assistant_request_pending(self, run_id: str, task_id: str) -> bool:
-        request = self.maybe_get_assistant_request(run_id, task_id)
-        if request is None:
-            return False
-        response = self.maybe_get_assistant_response(run_id, task_id)
-        return response is None
-
-    def manual_gate_requires_human(self, run_id: str, task_id: str) -> bool:
-        gate = self.maybe_get_manual_gate(run_id, task_id)
-        if gate is None:
-            return False
-        return gate.status in {
-            ManualGateStatus.WAITING_FOR_HUMAN,
-            ManualGateStatus.ANSWERED,
-        }
-
-    def _validate_assistant_request_target(
-        self,
-        *,
         run_id: str,
-        task_id: str,
-        context_artifacts: list[str],
-    ) -> None:
-        profile_id = self.resolve_assistant_profile_id(run_id, task_id)
-        if profile_id is None:
-            raise ValueError(
-                f"task {task_id} has no effective assistant profile"
-            )
-        self.load_assistant_profile(profile_id)
-        for relative_path in context_artifacts:
-            absolute_path = self.paths.root / relative_path
-            if absolute_path.exists():
+        interrupt_id: str,
+    ) -> InterruptReply | None:
+        path = self.get_reply_path(run_id, interrupt_id)
+        if not path.exists():
+            return None
+        return InterruptReply.model_validate(_read_json(path))
+
+    def list_interrupts(
+        self,
+        *,
+        run_id: str | None = None,
+        audience: InterruptAudience | None = None,
+        unresolved_only: bool = False,
+    ) -> list[InterruptRecord]:
+        run_ids: list[str]
+        if run_id is not None:
+            run_ids = [run_id]
+        else:
+            run_ids = [path.name for path in sorted(self.paths.runs_dir.iterdir()) if path.is_dir()]
+        records: list[InterruptRecord] = []
+        for current_run_id in run_ids:
+            interrupts_dir = self.get_interrupts_dir(current_run_id)
+            for path in sorted(interrupts_dir.glob("*.json")):
+                interrupt = InterruptRequest.model_validate(_read_json(path))
+                if audience is not None and interrupt.audience is not audience:
+                    continue
+                if unresolved_only and interrupt.status is not InterruptStatus.OPEN:
+                    continue
+                reply = self.maybe_get_interrupt_reply(current_run_id, interrupt.interrupt_id)
+                records.append(
+                    InterruptRecord(
+                        run_id=current_run_id,
+                        instance_id=interrupt.instance_id,
+                        task_id=interrupt.task_id,
+                        interrupt=interrupt,
+                        reply=reply,
+                    )
+                )
+        return records
+
+    def find_interrupt(self, interrupt_id: str) -> InterruptRecord:
+        for record in self.list_interrupts():
+            if record.interrupt.interrupt_id == interrupt_id:
+                return record
+        raise KeyError(f"interrupt {interrupt_id} does not exist")
+
+    def list_instance_interrupts(
+        self,
+        run_id: str,
+        instance_id: str,
+        *,
+        blocking_only: bool = False,
+        unresolved_only: bool = False,
+    ) -> list[InterruptRecord]:
+        records: list[InterruptRecord] = []
+        for record in self.list_interrupts(run_id=run_id, unresolved_only=unresolved_only):
+            if record.instance_id != instance_id:
                 continue
-            raise ValueError(
-                f"context artifact {relative_path} does not exist under program dir"
-            )
+            if blocking_only and not record.interrupt.blocking:
+                continue
+            records.append(record)
+        return records
+
+    def maybe_get_run_task(self, run_id: str, task_id: str) -> TaskSpec | None:
+        try:
+            run = self.get_run(run_id)
+        except KeyError:
+            return None
+        for instance in run.instances.values():
+            if instance.task_id == task_id:
+                return instance.task
+        return None
+
+    def get_instance_for_task(self, run_id: str, task_id: str) -> RunInstanceState:
+        run = self.get_run(run_id)
+        for instance in run.instances.values():
+            if instance.task_id == task_id:
+                return instance
+        raise KeyError(f"task {task_id} does not exist in run {run_id}")
+
+    def resolve_assistant_profile(self, run_id: str, task_id: str) -> ResolvedAssistantProfile | None:
+        task = self.maybe_get_run_task(run_id, task_id)
+        if task is None:
+            try:
+                task = self.get_task(task_id)
+            except KeyError:
+                return None
+        profile_id = self.resolve_assistant_profile_id_for_task(task)
+        if profile_id is None:
+            return None
+        return self.load_assistant_profile(profile_id)
 
     def _task_path(self, task_id: str) -> Path:
         return self.paths.tasks_dir / f"{task_id}.yaml"
 
-    def _save_manual_gate(self, run_id: str, task_id: str, gate: ManualGate) -> None:
-        _write_json(
-            self.get_manual_gate_path(run_id, task_id),
-            gate.model_dump(mode="json"),
-        )
-
     def _new_event_id(self, *, prefix: str) -> str:
-        timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-        suffix = uuid.uuid4().hex[:8]
-        return f"{prefix}_{timestamp}_{suffix}"
+        return f"{prefix}-{uuid.uuid4().hex[:12]}"

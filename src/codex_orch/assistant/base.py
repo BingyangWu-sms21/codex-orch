@@ -22,6 +22,7 @@ class AssistantBackendRequest:
     profile: ResolvedAssistantProfile
     project: ProjectSpec
     task: TaskSpec
+    instance_id: str
     assistant_request: AssistantRequest
     artifacts: tuple[AssistantArtifactContext, ...]
 

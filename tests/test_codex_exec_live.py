@@ -44,11 +44,16 @@ def test_codex_exec_live_round_trip(tmp_path: Path) -> None:
     result = asyncio.run(
         runner.run(
             NodeExecutionRequest(
+                run_id="live-run",
+                instance_id="hello-1",
+                attempt_no=1,
                 program_dir=program_dir,
                 project_workspace_dir=workspace,
                 workspace_dir=workspace,
                 extra_writable_roots=tuple(),
-                node_dir=store.get_node_dir("live-run", "hello"),
+                instance_dir=store.get_instance_dir("live-run", "hello-1"),
+                attempt_dir=store.get_attempt_dir("live-run", "hello-1", 1),
+                resume_session_id=None,
                 project=store.load_project(),
                 task=task,
                 prompt="Respond with the single word hello.",
