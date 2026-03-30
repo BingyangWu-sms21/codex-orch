@@ -16,7 +16,6 @@
       <label>Id <input name="id" value="{{ task.id }}" required /></label>
       <label>Title <input name="title" value="{{ task.title }}" required /></label>
       <label>Agent <input name="agent" value="{{ task.agent }}" required /></label>
-      <label>Assistant profile <input name="assistant_profile" value="{{ task.assistant_profile or '' }}" /></label>
       <label>Status
         <select name="status">
           {% for status in task_statuses %}
@@ -27,6 +26,12 @@
       <label>Description <textarea name="description" rows="3">{{ task.description }}</textarea></label>
       <label>Labels (comma separated) <input name="labels" value="{{ task.labels | join(', ') }}" /></label>
       <label>Publish files <textarea name="publish" rows="3">{{ task.publish | join('\n') }}</textarea></label>
+      <label>Assistant hints (YAML object)
+        <textarea name="assistant_hints" rows="8">{{ assistant_hints_text }}</textarea>
+      </label>
+      <label>Interaction policy (YAML object)
+        <textarea name="interaction_policy" rows="8">{{ interaction_policy_text }}</textarea>
+      </label>
       <label>Model <input name="model" value="{{ task.model or '' }}" /></label>
       <label>Sandbox <input name="sandbox" value="{{ task.sandbox or '' }}" /></label>
       <label>Workspace override <input name="workspace" value="{{ task.workspace or '' }}" /></label>
@@ -37,6 +42,19 @@
       </label>
       <button type="submit">Save</button>
     </form>
+  </section>
+
+  <section class="card">
+    <h2>Assistant roles</h2>
+    {% if assistant_roles %}
+    <ul>
+      {% for role in assistant_roles %}
+      <li><code>{{ role.spec.id }}</code>: {{ role.spec.description or role.spec.title or role.spec.id }}</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p>No assistant roles are registered under <code>assistant_roles/</code>.</p>
+    {% endif %}
   </section>
 
   <section class="card">

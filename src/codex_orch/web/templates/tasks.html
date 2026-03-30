@@ -8,7 +8,6 @@
       <label>Id <input name="id" required /></label>
       <label>Title <input name="title" required /></label>
       <label>Agent <input name="agent" value="{{ project.default_agent if project else 'default' }}" required /></label>
-      <label>Assistant profile <input name="assistant_profile" value="{{ project.default_assistant_profile if project else '' }}" /></label>
       <label>Status
         <select name="status">
           {% for status in task_statuses %}
@@ -19,6 +18,12 @@
       <label>Description <textarea name="description" rows="3"></textarea></label>
       <label>Labels (comma separated) <input name="labels" /></label>
       <label>Publish files (one per line or comma separated) <textarea name="publish" rows="3">final.md</textarea></label>
+      <label>Assistant hints (YAML object)
+        <textarea name="assistant_hints" rows="6">{}</textarea>
+      </label>
+      <label>Interaction policy (YAML object)
+        <textarea name="interaction_policy" rows="6">{}</textarea>
+      </label>
       <label>Model <input name="model" /></label>
       <label>Sandbox <input name="sandbox" value="{{ project.default_sandbox if project else 'workspace-write' }}" /></label>
       <label>Workspace override <input name="workspace" /></label>
@@ -29,6 +34,19 @@
       </label>
       <button type="submit">Create task</button>
     </form>
+  </section>
+
+  <section class="card">
+    <h2>Assistant roles</h2>
+    {% if assistant_roles %}
+    <ul>
+      {% for role in assistant_roles %}
+      <li><code>{{ role.spec.id }}</code>: {{ role.spec.description or role.spec.title or role.spec.id }}</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p>No assistant roles are registered under <code>assistant_roles/</code>.</p>
+    {% endif %}
   </section>
 
   <section class="card">

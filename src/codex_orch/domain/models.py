@@ -7,6 +7,8 @@ from pathlib import PurePosixPath
 
 from pydantic import BaseModel, Field, model_validator
 
+from codex_orch.domain.assistant import DecisionKind
+
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -90,7 +92,6 @@ class ProjectSpec(BaseModel):
     workspace: str
     description: str = ""
     default_agent: str = "default"
-    default_assistant_profile: str | None = None
     default_model: str | None = None
     default_sandbox: str = "workspace-write"
     max_concurrency: int = 2
@@ -105,15 +106,6 @@ class ProjectSpec(BaseModel):
             raise ValueError("max_concurrency must be >= 1")
         if not self.workspace.strip():
             raise ValueError("workspace must not be empty")
-        if self.default_assistant_profile is not None:
-            object.__setattr__(
-                self,
-                "default_assistant_profile",
-                _validate_path_reference(
-                    self.default_assistant_profile,
-                    field_name="default_assistant_profile",
-                ),
-            )
         if self.node_wall_timeout_sec is not None and self.node_wall_timeout_sec <= 0:
             raise ValueError("node_wall_timeout_sec must be > 0")
         if self.node_idle_timeout_sec is not None and self.node_idle_timeout_sec <= 0:
@@ -191,17 +183,63 @@ class ComposeStepSpec(BaseModel):
         return self
 
 
+class TaskAssistantHints(BaseModel):
+    preferred_roles: list[str] = Field(default_factory=list)
+    decision_kind_overrides: dict[str, str] = Field(default_factory=dict)
+    ask_when: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_hints(self) -> TaskAssistantHints:
+        object.__setattr__(
+            self,
+            "preferred_roles",
+            [
+                _validate_path_reference(role_id, field_name="preferred_roles")
+                for role_id in self.preferred_roles
+            ],
+        )
+        normalized_overrides: dict[str, str] = {}
+        for raw_kind, role_id in self.decision_kind_overrides.items():
+            decision_kind = DecisionKind(raw_kind)
+            normalized_overrides[decision_kind.value] = _validate_path_reference(
+                role_id,
+                field_name="decision_kind_overrides",
+            )
+        object.__setattr__(self, "decision_kind_overrides", normalized_overrides)
+        return self
+
+
+class TaskInteractionPolicy(BaseModel):
+    allowed_assistant_roles: list[str] | None = None
+    allow_human: bool = True
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> TaskInteractionPolicy:
+        if self.allowed_assistant_roles is None:
+            return self
+        object.__setattr__(
+            self,
+            "allowed_assistant_roles",
+            [
+                _validate_path_reference(role_id, field_name="allowed_assistant_roles")
+                for role_id in self.allowed_assistant_roles
+            ],
+        )
+        return self
+
+
 class TaskSpec(BaseModel):
     id: str
     title: str
     agent: str
-    assistant_profile: str | None = None
     status: TaskStatus = TaskStatus.DRAFT
     description: str = ""
     labels: list[str] = Field(default_factory=list)
     depends_on: list[DependencyEdge] = Field(default_factory=list)
     compose: list[ComposeStepSpec] = Field(default_factory=list)
     publish: list[str] = Field(default_factory=lambda: ["final.md"])
+    assistant_hints: TaskAssistantHints = Field(default_factory=TaskAssistantHints)
+    interaction_policy: TaskInteractionPolicy = Field(default_factory=TaskInteractionPolicy)
     model: str | None = None
     sandbox: str | None = None
     workspace: str | None = None
@@ -212,15 +250,6 @@ class TaskSpec(BaseModel):
     def validate_task(self) -> TaskSpec:
         validated_publish = [_validate_relative_file_path(path) for path in self.publish]
         object.__setattr__(self, "publish", validated_publish)
-        if self.assistant_profile is not None:
-            object.__setattr__(
-                self,
-                "assistant_profile",
-                _validate_path_reference(
-                    self.assistant_profile,
-                    field_name="assistant_profile",
-                ),
-            )
         if self.workspace is not None:
             object.__setattr__(
                 self,

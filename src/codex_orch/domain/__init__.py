@@ -1,7 +1,8 @@
 from codex_orch.domain.assistant import (
     ApprovalMode,
     AssistantBackendKind,
-    AssistantProfileSpec,
+    AssistantRolePolicy,
+    AssistantRoleSpec,
     AssistantControlAction,
     AssistantRequest,
     AssistantResponse,
@@ -38,6 +39,8 @@ from codex_orch.domain.models import (
     RunNodeWaitReason,
     RunSnapshot,
     RunStatus,
+    TaskAssistantHints,
+    TaskInteractionPolicy,
     TaskSpec,
     TaskStatus,
 )
@@ -57,7 +60,8 @@ from codex_orch.domain.runtime import (
 __all__ = [
     "ApprovalMode",
     "AssistantBackendKind",
-    "AssistantProfileSpec",
+    "AssistantRolePolicy",
+    "AssistantRoleSpec",
     "AssistantControlAction",
     "AssistantRequest",
     "AssistantResponse",
@@ -100,6 +104,8 @@ __all__ = [
     "RunRecord",
     "RunSnapshot",
     "RunStatus",
+    "TaskAssistantHints",
+    "TaskInteractionPolicy",
     "TaskSpec",
     "TaskStatus",
 ]

@@ -102,6 +102,10 @@ class InterruptRequest(BaseModel):
     context_artifacts: list[str] = Field(default_factory=list)
     reply_schema: str | None = None
     priority: RequestPriority = RequestPriority.NORMAL
+    requested_target_role_id: str | None = None
+    recommended_target_role_id: str | None = None
+    resolved_target_role_id: str | None = None
+    target_resolution_reason: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
     status: InterruptStatus = InterruptStatus.OPEN
     created_at: str = Field(default_factory=_utc_now_iso)
@@ -130,6 +134,45 @@ class InterruptRequest(BaseModel):
                 "reply_schema",
                 _validate_relative_program_path(self.reply_schema),
             )
+        for field_name in (
+            "requested_target_role_id",
+            "recommended_target_role_id",
+            "resolved_target_role_id",
+        ):
+            raw_value = getattr(self, field_name)
+            if raw_value is None:
+                continue
+            normalized_value = raw_value.strip()
+            if not normalized_value:
+                raise ValueError(f"{field_name} must not be blank")
+            object.__setattr__(self, field_name, normalized_value)
+        if self.target_resolution_reason is not None:
+            normalized_reason = self.target_resolution_reason.strip()
+            if not normalized_reason:
+                raise ValueError("target_resolution_reason must not be blank")
+            object.__setattr__(self, "target_resolution_reason", normalized_reason)
+        if self.audience is InterruptAudience.ASSISTANT:
+            if self.resolved_target_role_id is None:
+                raise ValueError(
+                    "assistant interrupts must include resolved_target_role_id"
+                )
+            if not self.resolved_target_role_id:
+                raise ValueError("resolved_target_role_id must not be blank")
+            if self.target_resolution_reason is None or not self.target_resolution_reason:
+                raise ValueError(
+                    "assistant interrupts must include target_resolution_reason"
+                )
+        else:
+            for field_name in (
+                "requested_target_role_id",
+                "recommended_target_role_id",
+                "resolved_target_role_id",
+                "target_resolution_reason",
+            ):
+                if getattr(self, field_name) is not None:
+                    raise ValueError(
+                        f"human interrupts must not set {field_name}"
+                    )
         return self
 
 

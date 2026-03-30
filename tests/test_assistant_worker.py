@@ -3,7 +3,11 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from codex_orch.assistant import AssistantBackendResult, AssistantWorkerService
+from codex_orch.assistant import (
+    AssistantBackendResult,
+    AssistantRoleRouter,
+    AssistantWorkerService,
+)
 from codex_orch.domain import (
     ConfidenceLevel,
     InterruptAudience,
@@ -18,7 +22,7 @@ from codex_orch.domain import (
     DecisionKind,
 )
 from codex_orch.scheduler import RunService
-from tests.helpers import build_test_store, write_assistant_profile
+from tests.helpers import build_test_store, write_assistant_role
 from tests.test_run_service import FakeRunner
 
 
@@ -38,8 +42,37 @@ def _instance_for_task(run, task_id: str):
     return matches[0]
 
 
-def test_assistant_worker_skips_interrupt_without_effective_profile(tmp_path: Path) -> None:
+def _create_assistant_interrupt(store, *, run_id: str, instance_id: str, task_id: str):
+    recommendation, resolution = AssistantRoleRouter(store).resolve_assistant_target(
+        run_id=run_id,
+        task_id=task_id,
+        request_kind=RequestKind.CLARIFICATION,
+        decision_kind=DecisionKind.POLICY,
+        requested_target_role_id=None,
+    )
+    return store.create_interrupt(
+        run_id=run_id,
+        instance_id=instance_id,
+        audience=InterruptAudience.ASSISTANT,
+        blocking=True,
+        request_kind=RequestKind.CLARIFICATION,
+        question="Should I keep the wrapper?",
+        decision_kind=DecisionKind.POLICY,
+        options=["keep", "delete"],
+        context_artifacts=[],
+        reply_schema=None,
+        priority=RequestPriority.NORMAL,
+        requested_target_role_id=resolution.requested_target_role_id,
+        recommended_target_role_id=recommendation.recommended_target_role_id,
+        resolved_target_role_id=resolution.resolved_target_role_id,
+        target_resolution_reason=resolution.target_resolution_reason,
+        metadata={},
+    )
+
+
+def test_assistant_worker_fails_when_resolved_role_is_missing(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
+    write_assistant_role(store)
     store.save_task(
         TaskSpec(
             id="worker",
@@ -55,20 +88,13 @@ def test_assistant_worker_skips_interrupt_without_effective_profile(tmp_path: Pa
         user_inputs=None,
     )
     instance = _instance_for_task(run, "worker")
-    store.create_interrupt(
+    interrupt = _create_assistant_interrupt(
+        store,
         run_id=run.id,
         instance_id=instance.instance_id,
-        audience=InterruptAudience.ASSISTANT,
-        blocking=True,
-        request_kind=RequestKind.CLARIFICATION,
-        question="Should I keep the wrapper?",
-        decision_kind=DecisionKind.POLICY,
-        options=["keep", "delete"],
-        context_artifacts=[],
-        reply_schema=None,
-        priority=RequestPriority.NORMAL,
-        metadata={},
+        task_id="worker",
     )
+    store.get_assistant_role_spec_path(interrupt.resolved_target_role_id or "policy").unlink()
 
     worker = AssistantWorkerService(
         store,
@@ -83,12 +109,12 @@ def test_assistant_worker_skips_interrupt_without_effective_profile(tmp_path: Pa
     )
 
     stats = worker.run_once()
-    assert stats.skipped_no_profile == 1
+    assert stats.failed == 1
 
 
 def test_assistant_worker_auto_reply_resolves_interrupt_and_resumes_run(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
-    write_assistant_profile(store, set_as_default=True)
+    write_assistant_role(store)
     store.save_task(
         TaskSpec(
             id="worker",
@@ -134,7 +160,7 @@ def test_assistant_worker_auto_reply_resolves_interrupt_and_resumes_run(tmp_path
 
 def test_assistant_worker_handoff_creates_human_interrupt(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
-    write_assistant_profile(store, set_as_default=True)
+    write_assistant_role(store)
     store.save_task(
         TaskSpec(
             id="worker",
@@ -150,19 +176,11 @@ def test_assistant_worker_handoff_creates_human_interrupt(tmp_path: Path) -> Non
         user_inputs=None,
     )
     instance = _instance_for_task(run, "worker")
-    interrupt = store.create_interrupt(
+    interrupt = _create_assistant_interrupt(
+        store,
         run_id=run.id,
         instance_id=instance.instance_id,
-        audience=InterruptAudience.ASSISTANT,
-        blocking=True,
-        request_kind=RequestKind.CLARIFICATION,
-        question="Should I delete the wrapper?",
-        decision_kind=DecisionKind.POLICY,
-        options=["delete", "keep_wrapper"],
-        context_artifacts=[],
-        reply_schema=None,
-        priority=RequestPriority.HIGH,
-        metadata={},
+        task_id="worker",
     )
 
     backend = StubBackend(
@@ -188,3 +206,4 @@ def test_assistant_worker_handoff_creates_human_interrupt(tmp_path: Path) -> Non
     assert original.reply.reply_kind is InterruptReplyKind.HANDOFF_TO_HUMAN
     assert len(human_records) == 1
     assert human_records[0].interrupt.metadata["assistant_summary"] == "I need a human decision."
+    assert human_records[0].interrupt.resolved_target_role_id is None

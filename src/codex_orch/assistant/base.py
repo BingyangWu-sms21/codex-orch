@@ -13,18 +13,19 @@ from codex_orch.domain import (
     TaskSpec,
 )
 from codex_orch.prompt_context import StagedPromptFile as AssistantArtifactContext
-from codex_orch.store import ResolvedAssistantProfile
+from codex_orch.store import ResolvedAssistantRole
 
 
 @dataclass(frozen=True)
 class AssistantBackendRequest:
     program_dir: Path
-    profile: ResolvedAssistantProfile
+    role: ResolvedAssistantRole
     project: ProjectSpec
     task: TaskSpec
     instance_id: str
     assistant_request: AssistantRequest
     artifacts: tuple[AssistantArtifactContext, ...]
+    allow_human_handoff: bool
 
 
 @dataclass(frozen=True)

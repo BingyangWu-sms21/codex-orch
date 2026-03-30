@@ -9,7 +9,9 @@ through `codex exec` / `codex exec resume` with a built-in instance scheduler.
 
 The current implemented runtime is documented in [docs/spec.md](./docs/spec.md).
 The future controller-driven branching and loop runtime is documented in
-[docs/controller-runtime.md](./docs/controller-runtime.md).
+[docs/controller-runtime.md](./docs/controller-runtime.md). The future
+assistant-role interaction control plane is documented in
+[docs/assistant-role-control-plane.md](./docs/assistant-role-control-plane.md).
 
 ## Features
 
@@ -37,6 +39,7 @@ Key docs:
 
 - [docs/spec.md](./docs/spec.md): current implemented storage and execution model
 - [docs/controller-runtime.md](./docs/controller-runtime.md): target controller-driven runtime for branching and loops
+- [docs/assistant-role-control-plane.md](./docs/assistant-role-control-plane.md): target worker/assistant/human interaction control plane with named assistant roles and managed role-scoped preferences
 
 ## Program layout
 
@@ -44,11 +47,13 @@ Each orchestrated program lives in its own directory, for example:
 
 ```text
 codex-programs/my-program/
+├── assistant_roles/
 ├── project.yaml
 ├── tasks/
 ├── presets/
 ├── prompts/
 ├── inputs/
+├── .codex-orch/
 └── .runs/
 ```
 
@@ -83,6 +88,14 @@ plus a helper doc at:
 Workers should use the CLI helper instead of hand-writing inbox files:
 
 ```bash
+codex-orch interrupt recommend \
+  --program-dir /path/to/program \
+  --run-id 20260319010101-deadbeef \
+  --task-id executeRefactor \
+  --audience assistant \
+  --kind clarification \
+  --decision-kind policy
+
 codex-orch interrupt create \
   --program-dir /path/to/program \
   --run-id 20260319010101-deadbeef \
@@ -91,6 +104,7 @@ codex-orch interrupt create \
   --audience assistant \
   --kind clarification \
   --decision-kind policy \
+  --target-role policy \
   --question "Can I delete the legacy wrapper?" \
   --option delete \
   --option keep_wrapper
@@ -109,6 +123,10 @@ When a worker runs inside `codex-orch`, the helper can infer:
 
 Context artifacts passed with `--artifact` must be relative to
 `CODEX_ORCH_PROGRAM_DIR`.
+
+Assistant interrupts now resolve to a concrete assistant role. Task-local
+`interaction_policy` can restrict which roles are allowed and whether human
+handoff is permitted.
 
 Blocking interrupts do not immediately stop the current attempt. Instead,
 `codex-orch` waits until the attempt ends, moves the instance to `waiting` if

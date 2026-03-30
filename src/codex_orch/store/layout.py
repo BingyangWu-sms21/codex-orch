@@ -20,6 +20,9 @@ class ProgramPaths:
     presets_dir: Path
     prompts_dir: Path
     inputs_dir: Path
+    assistant_roles_dir: Path
+    local_state_dir: Path
+    assistant_role_workspaces_dir: Path
     runs_dir: Path
 
 
@@ -50,6 +53,9 @@ def get_program_paths(program_dir: Path) -> ProgramPaths:
         presets_dir=root / "presets",
         prompts_dir=root / "prompts",
         inputs_dir=root / "inputs",
+        assistant_roles_dir=root / "assistant_roles",
+        local_state_dir=root / ".codex-orch",
+        assistant_role_workspaces_dir=root / ".codex-orch" / "assistant_roles",
         runs_dir=root / ".runs",
     )
 
@@ -61,5 +67,8 @@ def ensure_program_layout(program_dir: Path) -> ProgramPaths:
     paths.presets_dir.mkdir(parents=True, exist_ok=True)
     paths.prompts_dir.mkdir(parents=True, exist_ok=True)
     paths.inputs_dir.mkdir(parents=True, exist_ok=True)
+    paths.assistant_roles_dir.mkdir(parents=True, exist_ok=True)
+    paths.local_state_dir.mkdir(parents=True, exist_ok=True)
+    paths.assistant_role_workspaces_dir.mkdir(parents=True, exist_ok=True)
     paths.runs_dir.mkdir(parents=True, exist_ok=True)
     return paths

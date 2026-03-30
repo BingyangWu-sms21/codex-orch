@@ -2,7 +2,9 @@
 
 This document describes the current implemented runtime. For the future
 controller-driven runtime that supports first-class branching and loops, see
-[docs/controller-runtime.md](./controller-runtime.md).
+[docs/controller-runtime.md](./controller-runtime.md). For the future
+assistant-role interaction control plane, see
+[docs/assistant-role-control-plane.md](./assistant-role-control-plane.md).
 
 ## Global layer
 
@@ -11,17 +13,18 @@ controller-driven runtime that supports first-class branching and loops, see
 ```text
 ~/.codex-orch/
 ├── config.toml
-├── presets/
-└── profiles/
+└── presets/
 ```
 
 ## Program layer
 
 Each program is a file-backed task pool with local prompts, inputs, presets,
-and run artifacts.
+assistant roles, local assistant scratch state, and run artifacts.
 
 ```text
 program/
+├── assistant_roles/
+├── .codex-orch/
 ├── project.yaml
 ├── tasks/
 ├── presets/
@@ -126,9 +129,14 @@ materializes a helper doc at:
 The stable entrypoint is:
 
 ```bash
+codex-orch interrupt recommend \
+  --kind clarification \
+  --decision-kind policy
+
 codex-orch interrupt create \
   --kind clarification \
   --decision-kind policy \
+  --target-role policy \
   --question-file /tmp/question.md
 ```
 
@@ -166,6 +174,10 @@ Request fields include:
 - `context_artifacts`
 - `reply_schema`
 - `priority`
+- `requested_target_role_id`
+- `recommended_target_role_id`
+- `resolved_target_role_id`
+- `target_resolution_reason`
 - `metadata`
 
 Reply fields include:
@@ -179,7 +191,7 @@ Reply fields include:
 
 Assistant replies with `reply_kind=handoff_to_human` are recorded on the
 assistant interrupt and then materialize a new human interrupt on the same
-instance.
+instance, but only when the task's `interaction_policy.allow_human` is true.
 
 ## Waiting semantics
 

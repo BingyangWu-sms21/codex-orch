@@ -7,4 +7,5 @@ build/
 *.pyc
 
 examples/**/.runs/
+.codex-orch/
 .claude/

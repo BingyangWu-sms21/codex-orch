@@ -11,6 +11,7 @@ from codex_orch.assistant.base import (
     AssistantBackend,
     AssistantBackendRequest,
 )
+from codex_orch.assistant.routing import AssistantRoleRouter
 from codex_orch.domain import (
     AssistantBackendKind,
     AssistantRequest,
@@ -33,7 +34,7 @@ class AssistantWorkerStats:
     processed: int = 0
     auto_replied: int = 0
     handed_off: int = 0
-    skipped_no_profile: int = 0
+    skipped_no_role: int = 0
     failed: int = 0
 
 
@@ -53,6 +54,7 @@ class AssistantWorkerService:
         if backend is not None:
             self.backends.setdefault(AssistantBackendKind.CODEX_CLI, backend)
         self.run_service = run_service
+        self.router = AssistantRoleRouter(store)
         self._reported_request_issues: dict[str, str] = {}
 
     def run_once(self) -> AssistantWorkerStats:
@@ -60,7 +62,7 @@ class AssistantWorkerService:
         processed = 0
         auto_replied = 0
         handed_off = 0
-        skipped_no_profile = 0
+        skipped_no_role = 0
         failed = 0
         for record in self.store.list_interrupts(
             audience=InterruptAudience.ASSISTANT,
@@ -74,8 +76,8 @@ class AssistantWorkerService:
             elif outcome == "processed:handoff":
                 processed += 1
                 handed_off += 1
-            elif outcome == "skipped:no_profile":
-                skipped_no_profile += 1
+            elif outcome == "skipped:no_role":
+                skipped_no_role += 1
             else:
                 failed += 1
         return AssistantWorkerStats(
@@ -83,7 +85,7 @@ class AssistantWorkerService:
             processed=processed,
             auto_replied=auto_replied,
             handed_off=handed_off,
-            skipped_no_profile=skipped_no_profile,
+            skipped_no_role=skipped_no_role,
             failed=failed,
         )
 
@@ -94,27 +96,29 @@ class AssistantWorkerService:
 
     def _process_record(self, record: InterruptRecord) -> str:
         interrupt_id = record.interrupt.interrupt_id
-        profile = self.store.resolve_assistant_profile(record.run_id, record.task_id)
-        if profile is None:
+        resolved_role_id = record.interrupt.resolved_target_role_id
+        if resolved_role_id is None:
             self._report_request_issue(
                 interrupt_id,
-                "assistant interrupt has no effective assistant profile; leaving unresolved",
+                "assistant interrupt is missing resolved assistant role; leaving unresolved",
             )
-            return "skipped:no_profile"
+            return "skipped:no_role"
 
         try:
+            role = self.store.load_assistant_role(resolved_role_id)
             task = self._resolve_task(record)
             project = self.store.load_project()
             backend_request = AssistantBackendRequest(
                 program_dir=self.store.paths.root,
-                profile=profile,
+                role=role,
                 project=project,
                 task=task,
                 instance_id=record.instance_id,
                 assistant_request=self._to_assistant_request(record),
                 artifacts=tuple(self._load_artifacts(record)),
+                allow_human_handoff=task.interaction_policy.allow_human,
             )
-            backend = self._resolve_backend(profile.spec.backend)
+            backend = self._resolve_backend(role.spec.backend)
             result = backend.respond(backend_request)
             if result.resolution_kind not in {
                 ResolutionKind.AUTO_REPLY,
@@ -138,6 +142,10 @@ class AssistantWorkerService:
                 asyncio.run(self.run_service.resume_run(record.run_id))
                 return "processed:auto_reply"
 
+            self.router.validate_human_interrupt_allowed(
+                run_id=record.run_id,
+                task_id=record.task_id,
+            )
             self.store.save_interrupt_reply(
                 interrupt_id,
                 audience=InterruptAudience.ASSISTANT,
@@ -160,6 +168,10 @@ class AssistantWorkerService:
                 context_artifacts=list(record.interrupt.context_artifacts),
                 reply_schema=record.interrupt.reply_schema,
                 priority=record.interrupt.priority,
+                requested_target_role_id=None,
+                recommended_target_role_id=None,
+                resolved_target_role_id=None,
+                target_resolution_reason=None,
                 metadata={
                     "assistant_summary": result.answer,
                     "assistant_rationale": result.rationale,

@@ -1,8 +1,12 @@
 # Controller-Driven Runtime North Star
 
-This document defines the target runtime model for branching and loops in
-`codex-orch`. It is intentionally future-facing. The current implementation is
-still the static DAG snapshot model documented in [docs/spec.md](./spec.md).
+This document defines the target runtime model for controller-driven branching
+and loops in `codex-orch`. It is intentionally future-facing. The current
+implemented runtime is documented in [docs/spec.md](./spec.md).
+
+For the future worker / assistant / human interaction control plane with named
+assistant roles and managed role-scoped preferences, see
+[docs/assistant-role-control-plane.md](./assistant-role-control-plane.md).
 
 The goal of this design is to make branching, loops, and interrupt-driven
 execution first-class without abandoning the project's local-first,
@@ -10,12 +14,13 @@ filesystem-backed architecture.
 
 ## Why the current model is not enough
 
-Today's runtime freezes a task subgraph into a static DAG snapshot and compiles
-that graph into a Prefect flow once per run. That is sufficient for:
+Today's runtime already has a run-centered instance scheduler, attempt
+directories, interrupt/inbox channels, and Codex session resume. That is
+sufficient for:
 
 - fixed `order` / `context` dependencies
 - published-artifact handoff between tasks
-- pausing and resuming a single task after assistant or human input
+- pausing and resuming the same instance after assistant or human input
 
 It is not sufficient for:
 
@@ -24,11 +29,11 @@ It is not sufficient for:
 - routing based on structured state instead of raw protocol files
 - replay and reconciliation when routing decisions depend on side effects
 
-The core issue is not just missing syntax on dependency edges. The current
-runtime has the wrong control-plane shape: task ids are treated as execution
-identities, control state is spread across node-local object files, and
-assistant/manual-gate artifacts are consumed directly by resume logic instead of
-being materialized into a unified workflow state.
+The core issue is no longer basic runtime persistence or resume mechanics. The
+gap is now higher-level control semantics: the runtime still creates one initial
+instance per selected task, only understands static dependency closure, and does
+not yet have a first-class controller model that can emit routing and loop
+control facts for the scheduler to consume.
 
 ## Core Principles
 

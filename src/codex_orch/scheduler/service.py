@@ -755,8 +755,6 @@ class RunService:
     def _materialize_task(self, project: ProjectSpec, task: TaskSpec) -> TaskSpec:
         effective_sandbox = task.sandbox or project.default_sandbox
         updates: dict[str, object] = {}
-        if task.assistant_profile is None and project.default_assistant_profile is not None:
-            updates["assistant_profile"] = project.default_assistant_profile
         if task.sandbox is None:
             updates["sandbox"] = project.default_sandbox
         if task.model is None and project.default_model is not None:
@@ -799,7 +797,23 @@ class RunService:
 
     def _write_interrupt_help_doc(self, *, attempt_dir: Path, task: TaskSpec) -> None:
         helper_path = self._interrupt_help_doc_path(attempt_dir)
-        assistant_profile = task.assistant_profile or "<none>"
+        roles = self.store.list_assistant_roles()
+        if task.interaction_policy.allowed_assistant_roles is None:
+            allowed_roles = sorted(roles)
+        else:
+            allowed_roles = sorted(set(task.interaction_policy.allowed_assistant_roles))
+        role_lines = [
+            f"- `{role_id}`: {roles[role_id].spec.description or roles[role_id].spec.title or role_id}"
+            for role_id in sorted(roles)
+        ]
+        if not role_lines:
+            role_lines = ["- no assistant roles are currently registered"]
+        if task.interaction_policy.allowed_assistant_roles is None:
+            allowed_roles_text = "all registered roles"
+        elif allowed_roles:
+            allowed_roles_text = ", ".join(f"`{role_id}`" for role_id in allowed_roles)
+        else:
+            allowed_roles_text = "none"
         helper_path.parent.mkdir(parents=True, exist_ok=True)
         helper_path.write_text(
             dedent(
@@ -811,7 +825,24 @@ class RunService:
                 ## Current Task State
 
                 - task_id: `{task.id}`
-                - effective_assistant_profile: `{assistant_profile}`
+                - allowed_assistant_roles: {allowed_roles_text}
+                - allow_human: `{str(task.interaction_policy.allow_human).lower()}`
+
+                ## Registered Assistant Roles
+
+                {"\n".join(role_lines)}
+
+                ## Get A Recommendation
+
+                ```bash
+                codex-orch interrupt recommend \\
+                  --program-dir "$CODEX_ORCH_PROGRAM_DIR" \\
+                  --run-id "$CODEX_ORCH_RUN_ID" \\
+                  --task-id "$CODEX_ORCH_TASK_ID" \\
+                  --audience assistant \\
+                  --kind clarification \\
+                  --decision-kind policy
+                ```
 
                 ## Create An Assistant Interrupt
 
@@ -824,6 +855,7 @@ class RunService:
                   --audience assistant \\
                   --kind clarification \\
                   --decision-kind policy \\
+                  --target-role <role-id> \\
                   --question "Can I delete the legacy wrapper?" \\
                   --option delete \\
                   --option keep_wrapper
@@ -843,6 +875,8 @@ class RunService:
                 ## Semantics
 
                 - Interrupts are resolved through the run inbox, not by mutating task-local files.
+                - Assistant interrupts must resolve to a concrete assistant role.
+                - Start with `codex-orch interrupt recommend`, then use `--target-role` when creating the interrupt.
                 - Blocking interrupts move this instance to `waiting` after the current attempt ends if they remain unresolved.
                 - The next attempt resumes via the same Codex session after all blocking interrupts are resolved.
                 """

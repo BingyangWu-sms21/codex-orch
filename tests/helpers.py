@@ -31,38 +31,47 @@ def build_test_store(tmp_path: Path) -> ProjectStore:
     return store
 
 
-def write_assistant_profile(
+def write_assistant_role(
     store: ProjectStore,
-    profile_id: str = "assistant-default",
+    role_id: str = "policy",
     *,
     instructions: str = "Prefer concise answers.",
+    description: str = "",
     sandbox: str = "workspace-write",
-    set_as_default: bool = False,
+    request_kinds: list[str] | None = None,
+    decision_kinds: list[str] | None = None,
+    managed_asset_contents: str = "version: 1\npreferences:\n  deletion_bias: conservative\n",
 ) -> None:
-    profile_dir = store.get_profile_dir(profile_id)
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    store.get_profile_spec_path(profile_id).write_text(
+    role_dir = store.get_assistant_role_dir(role_id)
+    role_dir.mkdir(parents=True, exist_ok=True)
+    (role_dir / "preferences.yaml").write_text(
+        managed_asset_contents,
+        encoding="utf-8",
+    )
+    store.get_assistant_role_spec_path(role_id).write_text(
         yaml.safe_dump(
             {
-                "id": profile_id,
-                "title": profile_id,
+                "id": role_id,
+                "title": role_id,
+                "description": description,
                 "backend": "codex_cli",
                 "sandbox": sandbox,
+                "instructions": "instructions.md",
+                "managed_assets": ["preferences.yaml"],
+                "policy": {
+                    "request_kinds": request_kinds or ["clarification"],
+                    "decision_kinds": decision_kinds or ["policy"],
+                },
             },
             sort_keys=False,
         ),
         encoding="utf-8",
     )
-    store.get_profile_instructions_path(profile_id).write_text(
+    (role_dir / "instructions.md").write_text(
         instructions + "\n",
         encoding="utf-8",
     )
-    store.get_profile_workspace_dir(profile_id)
-    if set_as_default:
-        project = store.load_project()
-        store.save_project(
-            project.model_copy(update={"default_assistant_profile": profile_id})
-        )
+    store.get_assistant_role_workspace_dir(role_id)
 
 
 def sample_task(task_id: str, *, title: str, agent: str = "default") -> TaskSpec:

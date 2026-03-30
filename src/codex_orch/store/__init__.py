@@ -9,7 +9,7 @@ from codex_orch.store.layout import (
 from codex_orch.store.project_store import (
     InterruptRecord,
     ProjectStore,
-    ResolvedAssistantProfile,
+    ResolvedAssistantRole,
     ResolvedPreset,
 )
 
@@ -18,7 +18,7 @@ __all__ = [
     "ProgramPaths",
     "InterruptRecord",
     "ProjectStore",
-    "ResolvedAssistantProfile",
+    "ResolvedAssistantRole",
     "ResolvedPreset",
     "ensure_global_layout",
     "ensure_program_layout",

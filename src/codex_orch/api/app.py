@@ -48,6 +48,7 @@ def create_app(
             "program_dir": str(store.paths.root),
             "project": store.load_project() if store.paths.project_file.exists() else None,
             "task_statuses": [status.value for status in TaskStatus],
+            "assistant_roles": list(store.list_assistant_roles().values()),
         }
         base_context.update(context)
         return templates.TemplateResponse(request, template_name, base_context)
@@ -81,6 +82,8 @@ def create_app(
                 "task": task,
                 "task_yaml": _task_to_yaml(task),
                 "compose_text": _compose_to_yaml(task),
+                "assistant_hints_text": _assistant_hints_to_yaml(task),
+                "interaction_policy_text": _interaction_policy_to_yaml(task),
                 "incoming_edges": incoming_edges,
                 "all_tasks": task_pool.list_tasks(),
             },
@@ -121,6 +124,8 @@ def create_app(
                     "task": existing,
                     "task_yaml": _task_to_yaml(existing),
                     "compose_text": _compose_to_yaml(existing),
+                    "assistant_hints_text": _assistant_hints_to_yaml(existing),
+                    "interaction_policy_text": _interaction_policy_to_yaml(existing),
                     "incoming_edges": [
                         edge for edge in task_pool.list_edges() if edge.target == existing.id
                     ],
@@ -318,15 +323,6 @@ def _task_from_form(
         "agent",
         existing.agent if existing is not None else project.default_agent,
     )
-    assistant_profile = _nullable(
-        _form_value(
-            form,
-            "assistant_profile",
-            existing.assistant_profile
-            if existing is not None and existing.assistant_profile is not None
-            else "",
-        )
-    )
     status_raw = _form_value(
         form,
         "status",
@@ -347,6 +343,28 @@ def _task_from_form(
         compose_payload = []
     publish = _split_lines(_form_value(form, "publish", "final.md"))
     labels = _split_csv(_form_value(form, "labels", ""))
+    assistant_hints_text = _form_value(
+        form,
+        "assistant_hints",
+        _assistant_hints_to_yaml(existing),
+    )
+    interaction_policy_text = _form_value(
+        form,
+        "interaction_policy",
+        _interaction_policy_to_yaml(existing),
+    )
+    assistant_hints = (
+        yaml.safe_load(assistant_hints_text) if assistant_hints_text.strip() else {}
+    )
+    if assistant_hints is None:
+        assistant_hints = {}
+    interaction_policy = (
+        yaml.safe_load(interaction_policy_text)
+        if interaction_policy_text.strip()
+        else {}
+    )
+    if interaction_policy is None:
+        interaction_policy = {}
     model = _nullable(
         _form_value(
             form,
@@ -391,13 +409,14 @@ def _task_from_form(
         id=task_id,
         title=title,
         agent=agent,
-        assistant_profile=assistant_profile,
         status=TaskStatus(status_raw),
         description=description,
         labels=labels,
         depends_on=[] if existing is None else existing.depends_on,
         compose=compose_payload,
         publish=publish,
+        assistant_hints=assistant_hints,
+        interaction_policy=interaction_policy,
         model=model,
         sandbox=sandbox,
         workspace=workspace,
@@ -414,6 +433,20 @@ def _compose_to_yaml(task: TaskSpec | None) -> str:
     if task is None:
         return _compose_example()
     payload = [step.model_dump(mode="json", exclude_none=True) for step in task.compose]
+    return yaml.safe_dump(payload, sort_keys=False)
+
+
+def _assistant_hints_to_yaml(task: TaskSpec | None) -> str:
+    if task is None:
+        return yaml.safe_dump({}, sort_keys=False)
+    payload = task.assistant_hints.model_dump(mode="json", exclude_defaults=True)
+    return yaml.safe_dump(payload, sort_keys=False)
+
+
+def _interaction_policy_to_yaml(task: TaskSpec | None) -> str:
+    if task is None:
+        return yaml.safe_dump({}, sort_keys=False)
+    payload = task.interaction_policy.model_dump(mode="json", exclude_defaults=True)
     return yaml.safe_dump(payload, sort_keys=False)
 
 

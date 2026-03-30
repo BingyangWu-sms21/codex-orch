@@ -48,6 +48,6 @@ Use these files as the first stop when a run is stuck or surprising:
 
 Common failure patterns:
 
-- missing assistant profile or context artifact: interrupt remains unresolved or the assistant worker skips it
+- missing assistant role or context artifact: interrupt remains unresolved or the assistant worker skips it
 - instance waiting on replies: inspect unresolved interrupts and the latest attempt runtime
 - published artifact missing: inspect attempt prompt, outputs, and instance `published/`

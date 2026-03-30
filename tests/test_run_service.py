@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
+from codex_orch.assistant import AssistantRoleRouter
 from codex_orch.domain import (
     InterruptAudience,
     InterruptReplyKind,
@@ -19,7 +20,7 @@ from codex_orch.domain import (
 )
 from codex_orch.runner import NodeExecutionRequest, NodeExecutionResult
 from codex_orch.scheduler import RunService
-from tests.helpers import build_test_store, write_assistant_profile
+from tests.helpers import build_test_store, write_assistant_role
 
 
 class FakeRunner:
@@ -48,6 +49,13 @@ class FakeRunner:
             and request.instance_id not in self._first_attempt_interrupts
         ):
             self._first_attempt_interrupts.add(request.instance_id)
+            recommendation, resolution = AssistantRoleRouter(self.store).resolve_assistant_target(
+                run_id=request.run_id,
+                task_id=request.task.id,
+                request_kind=RequestKind.CLARIFICATION,
+                decision_kind=DecisionKind.POLICY,
+                requested_target_role_id=None,
+            )
             self.store.create_interrupt(
                 run_id=request.run_id,
                 instance_id=request.instance_id,
@@ -60,6 +68,10 @@ class FakeRunner:
                 context_artifacts=[],
                 reply_schema=None,
                 priority=RequestPriority.HIGH,
+                requested_target_role_id=resolution.requested_target_role_id,
+                recommended_target_role_id=recommendation.recommended_target_role_id,
+                resolved_target_role_id=resolution.resolved_target_role_id,
+                target_resolution_reason=resolution.target_resolution_reason,
                 metadata={},
             )
         final_path.write_text(request.prompt, encoding="utf-8")
@@ -128,7 +140,7 @@ def test_run_service_materializes_context_dependencies(tmp_path: Path) -> None:
 
 def test_run_service_waits_for_blocking_interrupt_and_resumes_same_session(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
-    write_assistant_profile(store, set_as_default=True)
+    write_assistant_role(store)
     store.save_task(
         TaskSpec(
             id="worker",

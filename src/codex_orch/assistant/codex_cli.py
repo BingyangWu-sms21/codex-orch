@@ -9,54 +9,62 @@ from pathlib import Path
 from codex_orch.assistant.base import AssistantBackendRequest, AssistantBackendResult
 from codex_orch.domain import ConfidenceLevel, ControlActionKind, ResolutionKind
 
-_ASSISTANT_OUTPUT_SCHEMA: dict[str, object] = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "resolution_kind": {
-            "type": "string",
-            "enum": [
-                ResolutionKind.AUTO_REPLY.value,
-                ResolutionKind.HANDOFF_TO_HUMAN.value,
-            ],
+
+def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
+    allowed_resolution_kinds = [ResolutionKind.AUTO_REPLY.value]
+    if allow_human_handoff:
+        allowed_resolution_kinds.append(ResolutionKind.HANDOFF_TO_HUMAN.value)
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "resolution_kind": {
+                "type": "string",
+                "enum": allowed_resolution_kinds,
+            },
+            "answer": {"type": "string", "minLength": 1},
+            "rationale": {"type": "string", "minLength": 1},
+            "confidence": {
+                "type": "string",
+                "enum": [level.value for level in ConfidenceLevel],
+            },
+            "citations": {"type": "array", "items": {"type": "string"}},
+            "proposed_guidance_updates": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "proposed_control_actions": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [kind.value for kind in ControlActionKind],
+                },
+            },
         },
-        "answer": {"type": "string", "minLength": 1},
-        "rationale": {"type": "string", "minLength": 1},
-        "confidence": {
-            "type": "string",
-            "enum": [level.value for level in ConfidenceLevel],
-        },
-        "citations": {"type": "array", "items": {"type": "string"}},
-        "proposed_guidance_updates": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "proposed_control_actions": {
-            "type": "array",
-            "items": {"type": "string", "enum": [kind.value for kind in ControlActionKind]},
-        },
-    },
-    "required": [
-        "resolution_kind",
-        "answer",
-        "rationale",
-        "confidence",
-        "citations",
-        "proposed_guidance_updates",
-        "proposed_control_actions",
-    ],
-}
+        "required": [
+            "resolution_kind",
+            "answer",
+            "rationale",
+            "confidence",
+            "citations",
+            "proposed_guidance_updates",
+            "proposed_control_actions",
+        ],
+    }
 
 
 class CodexCliAssistantBackend:
     def respond(self, request: AssistantBackendRequest) -> AssistantBackendResult:
         prompt = self._build_prompt(request)
-        schema_path = self._write_schema_file(request.profile.profile_dir)
+        schema_path = self._write_schema_file(
+            request.role.role_dir,
+            allow_human_handoff=request.allow_human_handoff,
+        )
         try:
             result = subprocess.run(
                 self._build_command(request, schema_path),
-                cwd=request.profile.workspace_dir,
+                cwd=request.role.workspace_dir,
                 env=self._build_environment(request),
                 capture_output=True,
                 text=True,
@@ -100,9 +108,9 @@ class CodexCliAssistantBackend:
             "--json",
             "--skip-git-repo-check",
             "--cd",
-            str(request.profile.workspace_dir),
+            str(request.role.workspace_dir),
         ]
-        sandbox = request.profile.spec.sandbox
+        sandbox = request.role.spec.sandbox
         if sandbox == "workspace-write":
             command.append("--full-auto")
             for visible_root in self._command_visible_roots(request):
@@ -113,8 +121,8 @@ class CodexCliAssistantBackend:
             command.extend(["--sandbox", sandbox])
             for visible_root in self._command_visible_roots(request):
                 command.extend(["--add-dir", str(visible_root)])
-        if request.profile.spec.model is not None:
-            command.extend(["--model", request.profile.spec.model])
+        if request.role.spec.model is not None:
+            command.extend(["--model", request.role.spec.model])
         command.extend(["--output-schema", str(schema_path), "-"])
         return command
 
@@ -125,39 +133,57 @@ class CodexCliAssistantBackend:
                 "CODEX_ORCH_PROGRAM_DIR": str(request.program_dir),
                 "CODEX_ORCH_RUN_ID": request.assistant_request.run_id,
                 "CODEX_ORCH_TASK_ID": request.task.id,
-                "CODEX_ORCH_ASSISTANT_PROFILE_ID": request.profile.spec.id,
-                "CODEX_ORCH_ASSISTANT_PROFILE_DIR": str(request.profile.profile_dir),
-                "CODEX_ORCH_ASSISTANT_WORKSPACE_DIR": str(request.profile.workspace_dir),
+                "CODEX_ORCH_ASSISTANT_ROLE_ID": request.role.spec.id,
+                "CODEX_ORCH_ASSISTANT_ROLE_DIR": str(request.role.role_dir),
+                "CODEX_ORCH_ASSISTANT_ROLE_WORKSPACE_DIR": str(request.role.workspace_dir),
+                "CODEX_ORCH_ASSISTANT_MANAGED_ASSET_PATHS": os.pathsep.join(
+                    str(path) for path in request.role.managed_asset_paths
+                ),
                 "CODEX_ORCH_RUN_DIR": str(self._run_dir(request)),
                 "CODEX_ORCH_RUN_INSTANCES_DIR": str(self._run_instances_dir(request)),
             }
         )
         return env
 
-    def _write_schema_file(self, profile_dir: Path) -> Path:
+    def _write_schema_file(
+        self,
+        role_dir: Path,
+        *,
+        allow_human_handoff: bool,
+    ) -> Path:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
             suffix=".json",
             prefix="assistant-schema-",
-            dir=profile_dir,
+            dir=role_dir,
             delete=False,
         ) as handle:
-            json.dump(_ASSISTANT_OUTPUT_SCHEMA, handle, indent=2, sort_keys=True)
+            json.dump(
+                _assistant_output_schema(
+                    allow_human_handoff=allow_human_handoff,
+                ),
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
             handle.write("\n")
             return Path(handle.name)
 
     def _build_prompt(self, request: AssistantBackendRequest) -> str:
-        instructions = request.profile.instructions_path.read_text(encoding="utf-8").strip()
+        instructions = request.role.instructions_path.read_text(encoding="utf-8").strip()
         metadata_lines = [
             f"- project_name: {request.project.name}",
             f"- run_id: {request.assistant_request.run_id}",
+            f"- assistant_role_id: {request.role.spec.id}",
+            f"- assistant_role_title: {request.role.spec.title or request.role.spec.id}",
             f"- requester_task_id: {request.task.id}",
             f"- requester_task_title: {request.task.title}",
             f"- requester_task_agent: {request.task.agent}",
             f"- request_kind: {request.assistant_request.request_kind.value}",
             f"- decision_kind: {request.assistant_request.decision_kind.value}",
             f"- priority: {request.assistant_request.priority.value}",
+            f"- allow_human_handoff: {str(request.allow_human_handoff).lower()}",
         ]
         if request.task.description:
             metadata_lines.append(f"- requester_task_description: {request.task.description}")
@@ -178,21 +204,34 @@ class CodexCliAssistantBackend:
         for artifact in request.artifacts:
             artifact_sections.append(self._format_artifact_section(artifact))
 
+        managed_asset_sections = [
+            self._format_managed_asset_section(path)
+            for path in request.role.managed_asset_paths
+        ]
+
         requester_instance_dir = self._run_instances_dir(request) / request.instance_id
         accessible_paths = [
-            f"- assistant_profile_workspace: `{request.profile.workspace_dir}`",
+            f"- assistant_role_dir: `{request.role.role_dir}`",
+            f"- assistant_role_workspace: `{request.role.workspace_dir}`",
             f"- program_dir: `{request.program_dir}`",
             f"- run_dir: `{self._run_dir(request)}`",
             f"- run_instances_dir: `{self._run_instances_dir(request)}`",
             f"- requester_instance_dir: `{requester_instance_dir}`",
             (
-                "- Use the assistant profile workspace for persistent notes and preferences. "
-                "Treat the program and run directories as observational context and do not modify them while answering this request."
+                "- Managed role assets are the authoritative long-term guidance. "
+                "Use the assistant role workspace only for private scratch notes, not as preference truth."
+            ),
+            (
+                "- Treat the program and run directories as observational context and do not modify them while answering this request."
             ),
         ]
         sections = [
-            "# Assistant Profile Instructions",
-            instructions or "(no profile instructions provided)",
+            "# Assistant Role Instructions",
+            instructions or "(no role instructions provided)",
+            "# Managed Role Assets",
+            "\n\n".join(managed_asset_sections)
+            if managed_asset_sections
+            else "No managed role assets were configured.",
             "# Run Context",
             "\n".join(metadata_lines),
             "# Accessible Paths",
@@ -208,7 +247,11 @@ class CodexCliAssistantBackend:
                 [
                     "Return only JSON matching the provided schema.",
                     "Choose resolution_kind=auto_reply when you can answer directly.",
-                    "Choose resolution_kind=handoff_to_human when the decision depends on user preference, policy approval, or ambiguous product direction.",
+                    (
+                        "Choose resolution_kind=handoff_to_human when the decision depends on user preference, policy approval, or ambiguous product direction."
+                        if request.allow_human_handoff
+                        else "Human handoff is not allowed for this task. Always return resolution_kind=auto_reply."
+                    ),
                     "Keep citations grounded in the provided artifacts or stable repo/user guidance paths.",
                     "Keep proposed_control_actions empty unless a control-plane action is truly necessary.",
                     "Treat proposed_control_actions and proposed_guidance_updates as proposals only; codex-orch records them but does not execute them automatically.",
@@ -242,6 +285,16 @@ class CodexCliAssistantBackend:
         )
         return "\n".join(lines)
 
+    def _format_managed_asset_section(self, path: Path) -> str:
+        lines = [f"## {path.name}", f"Path: {path}"]
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except UnicodeDecodeError:
+            lines.append("Content omitted: managed asset is not UTF-8 text.")
+            return "\n".join(lines)
+        lines.extend(["```text", content, "```"])
+        return "\n".join(lines)
+
     def _command_visible_roots(
         self,
         request: AssistantBackendRequest,
@@ -251,7 +304,7 @@ class CodexCliAssistantBackend:
             self._run_instances_dir(request),
         ]
         deduped: list[Path] = []
-        seen: set[str] = {str(request.profile.workspace_dir)}
+        seen: set[str] = {str(request.role.workspace_dir)}
         for path in candidates:
             normalized = str(path)
             if normalized in seen:

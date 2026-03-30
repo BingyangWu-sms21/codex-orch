@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
+
 from codex_orch.assistant.base import AssistantBackendRequest
-from codex_orch.assistant.codex_cli import CodexCliAssistantBackend
+from codex_orch.assistant.codex_cli import (
+    CodexCliAssistantBackend,
+    _assistant_output_schema,
+)
 from codex_orch.domain import (
     AssistantRequest,
     DecisionKind,
@@ -14,13 +19,42 @@ from codex_orch.domain import (
 )
 from codex_orch.prompt_context import ensure_staged_assistant_artifact
 from codex_orch.scheduler import RunService
-from tests.helpers import build_test_store, write_assistant_profile
+from tests.helpers import build_test_store, write_assistant_role
 from tests.test_run_service import FakeRunner
+
+
+def test_load_assistant_role_supports_program_relative_asset_paths(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    role_dir = store.get_assistant_role_dir("policy")
+    role_dir.mkdir(parents=True, exist_ok=True)
+    instructions_path = role_dir / "instructions.md"
+    instructions_path.write_text("Prefer concise answers.\n", encoding="utf-8")
+    managed_asset_path = role_dir / "preferences.yaml"
+    managed_asset_path.write_text("version: 1\npreferences:\n  naming: explicit\n", encoding="utf-8")
+    store.get_assistant_role_spec_path("policy").write_text(
+        yaml.safe_dump(
+            {
+                "id": "policy",
+                "title": "policy",
+                "backend": "codex_cli",
+                "sandbox": "workspace-write",
+                "instructions": "assistant_roles/policy/instructions.md",
+                "managed_assets": ["assistant_roles/policy/preferences.yaml"],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    role = store.load_assistant_role("policy")
+
+    assert role.instructions_path == instructions_path
+    assert role.managed_asset_paths == (managed_asset_path,)
 
 
 def test_assistant_backend_exposes_program_and_run_instances_context(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
-    write_assistant_profile(store, set_as_default=True)
+    write_assistant_role(store, managed_asset_contents="version: 1\npreferences:\n  naming: explicit\n")
     store.save_task(
         TaskSpec(
             id="worker",
@@ -59,12 +93,13 @@ def test_assistant_backend_exposes_program_and_run_instances_context(tmp_path: P
     )
     backend_request = AssistantBackendRequest(
         program_dir=store.paths.root,
-        profile=store.load_assistant_profile("assistant-default"),
+        role=store.load_assistant_role("policy"),
         project=store.load_project(),
         task=instance.task,
         instance_id=instance.instance_id,
         assistant_request=request,
         artifacts=(artifact,),
+        allow_human_handoff=True,
     )
 
     prompt = CodexCliAssistantBackend()._build_prompt(backend_request)
@@ -72,11 +107,13 @@ def test_assistant_backend_exposes_program_and_run_instances_context(tmp_path: P
     assert "- run_instances_dir:" in prompt
     assert instance.instance_id in prompt
     assert "Prefer deleting wrappers." in prompt
+    assert "Managed Role Assets" in prompt
+    assert "naming: explicit" in prompt
 
 
 def test_assistant_backend_formats_large_and_binary_artifacts(tmp_path: Path) -> None:
     store = build_test_store(tmp_path)
-    write_assistant_profile(store, set_as_default=True)
+    write_assistant_role(store)
     store.save_task(
         TaskSpec(
             id="worker",
@@ -116,3 +153,9 @@ def test_assistant_backend_formats_large_and_binary_artifacts(tmp_path: Path) ->
 
     assert "Preview only: artifact exceeded inline size limit." in large_text
     assert "Content omitted: artifact is not UTF-8 text." in blob_text
+
+
+def test_assistant_backend_schema_blocks_handoff_when_human_is_disallowed() -> None:
+    schema = _assistant_output_schema(allow_human_handoff=False)
+
+    assert schema["properties"]["resolution_kind"]["enum"] == ["auto_reply"]

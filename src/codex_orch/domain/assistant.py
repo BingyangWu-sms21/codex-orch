@@ -87,20 +87,45 @@ class ControlActionStatus(StrEnum):
     REJECTED = "rejected"
 
 
-class AssistantProfileSpec(BaseModel):
+class AssistantRolePolicy(BaseModel):
+    request_kinds: list[RequestKind] = Field(default_factory=list)
+    decision_kinds: list[DecisionKind] = Field(default_factory=list)
+    task_labels_any: list[str] = Field(default_factory=list)
+    ask_when: list[str] = Field(default_factory=list)
+
+
+class AssistantRoleSpec(BaseModel):
     id: str
     title: str = ""
     description: str = ""
     backend: AssistantBackendKind = AssistantBackendKind.CODEX_CLI
     model: str | None = None
     sandbox: str = "workspace-write"
+    instructions: str = "instructions.md"
+    managed_assets: list[str] = Field(default_factory=list)
+    policy: AssistantRolePolicy = Field(default_factory=AssistantRolePolicy)
 
     @model_validator(mode="after")
-    def validate_profile(self) -> AssistantProfileSpec:
+    def validate_role(self) -> AssistantRoleSpec:
         if not self.id.strip():
             raise ValueError("id must not be empty")
         if not self.sandbox.strip():
             raise ValueError("sandbox must not be empty")
+        if not self.instructions.strip():
+            raise ValueError("instructions must not be empty")
+        object.__setattr__(
+            self,
+            "instructions",
+            _validate_relative_program_path(self.instructions),
+        )
+        object.__setattr__(
+            self,
+            "managed_assets",
+            [
+                _validate_relative_program_path(path)
+                for path in self.managed_assets
+            ],
+        )
         return self
 
 

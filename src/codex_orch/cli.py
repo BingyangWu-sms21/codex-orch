@@ -9,7 +9,11 @@ from pathlib import Path
 import typer
 import yaml
 
-from codex_orch.assistant import AssistantWorkerService, CodexCliAssistantBackend
+from codex_orch.assistant import (
+    AssistantRoleRouter,
+    AssistantWorkerService,
+    CodexCliAssistantBackend,
+)
 from codex_orch.api.app import DEFAULT_WEB_PORT, serve
 from codex_orch.domain import (
     ConfidenceLevel,
@@ -101,6 +105,10 @@ def _assistant_worker_service(program_dir: Path) -> AssistantWorkerService:
     )
 
 
+def _assistant_router(program_dir: Path) -> AssistantRoleRouter:
+    return AssistantRoleRouter(_store(program_dir))
+
+
 def _print_json(payload: object) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
 
@@ -187,7 +195,6 @@ def project_init(
     workspace: Path,
     description: str = "",
     default_agent: str = "default",
-    default_assistant_profile: str | None = None,
     default_sandbox: str = "workspace-write",
     max_concurrency: int = 2,
 ) -> None:
@@ -197,7 +204,6 @@ def project_init(
         workspace=str(workspace.resolve()),
         description=description,
         default_agent=default_agent,
-        default_assistant_profile=default_assistant_profile,
         default_sandbox=default_sandbox,
         max_concurrency=max_concurrency,
     )
@@ -458,6 +464,7 @@ def interrupt_create(
     decision_kind: DecisionKind | None = typer.Option(None, "--decision-kind"),
     question: str | None = typer.Option(None, "--question"),
     question_file: Path | None = typer.Option(None, "--question-file"),
+    target_role: str | None = typer.Option(None, "--target-role"),
     option: list[str] | None = typer.Option(None, "--option"),
     artifact: list[str] | None = typer.Option(None, "--artifact"),
     reply_schema: str | None = typer.Option(None, "--reply-schema"),
@@ -471,30 +478,136 @@ def interrupt_create(
     resolved_instance_id = _resolve_instance_id(instance_id)
     resolved_task_id = _resolve_task_id(task_id)
     store = _store(resolved_program_dir)
-    interrupt = store.create_interrupt(
-        run_id=resolved_run_id,
-        instance_id=resolved_instance_id,
-        audience=audience,
-        blocking=blocking,
-        request_kind=kind,
-        question=_read_text_input(question, question_file, field="question"),
-        decision_kind=decision_kind,
-        options=[] if option is None else option,
-        context_artifacts=[] if artifact is None else artifact,
-        reply_schema=reply_schema,
-        priority=priority,
-        metadata={}
-        if metadata is None
-        else {key: value for key, value in _parse_key_values(metadata).items()},
-    )
-    if interrupt.task_id != resolved_task_id:
+    try:
+        run = store.get_run(resolved_run_id)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if resolved_instance_id not in run.instances:
         raise typer.BadParameter(
-            f"task id {resolved_task_id} does not match instance task {interrupt.task_id}"
+            f"instance {resolved_instance_id} does not exist in run {resolved_run_id}"
         )
+    instance = run.instances[resolved_instance_id]
+    if instance.task_id != resolved_task_id:
+        raise typer.BadParameter(
+            f"task id {resolved_task_id} does not match instance task {instance.task_id}"
+        )
+    router = AssistantRoleRouter(store)
+    requested_target_role_id: str | None = None
+    recommended_target_role_id: str | None = None
+    resolved_target_role_id: str | None = None
+    target_resolution_reason: str | None = None
+    try:
+        if audience is InterruptAudience.ASSISTANT:
+            recommendation, resolution = router.resolve_assistant_target(
+                run_id=resolved_run_id,
+                task_id=resolved_task_id,
+                request_kind=kind,
+                decision_kind=decision_kind,
+                requested_target_role_id=target_role,
+            )
+            requested_target_role_id = resolution.requested_target_role_id
+            recommended_target_role_id = recommendation.recommended_target_role_id
+            resolved_target_role_id = resolution.resolved_target_role_id
+            target_resolution_reason = resolution.target_resolution_reason
+        else:
+            if target_role is not None:
+                raise typer.BadParameter("--target-role is only valid for assistant interrupts")
+            router.validate_human_interrupt_allowed(
+                run_id=resolved_run_id,
+                task_id=resolved_task_id,
+            )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    try:
+        interrupt = store.create_interrupt(
+            run_id=resolved_run_id,
+            instance_id=resolved_instance_id,
+            audience=audience,
+            blocking=blocking,
+            request_kind=kind,
+            question=_read_text_input(question, question_file, field="question"),
+            decision_kind=decision_kind,
+            options=[] if option is None else option,
+            context_artifacts=[] if artifact is None else artifact,
+            reply_schema=reply_schema,
+            priority=priority,
+            requested_target_role_id=requested_target_role_id,
+            recommended_target_role_id=recommended_target_role_id,
+            resolved_target_role_id=resolved_target_role_id,
+            target_resolution_reason=target_resolution_reason,
+            metadata={}
+            if metadata is None
+            else {key: value for key, value in _parse_key_values(metadata).items()},
+        )
+    except (KeyError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if as_json:
         _print_json(interrupt.model_dump(mode="json"))
         return
     typer.echo(interrupt.interrupt_id)
+
+
+@interrupt_app.command("recommend")
+def interrupt_recommend(
+    program_dir: Path | None = typer.Option(None, "--program-dir"),
+    run_id: str | None = typer.Option(None, "--run-id"),
+    task_id: str | None = typer.Option(None, "--task-id"),
+    audience: InterruptAudience = typer.Option(..., "--audience"),
+    kind: RequestKind = typer.Option(..., "--kind"),
+    decision_kind: DecisionKind | None = typer.Option(None, "--decision-kind"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    resolved_program_dir = _resolve_program_dir(program_dir)
+    resolved_run_id = _resolve_run_id(run_id)
+    resolved_task_id = _resolve_task_id(task_id)
+    router = _assistant_router(resolved_program_dir)
+    if audience is InterruptAudience.HUMAN:
+        allowed = True
+        reason = None
+        try:
+            router.validate_human_interrupt_allowed(
+                run_id=resolved_run_id,
+                task_id=resolved_task_id,
+            )
+        except ValueError as exc:
+            allowed = False
+            reason = str(exc)
+        payload = {
+            "audience": audience.value,
+            "request_kind": kind.value,
+            "decision_kind": None if decision_kind is None else decision_kind.value,
+            "allow_human": allowed,
+            "reason": reason,
+        }
+        if as_json:
+            _print_json(payload)
+            return
+        typer.echo(yaml.safe_dump(payload, sort_keys=False))
+        return
+
+    try:
+        recommendation = router.recommend(
+            run_id=resolved_run_id,
+            task_id=resolved_task_id,
+            request_kind=kind,
+            decision_kind=decision_kind,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    payload = {
+        "audience": audience.value,
+        "request_kind": kind.value,
+        "decision_kind": None if decision_kind is None else decision_kind.value,
+        "allowed_assistant_roles": list(recommendation.allowed_role_ids),
+        "ranked_role_ids": list(recommendation.ranked_role_ids),
+        "recommended_target_role_id": recommendation.recommended_target_role_id,
+        "target_resolution_reason": recommendation.recommendation_reason,
+        "allow_human": recommendation.allow_human,
+    }
+    if as_json:
+        _print_json(payload)
+        return
+    typer.echo(yaml.safe_dump(payload, sort_keys=False))
 
 
 @interrupt_app.command("list")
@@ -575,6 +688,7 @@ def inbox_reply(
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     store = _store(program_dir)
+    router = AssistantRoleRouter(store)
     record = store.find_interrupt(interrupt_id)
     body = _read_text_input(text, text_file, field="text")
     if record.interrupt.audience is InterruptAudience.HUMAN and reply_kind is not InterruptReplyKind.ANSWER:
@@ -593,6 +707,13 @@ def inbox_reply(
         record.interrupt.audience is InterruptAudience.ASSISTANT
         and reply_kind is InterruptReplyKind.HANDOFF_TO_HUMAN
     ):
+        try:
+            router.validate_human_interrupt_allowed(
+                run_id=record.run_id,
+                task_id=record.task_id,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
         store.create_interrupt(
             run_id=record.run_id,
             instance_id=record.instance_id,
@@ -605,6 +726,10 @@ def inbox_reply(
             context_artifacts=list(record.interrupt.context_artifacts),
             reply_schema=record.interrupt.reply_schema,
             priority=record.interrupt.priority,
+            requested_target_role_id=None,
+            recommended_target_role_id=None,
+            resolved_target_role_id=None,
+            target_resolution_reason=None,
             metadata={
                 "assistant_summary": body,
                 "assistant_rationale": rationale or "",
@@ -634,7 +759,7 @@ def inbox_worker(
             "processed": stats.processed,
             "auto_replied": stats.auto_replied,
             "handed_off": stats.handed_off,
-            "skipped_no_profile": stats.skipped_no_profile,
+            "skipped_no_role": stats.skipped_no_role,
             "failed": stats.failed,
         }
         if as_json:

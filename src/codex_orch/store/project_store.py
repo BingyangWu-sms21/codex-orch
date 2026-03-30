@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 from codex_orch.domain import (
-    AssistantProfileSpec,
+    AssistantRoleSpec,
     DependencyEdge,
     DependencyKind,
     InterruptAudience,
@@ -40,11 +40,12 @@ class ResolvedPreset:
 
 
 @dataclass(frozen=True)
-class ResolvedAssistantProfile:
-    profile_dir: Path
+class ResolvedAssistantRole:
+    role_dir: Path
     instructions_path: Path
+    managed_asset_paths: tuple[Path, ...]
     workspace_dir: Path
-    spec: AssistantProfileSpec
+    spec: AssistantRoleSpec
 
 
 @dataclass(frozen=True)
@@ -203,48 +204,69 @@ class ProjectStore:
         if path.exists():
             path.unlink()
 
-    def get_profile_dir(self, profile_id: str) -> Path:
-        return self.global_paths.profiles_dir / profile_id
+    def get_assistant_role_dir(self, role_id: str) -> Path:
+        return self.paths.assistant_roles_dir / role_id
 
-    def get_profile_spec_path(self, profile_id: str) -> Path:
-        return self.get_profile_dir(profile_id) / "profile.yaml"
+    def get_assistant_role_spec_path(self, role_id: str) -> Path:
+        return self.get_assistant_role_dir(role_id) / "role.yaml"
 
-    def get_profile_instructions_path(self, profile_id: str) -> Path:
-        return self.get_profile_dir(profile_id) / "instructions.md"
-
-    def get_profile_workspace_dir(self, profile_id: str) -> Path:
-        workspace_dir = self.get_profile_dir(profile_id) / "workspace"
+    def get_assistant_role_workspace_dir(self, role_id: str) -> Path:
+        workspace_dir = self.paths.assistant_role_workspaces_dir / role_id / "workspace"
         workspace_dir.mkdir(parents=True, exist_ok=True)
         return workspace_dir
 
-    def load_assistant_profile(self, profile_id: str) -> ResolvedAssistantProfile:
-        path = self.get_profile_spec_path(profile_id)
+    def _resolve_assistant_role_asset_path(self, role_dir: Path, relative_path: str) -> Path:
+        role_local_path = role_dir / relative_path
+        if role_local_path.exists():
+            return role_local_path
+        return self.paths.root / relative_path
+
+    def load_assistant_role(self, role_id: str) -> ResolvedAssistantRole:
+        path = self.get_assistant_role_spec_path(role_id)
         if not path.exists():
-            raise KeyError(f"assistant profile {profile_id} does not exist")
+            raise KeyError(f"assistant role {role_id} does not exist")
         payload = _read_yaml(path)
         if payload is None:
-            raise ValueError(f"profile file {path} is empty")
-        spec = AssistantProfileSpec.model_validate(payload)
-        if spec.id != profile_id:
+            raise ValueError(f"assistant role file {path} is empty")
+        spec = AssistantRoleSpec.model_validate(payload)
+        if spec.id != role_id:
             raise ValueError(
-                f"profile file {path} has id {spec.id}, expected {profile_id}"
+                f"assistant role file {path} has id {spec.id}, expected {role_id}"
             )
-        instructions_path = self.get_profile_instructions_path(profile_id)
+        role_dir = self.get_assistant_role_dir(role_id)
+        instructions_path = self._resolve_assistant_role_asset_path(
+            role_dir,
+            spec.instructions,
+        )
         if not instructions_path.exists():
             raise KeyError(
-                f"assistant profile {profile_id} is missing instructions.md"
+                f"assistant role {role_id} is missing {spec.instructions}"
             )
-        return ResolvedAssistantProfile(
-            profile_dir=self.get_profile_dir(profile_id),
+        managed_asset_paths: list[Path] = []
+        for relative_path in spec.managed_assets:
+            asset_path = self._resolve_assistant_role_asset_path(
+                role_dir,
+                relative_path,
+            )
+            if not asset_path.exists():
+                raise KeyError(
+                    f"assistant role {role_id} is missing managed asset {relative_path}"
+                )
+            managed_asset_paths.append(asset_path)
+        return ResolvedAssistantRole(
+            role_dir=role_dir,
             instructions_path=instructions_path,
-            workspace_dir=self.get_profile_workspace_dir(profile_id),
+            managed_asset_paths=tuple(managed_asset_paths),
+            workspace_dir=self.get_assistant_role_workspace_dir(role_id),
             spec=spec,
         )
 
-    def resolve_assistant_profile_id_for_task(self, task: TaskSpec) -> str | None:
-        if task.assistant_profile is not None:
-            return task.assistant_profile
-        return self.load_project().default_assistant_profile
+    def list_assistant_roles(self) -> dict[str, ResolvedAssistantRole]:
+        resolved: dict[str, ResolvedAssistantRole] = {}
+        for path in sorted(self.paths.assistant_roles_dir.glob("*/role.yaml")):
+            role = self.load_assistant_role(path.parent.name)
+            resolved[role.spec.id] = role
+        return resolved
 
     def load_default_user_inputs(self) -> dict[str, str]:
         project = self.load_project()
@@ -439,6 +461,10 @@ class ProjectStore:
         context_artifacts: list[str],
         reply_schema: str | None,
         priority,
+        requested_target_role_id: str | None = None,
+        recommended_target_role_id: str | None = None,
+        resolved_target_role_id: str | None = None,
+        target_resolution_reason: str | None = None,
         metadata: dict[str, object] | None = None,
     ) -> InterruptRequest:
         run = self.get_run(run_id)
@@ -458,6 +484,10 @@ class ProjectStore:
             context_artifacts=context_artifacts,
             reply_schema=reply_schema,
             priority=priority,
+            requested_target_role_id=requested_target_role_id,
+            recommended_target_role_id=recommended_target_role_id,
+            resolved_target_role_id=resolved_target_role_id,
+            target_resolution_reason=target_resolution_reason,
             metadata={} if metadata is None else metadata,
         )
         self.save_interrupt(interrupt)
@@ -469,6 +499,7 @@ class ProjectStore:
                 "interrupt_id": interrupt.interrupt_id,
                 "audience": interrupt.audience.value,
                 "blocking": interrupt.blocking,
+                "resolved_target_role_id": interrupt.resolved_target_role_id,
             },
         )
         return interrupt
@@ -630,18 +661,6 @@ class ProjectStore:
             if instance.task_id == task_id:
                 return instance
         raise KeyError(f"task {task_id} does not exist in run {run_id}")
-
-    def resolve_assistant_profile(self, run_id: str, task_id: str) -> ResolvedAssistantProfile | None:
-        task = self.maybe_get_run_task(run_id, task_id)
-        if task is None:
-            try:
-                task = self.get_task(task_id)
-            except KeyError:
-                return None
-        profile_id = self.resolve_assistant_profile_id_for_task(task)
-        if profile_id is None:
-            return None
-        return self.load_assistant_profile(profile_id)
 
     def _task_path(self, task_id: str) -> Path:
         return self.paths.tasks_dir / f"{task_id}.yaml"
