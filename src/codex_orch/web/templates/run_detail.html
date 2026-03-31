@@ -36,6 +36,9 @@
         <th>Last progress</th>
         <th>Last event</th>
         <th>Termination reason</th>
+        <th>Failure kind</th>
+        <th>Failure summary</th>
+        <th>Resume hint</th>
         <th>Artifacts</th>
         <th>Instance dir</th>
       </tr>
@@ -74,6 +77,25 @@
           -
           {% endif %}
         </td>
+        <td>
+          {% if instance.failure_kind %}
+          {{ instance.failure_kind.value }}
+          {% elif runtime and runtime.failure_kind %}
+          {{ runtime.failure_kind.value }}
+          {% else %}
+          -
+          {% endif %}
+        </td>
+        <td>
+          {% if instance.failure_summary %}
+          {{ instance.failure_summary }}
+          {% elif runtime and runtime.failure_summary %}
+          {{ runtime.failure_summary }}
+          {% else %}
+          -
+          {% endif %}
+        </td>
+        <td>{% if instance.resume_recommended %}resume recommended{% else %}-{% endif %}</td>
         <td>
           {% for artifact in instance.published %}
           <div>{{ artifact.relative_path }}</div>

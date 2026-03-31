@@ -1,0 +1,60 @@
+id: acceptance_gate
+title: Request final human acceptance
+kind: controller
+agent: default
+status: ready
+depends_on:
+  - task: quality_loop_gate
+    as: loop_gate
+    kind: order
+    consume: []
+  - task: quality_attempt
+    as: latest
+    kind: context
+    consume:
+      - result.json
+  - task: baseline_run
+    as: baseline
+    kind: context
+    consume:
+      - result.json
+compose:
+  - kind: file
+    path: prompts/acceptance_gate.md
+  - kind: ref
+    ref: deps.latest.result
+  - kind: ref
+    ref: deps.baseline.result
+  - kind: ref
+    ref: runtime.replies
+  - kind: ref
+    ref: runtime.latest_reply
+  - kind: ref
+    ref: inputs.acceptance_criteria
+publish:
+  - final.md
+  - result.json
+assistant_hints:
+  preferred_roles:
+    - policy
+    - review
+  ask_when:
+    - summarize_acceptance_risks
+    - prepare_human_decision
+interaction_policy:
+  allowed_assistant_roles:
+    - policy
+    - review
+  allow_human: true
+control:
+  mode: route
+  routes:
+    - label: approved
+      targets:
+        - publish_summary
+    - label: revise
+      targets:
+        - revision_requested
+    - label: expand_scope
+      targets:
+        - scope_review

@@ -1,0 +1,7 @@
+version: 1
+preferences:
+  favor_high_information_validation: true
+  prefer_narrower_test_layer_first: true
+guidance:
+  - Prefer the smallest validation step that meaningfully reduces uncertainty.
+  - Treat test augmentation as part of convergence work when evidence is weak.

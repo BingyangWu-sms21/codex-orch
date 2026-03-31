@@ -10,10 +10,16 @@ from codex_orch.domain import (
     DependencyEdge,
     DependencyKind,
     PresetSpec,
+    ProjectSpec,
     TaskControlMode,
     TaskKind,
     TaskSpec,
     TaskStatus,
+)
+from codex_orch.input_values import JsonValue, referenced_input_template_keys
+from codex_orch.schema_utils import (
+    OutputSchemaCompatibilityWarning,
+    validate_output_schema_compatibility,
 )
 from codex_orch.store import ProjectStore
 
@@ -27,7 +33,51 @@ class GraphEdgeView:
     scope: str
 
 
+@dataclass(frozen=True)
+class ProgramValidationIssue:
+    severity: str
+    code: str
+    message: str
+    location: str
+    reference_url: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "severity": self.severity,
+            "code": self.code,
+            "message": self.message,
+            "location": self.location,
+            "reference_url": self.reference_url,
+        }
+
+
+@dataclass(frozen=True)
+class ProgramValidationReport:
+    errors: tuple[ProgramValidationIssue, ...] = ()
+    warnings: tuple[ProgramValidationIssue, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors and not self.warnings
+
+    @property
+    def blocking(self) -> bool:
+        return bool(self.errors)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "ok": self.ok,
+            "blocking": self.blocking,
+            "errors": [issue.to_dict() for issue in self.errors],
+            "warnings": [issue.to_dict() for issue in self.warnings],
+        }
+
+
 class TaskPoolService:
+    _OUTPUT_SCHEMA_REFERENCE_URL = (
+        "https://platform.openai.com/docs/guides/structured-outputs"
+    )
+
     def __init__(self, store: ProjectStore) -> None:
         self.store = store
 
@@ -74,8 +124,13 @@ class TaskPoolService:
         return views
 
     def validate_graph(self) -> None:
+        report = self.validate_program()
+        if report.errors:
+            raise ValueError(report.errors[0].message)
+
+    def validate_program(self) -> ProgramValidationReport:
         tasks = self.store.load_task_map()
-        self._validate_task_graph(tasks)
+        return self._validate_program_report(tasks=tasks)
 
     def preview_preset(
         self,
@@ -216,6 +271,175 @@ class TaskPoolService:
         self._validate_controller_routes(tasks)
         self._validate_compose_refs(tasks)
         self._validate_cycles(tasks)
+
+    def _validate_program_report(
+        self,
+        *,
+        tasks: dict[str, TaskSpec],
+    ) -> ProgramValidationReport:
+        errors: list[ProgramValidationIssue] = []
+        warnings: list[ProgramValidationIssue] = []
+
+        try:
+            self._validate_task_graph(tasks)
+        except ValueError as exc:
+            errors.append(
+                ProgramValidationIssue(
+                    severity="error",
+                    code="graph.invalid",
+                    message=str(exc),
+                    location="graph",
+                )
+            )
+
+        if not self.store.paths.project_file.exists():
+            return ProgramValidationReport(
+                errors=tuple(errors),
+                warnings=tuple(warnings),
+            )
+
+        project = self.store.load_project()
+        try:
+            default_inputs = self.store.load_default_user_inputs()
+        except (OSError, ValueError) as exc:
+            errors.append(
+                ProgramValidationIssue(
+                    severity="error",
+                    code="inputs.default_load_failed",
+                    message=f"failed to load default user inputs: {exc}",
+                    location="project.user_inputs",
+                )
+            )
+            return ProgramValidationReport(
+                errors=tuple(errors),
+                warnings=tuple(warnings),
+            )
+
+        errors.extend(self._validate_path_bound_inputs(project, tasks, default_inputs))
+        schema_errors, schema_warnings = self._collect_result_schema_issues(tasks)
+        errors.extend(schema_errors)
+        warnings.extend(schema_warnings)
+        return ProgramValidationReport(
+            errors=tuple(errors),
+            warnings=tuple(warnings),
+        )
+
+    def _collect_result_schema_issues(
+        self,
+        tasks: dict[str, TaskSpec],
+    ) -> tuple[list[ProgramValidationIssue], list[ProgramValidationIssue]]:
+        errors: list[ProgramValidationIssue] = []
+        warnings: list[ProgramValidationIssue] = []
+        for task in tasks.values():
+            if task.result_schema is None:
+                continue
+            field_name = f"task {task.id} result_schema"
+            schema_path = self.store.paths.root / task.result_schema
+            try:
+                compatibility_warnings = validate_output_schema_compatibility(
+                    schema_path=schema_path,
+                    field_name=field_name,
+                )
+            except ValueError as exc:
+                errors.append(
+                    ProgramValidationIssue(
+                        severity="error",
+                        code="result_schema.invalid",
+                        message=str(exc),
+                        location=f"tasks/{task.id}.yaml:result_schema",
+                    )
+                )
+                continue
+            warnings.extend(
+                self._schema_warning_issue(task.id, task.result_schema, item)
+                for item in compatibility_warnings
+            )
+        return errors, warnings
+
+    def _validate_path_bound_inputs(
+        self,
+        project: ProjectSpec,
+        tasks: dict[str, TaskSpec],
+        default_inputs: dict[str, JsonValue],
+    ) -> list[ProgramValidationIssue]:
+        errors: list[ProgramValidationIssue] = []
+        issue = self._validate_path_template_inputs(
+            field_name="project.workspace",
+            location="project.workspace",
+            raw_value=project.workspace,
+            default_inputs=default_inputs,
+        )
+        if issue is not None:
+            errors.append(issue)
+        for task in tasks.values():
+            if task.workspace is not None:
+                issue = self._validate_path_template_inputs(
+                    field_name=f"task {task.id} workspace",
+                    location=f"tasks/{task.id}.yaml:workspace",
+                    raw_value=task.workspace,
+                    default_inputs=default_inputs,
+                )
+                if issue is not None:
+                    errors.append(issue)
+            for index, raw_root in enumerate(task.extra_writable_roots):
+                issue = self._validate_path_template_inputs(
+                    field_name=f"task {task.id} extra_writable_roots[{index}]",
+                    location=f"tasks/{task.id}.yaml:extra_writable_roots[{index}]",
+                    raw_value=raw_root,
+                    default_inputs=default_inputs,
+                )
+                if issue is not None:
+                    errors.append(issue)
+        return errors
+
+    def _validate_path_template_inputs(
+        self,
+        *,
+        field_name: str,
+        location: str,
+        raw_value: str,
+        default_inputs: dict[str, JsonValue],
+    ) -> ProgramValidationIssue | None:
+        for input_key in referenced_input_template_keys(raw_value):
+            if input_key not in default_inputs:
+                continue
+            value = default_inputs[input_key]
+            if not isinstance(value, str):
+                return ProgramValidationIssue(
+                    severity="error",
+                    code="path_input.non_string",
+                    message=(
+                        f"{field_name} references inputs.{input_key}, which must resolve to a string"
+                    ),
+                    location=location,
+                )
+            if value != value.strip():
+                return ProgramValidationIssue(
+                    severity="error",
+                    code="path_input.whitespace",
+                    message=(
+                        f"{field_name} references inputs.{input_key}, whose default value has leading or trailing whitespace"
+                    ),
+                    location=location,
+                )
+        return None
+
+    def _schema_warning_issue(
+        self,
+        task_id: str,
+        schema_relative_path: str,
+        warning: OutputSchemaCompatibilityWarning,
+    ) -> ProgramValidationIssue:
+        return ProgramValidationIssue(
+            severity="warning",
+            code=warning.code,
+            message=warning.message,
+            location=(
+                f"tasks/{task_id}.yaml:result_schema -> {schema_relative_path} "
+                f"at {warning.object_path}"
+            ),
+            reference_url=self._OUTPUT_SCHEMA_REFERENCE_URL,
+        )
 
     def _validate_compose_refs(self, tasks: dict[str, TaskSpec]) -> None:
         for task in tasks.values():

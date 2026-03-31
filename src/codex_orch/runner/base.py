@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Protocol
 
 from codex_orch.domain import (
+    NodeExecutionFailureKind,
     NodeExecutionTerminationReason,
     ProjectSpec,
     TaskSpec,
@@ -36,6 +37,9 @@ class NodeExecutionResult:
     session_id: str | None = None
     error: str | None = None
     termination_reason: NodeExecutionTerminationReason | None = None
+    failure_kind: NodeExecutionFailureKind | None = None
+    failure_summary: str | None = None
+    resume_recommended: bool = False
 
 
 class TaskRunner(Protocol):

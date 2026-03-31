@@ -1,0 +1,11 @@
+name: quality-convergence-program
+workspace: ${inputs.repo_workspace}
+description: Example program for feature-scoped quality convergence with assistant escalation and human-blocking acceptance.
+default_agent: default
+default_sandbox: workspace-write
+max_concurrency: 2
+user_inputs:
+  repo_workspace: inputs/repo_workspace.txt
+  feature_brief: inputs/feature_brief.md
+  acceptance_criteria: inputs/acceptance_criteria.md
+  attempt_budget: inputs/attempt_budget.txt

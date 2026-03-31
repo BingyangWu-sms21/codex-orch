@@ -1,0 +1,32 @@
+id: revision_requested
+title: Summarize why another revision cycle is needed
+kind: work
+agent: default
+status: ready
+depends_on:
+  - task: acceptance_gate
+    as: gate
+    kind: context
+    consume:
+      - result.json
+  - task: quality_attempt
+    as: latest
+    kind: context
+    consume:
+      - result.json
+  - task: baseline_run
+    as: baseline
+    kind: context
+    consume:
+      - result.json
+compose:
+  - kind: file
+    path: prompts/revision_requested.md
+  - kind: ref
+    ref: deps.gate.result
+  - kind: ref
+    ref: deps.latest.result
+  - kind: ref
+    ref: deps.baseline.result
+publish:
+  - final.md

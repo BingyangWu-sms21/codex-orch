@@ -1,0 +1,7 @@
+version: 1
+preferences:
+  be_conservative_about_stopping: true
+  flag_scope_creep_early: true
+guidance:
+  - Prefer explicit evidence over optimistic conclusions.
+  - Recommend human review when the loop appears to be broadening beyond its original target.

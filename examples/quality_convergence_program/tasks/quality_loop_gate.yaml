@@ -1,0 +1,27 @@
+id: quality_loop_gate
+title: Decide whether quality is still converging
+kind: controller
+agent: default
+status: ready
+depends_on:
+  - task: quality_attempt
+    as: latest
+    kind: context
+    consume:
+      - result.json
+compose:
+  - kind: file
+    path: prompts/quality_loop_gate.md
+  - kind: ref
+    ref: deps.latest.result
+  - kind: ref
+    ref: inputs.attempt_budget
+publish:
+  - final.md
+  - result.json
+control:
+  mode: loop
+  continue_targets:
+    - quality_attempt
+  stop_targets:
+    - acceptance_gate

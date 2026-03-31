@@ -39,7 +39,7 @@ from codex_orch.skills import (
     list_builtin_skills,
 )
 from codex_orch.store import InterruptRecord, ProjectStore
-from codex_orch.task_pool import TaskPoolService
+from codex_orch.task_pool import ProgramValidationIssue, TaskPoolService
 
 app = typer.Typer(help="File-backed task orchestrator for Codex CLI.")
 project_app = typer.Typer(help="Initialize and inspect program directories.")
@@ -254,6 +254,26 @@ def _proposal_payload(record) -> dict[str, object]:
     return record.model_dump(mode="json")
 
 
+def _print_validation_issue(issue: ProgramValidationIssue) -> None:
+    typer.echo(
+        f"{issue.severity.upper()}: [{issue.code}] {issue.location}: {issue.message}",
+        err=True,
+    )
+    if issue.reference_url is not None:
+        typer.echo(f"  reference: {issue.reference_url}", err=True)
+
+
+def _emit_validation_warnings(report) -> None:
+    for issue in report.warnings:
+        _print_validation_issue(issue)
+
+
+def _validation_warning_text(report) -> str | None:
+    if not report.warnings:
+        return None
+    return " | ".join(issue.message for issue in report.warnings)
+
+
 @project_app.command("init")
 def project_init(
     program_dir: Path,
@@ -277,6 +297,32 @@ def project_init(
     if not store.get_assistant_operating_model_path().exists():
         install_assistant_operating_model(store.paths.root, overwrite=False)
     typer.echo(f"Initialized program at {store.paths.root}")
+
+
+@project_app.command("validate")
+def project_validate(
+    program_dir: Path,
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    report = _task_pool(program_dir).validate_program()
+    payload = {
+        **report.to_dict(),
+        "program_dir": str(program_dir.resolve()),
+    }
+    if as_json:
+        _print_json(payload)
+    else:
+        for issue in report.errors:
+            _print_validation_issue(issue)
+        for issue in report.warnings:
+            _print_validation_issue(issue)
+        if report.ok:
+            typer.echo(f"Validated program at {payload['program_dir']}")
+    if report.errors:
+        raise typer.Exit(code=2)
+    if report.warnings:
+        raise typer.Exit(code=1)
+    raise typer.Exit(code=0)
 
 
 @assistant_doc_app.command("install")
@@ -327,7 +373,9 @@ def task_add(program_dir: Path, spec: Path) -> None:
     store = _store(program_dir)
     payload = yaml.safe_load(spec.read_text(encoding="utf-8"))
     task = TaskSpec.model_validate(payload)
-    TaskPoolService(store).save_task(task)
+    pool = TaskPoolService(store)
+    pool.save_task(task)
+    _emit_validation_warnings(pool.validate_program())
     typer.echo(f"Added task {task.id}")
 
 
@@ -341,9 +389,11 @@ def task_update(program_dir: Path, task_id: str, spec: Path) -> None:
     merged = existing.model_dump(mode="json")
     merged.update(payload)
     task = TaskSpec.model_validate(merged)
-    TaskPoolService(store).save_task(task)
+    pool = TaskPoolService(store)
+    pool.save_task(task)
     if task.id != existing.id:
         store.delete_task(existing.id)
+    _emit_validation_warnings(pool.validate_program())
     typer.echo(f"Updated task {task.id}")
 
 
@@ -469,6 +519,10 @@ def run_start(
     input_json_file: list[str] | None = typer.Option(None, "--input-json-file"),
     wait: bool = True,
 ) -> None:
+    report = _task_pool(program_dir).validate_program()
+    if report.errors:
+        raise typer.BadParameter(report.errors[0].message)
+    _emit_validation_warnings(report)
     service = _run_service(program_dir)
     root_values = [] if root is None else root
     label_values = [] if label is None else label

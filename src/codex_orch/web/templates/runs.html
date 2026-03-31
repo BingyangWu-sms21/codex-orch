@@ -48,6 +48,14 @@
             <div>running={{ activity.running_instances | length }}</div>
             <div>{% if activity.last_progress_at %}{{ activity.last_progress_at }}{% else %}-{% endif %}</div>
             <div>{% if activity.last_event_summary %}{{ activity.last_event_summary }}{% else %}-{% endif %}</div>
+            <div>
+              {% if activity.failure_summary %}
+              failure={{ activity.failure_summary }}
+              {% if activity.resume_recommended %}(resume recommended){% endif %}
+              {% else %}
+              -
+              {% endif %}
+            </div>
           </td>
           <td>-</td>
         </tr>

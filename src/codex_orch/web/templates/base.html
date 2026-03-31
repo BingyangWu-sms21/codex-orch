@@ -22,6 +22,10 @@
     <section class="flash error">{{ error }}</section>
     {% endif %}
 
+    {% if warning %}
+    <section class="flash warning">{{ warning }}</section>
+    {% endif %}
+
     {% block content %}{% endblock %}
   </body>
 </html>

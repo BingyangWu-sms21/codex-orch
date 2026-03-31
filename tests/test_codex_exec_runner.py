@@ -9,6 +9,7 @@ from textwrap import dedent
 import pytest
 
 from codex_orch.domain import (
+    NodeExecutionFailureKind,
     NodeExecutionRuntime,
     NodeExecutionTerminationReason,
     ProjectSpec,
@@ -122,6 +123,94 @@ def _install_fake_codex(tmp_path: Path) -> Path:
                     flush=True,
                 )
                 raise SystemExit(0)
+            if mode == "auth-fail":
+                print(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": "unexpected status 401 Unauthorized: Invalid API key",
+                        }
+                    ),
+                    flush=True,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "type": "turn.failed",
+                            "error": {
+                                "message": "unexpected status 401 Unauthorized: Invalid API key",
+                            },
+                        }
+                    ),
+                    flush=True,
+                )
+                raise SystemExit(1)
+            if mode == "network-fail":
+                print(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": "Request failed after 3 retries: dns error: failed to lookup address information",
+                        }
+                    ),
+                    flush=True,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "type": "turn.failed",
+                            "error": {
+                                "message": "Request failed after 3 retries: dns error: failed to lookup address information",
+                            },
+                        }
+                    ),
+                    flush=True,
+                )
+                raise SystemExit(1)
+            if mode == "protocol-fail":
+                print(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": "stream disconnected before completion: stream closed before response.completed",
+                        }
+                    ),
+                    flush=True,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "type": "turn.failed",
+                            "error": {
+                                "message": "stream disconnected before completion: stream closed before response.completed",
+                            },
+                        }
+                    ),
+                    flush=True,
+                )
+                raise SystemExit(1)
+            if mode == "schema-fail":
+                print(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": "Invalid schema for response_format codex_output_schema: invalid_json_schema",
+                        }
+                    ),
+                    flush=True,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "type": "turn.failed",
+                            "error": {
+                                "message": "Invalid schema for response_format codex_output_schema: invalid_json_schema",
+                            },
+                        }
+                    ),
+                    flush=True,
+                )
+                raise SystemExit(1)
             raise SystemExit(2)
             """
         ),
@@ -348,3 +437,55 @@ def test_runner_applies_idle_timeout_and_forces_kill(
 
     assert not result.success
     assert result.termination_reason is NodeExecutionTerminationReason.IDLE_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    ("mode", "failure_kind", "resume_recommended"),
+    [
+        ("auth-fail", NodeExecutionFailureKind.EXTERNAL_AUTH, True),
+        ("network-fail", NodeExecutionFailureKind.EXTERNAL_NETWORK, True),
+        ("protocol-fail", NodeExecutionFailureKind.EXTERNAL_PROTOCOL, True),
+        ("schema-fail", NodeExecutionFailureKind.OUTPUT_SCHEMA, False),
+    ],
+)
+def test_runner_classifies_codex_backend_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    failure_kind: NodeExecutionFailureKind,
+    resume_recommended: bool,
+) -> None:
+    bin_dir = _install_fake_codex(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_CODEX_MODE", mode)
+
+    runner = CodexExecRunner()
+    request = _build_request(tmp_path, sandbox="workspace-write")
+    result = asyncio.run(runner.run(request))
+
+    assert not result.success
+    assert result.failure_kind is failure_kind
+    assert result.resume_recommended is resume_recommended
+    runtime = NodeExecutionRuntime.model_validate(
+        json.loads((request.attempt_dir / "runtime.json").read_text(encoding="utf-8"))
+    )
+    assert runtime.failure_kind is failure_kind
+    assert runtime.resume_recommended is resume_recommended
+    assert runtime.failure_summary is not None
+
+
+def test_runner_marks_missing_codex_binary_as_runner_invocation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+
+    runner = CodexExecRunner()
+    request = _build_request(tmp_path, sandbox="workspace-write")
+    result = asyncio.run(runner.run(request))
+
+    assert not result.success
+    assert result.failure_kind is NodeExecutionFailureKind.RUNNER_INVOCATION
+    assert result.resume_recommended is False

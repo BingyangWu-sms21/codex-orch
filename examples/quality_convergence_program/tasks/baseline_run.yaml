@@ -1,0 +1,17 @@
+id: baseline_run
+title: Record baseline quality state
+kind: work
+agent: default
+status: ready
+compose:
+  - kind: file
+    path: prompts/baseline_run.md
+  - kind: ref
+    ref: inputs.feature_brief
+  - kind: ref
+    ref: inputs.acceptance_criteria
+  - kind: ref
+    ref: inputs.attempt_budget
+publish:
+  - final.md
+  - result.json

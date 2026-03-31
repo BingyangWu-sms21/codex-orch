@@ -62,6 +62,16 @@ class NodeExecutionTerminationReason(StrEnum):
     ORPHANED = "orphaned"
 
 
+class NodeExecutionFailureKind(StrEnum):
+    EXTERNAL_AUTH = "external_auth"
+    EXTERNAL_NETWORK = "external_network"
+    EXTERNAL_PROTOCOL = "external_protocol"
+    OUTPUT_SCHEMA = "output_schema"
+    RUNNER_INVOCATION = "runner_invocation"
+    TASK_RUNTIME = "task_runtime"
+    UNKNOWN = "unknown"
+
+
 def _validate_relative_file_path(raw_path: str) -> str:
     candidate = PurePosixPath(raw_path)
     if candidate.is_absolute():
@@ -396,6 +406,9 @@ class NodeExecutionRuntime(BaseModel):
     wall_timeout_sec: float | None = None
     idle_timeout_sec: float | None = None
     termination_reason: NodeExecutionTerminationReason | None = None
+    failure_kind: NodeExecutionFailureKind | None = None
+    failure_summary: str | None = None
+    resume_recommended: bool = False
     return_code: int | None = None
 
     @model_validator(mode="after")
@@ -423,4 +436,11 @@ class NodeExecutionRuntime(BaseModel):
             raise ValueError("wall_timeout_sec must be > 0")
         if self.idle_timeout_sec is not None and self.idle_timeout_sec <= 0:
             raise ValueError("idle_timeout_sec must be > 0")
+        if self.failure_summary is not None and not self.failure_summary.strip():
+            raise ValueError("failure_summary must not be blank")
+        if self.termination_reason is NodeExecutionTerminationReason.COMPLETED:
+            if self.failure_kind is not None or self.failure_summary is not None:
+                raise ValueError(
+                    "completed runtime may not define failure_kind or failure_summary"
+                )
         return self

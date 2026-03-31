@@ -1,0 +1,46 @@
+id: quality_attempt
+title: Perform one quality convergence attempt
+kind: work
+agent: default
+status: ready
+labels:
+  - quality
+  - testing
+depends_on:
+  - task: baseline_run
+    as: baseline
+    kind: context
+    consume:
+      - result.json
+compose:
+  - kind: file
+    path: prompts/quality_attempt.md
+  - kind: ref
+    ref: deps.baseline.result
+  - kind: ref
+    ref: inputs.feature_brief
+  - kind: ref
+    ref: inputs.acceptance_criteria
+  - kind: ref
+    ref: runtime.replies
+  - kind: ref
+    ref: runtime.latest_reply
+publish:
+  - final.md
+  - result.json
+assistant_hints:
+  preferred_roles:
+    - test-triage
+  decision_kind_overrides:
+    policy: policy
+    review: review
+  ask_when:
+    - failure_root_cause_unclear
+    - test_strategy_unclear
+    - behavior_semantics_unclear
+interaction_policy:
+  allowed_assistant_roles:
+    - test-triage
+    - review
+    - policy
+  allow_human: true

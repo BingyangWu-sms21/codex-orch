@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import quote
 
 import uvicorn
 import yaml
@@ -49,6 +50,7 @@ def create_app(
             "project": store.load_project() if store.paths.project_file.exists() else None,
             "task_statuses": [status.value for status in TaskStatus],
             "assistant_roles": list(store.list_assistant_roles().values()),
+            "warning": request.query_params.get("warning"),
         }
         base_context.update(context)
         return templates.TemplateResponse(request, template_name, base_context)
@@ -97,6 +99,7 @@ def create_app(
         try:
             task = _task_from_form(form, store=store)
             task_pool.save_task(task)
+            warning = _validation_warning_text(task_pool.validate_program())
         except ValueError as exc:
             return render(
                 request,
@@ -108,7 +111,7 @@ def create_app(
                     "error": str(exc),
                 },
             )
-        return RedirectResponse(url=f"/tasks/{task.id}", status_code=303)
+        return _redirect_with_warning(url=f"/tasks/{task.id}", warning=warning)
 
     @app.post("/tasks/{task_id}", response_class=HTMLResponse)
     async def update_task(request: Request, task_id: str) -> Response:
@@ -119,6 +122,7 @@ def create_app(
             task_pool.save_task(task)
             if task.id != existing.id:
                 store.delete_task(existing.id)
+            warning = _validation_warning_text(task_pool.validate_program())
         except ValueError as exc:
             return render(
                 request,
@@ -137,7 +141,7 @@ def create_app(
                     "error": str(exc),
                 },
             )
-        return RedirectResponse(url=f"/tasks/{task.id}", status_code=303)
+        return _redirect_with_warning(url=f"/tasks/{task.id}", warning=warning)
 
     @app.post("/tasks/{task_id}/delete")
     async def delete_task(task_id: str) -> RedirectResponse:
@@ -227,6 +231,22 @@ def create_app(
         roots = _split_csv(_form_value(form, "roots", ""))
         labels = _split_csv(_form_value(form, "labels", ""))
         user_inputs = _parse_key_values(str(form.get("inputs", "")))
+        report = task_pool.validate_program()
+        if report.errors:
+            return render(
+                request,
+                "runs.html",
+                {
+                    "runs": store.list_runs(),
+                    "tasks": task_pool.list_tasks(),
+                    "run_activity": {
+                        item.id: _run_activity_summary(store, item)
+                        for item in store.list_runs()
+                    },
+                    "error": report.errors[0].message,
+                },
+            )
+        warning = _validation_warning_text(report)
         try:
             run = run_service.create_snapshot(
                 roots=roots,
@@ -248,7 +268,7 @@ def create_app(
                 },
             )
         background_tasks.add_task(_run_snapshot_sync, run_service, run.id)
-        return RedirectResponse(url=f"/runs/{run.id}", status_code=303)
+        return _redirect_with_warning(url=f"/runs/{run.id}", warning=warning)
 
     @app.post("/runs/{run_id}/resume")
     async def resume_run(
@@ -295,6 +315,9 @@ def _run_activity_summary(
     running_instances: list[str] = []
     last_progress_at: str | None = None
     last_event_summary: str | None = None
+    latest_failure_at: str | None = None
+    failure_summary: str | None = None
+    resume_recommended = False
     for instance_id, instance in run.instances.items():
         if instance.attempt == 0:
             continue
@@ -308,11 +331,39 @@ def _run_activity_summary(
         ):
             last_progress_at = runtime.last_progress_at
             last_event_summary = runtime.last_event_summary
+        failure_at = instance.finished_at or runtime.finished_at
+        if (
+            instance.status.value == "failed"
+            and instance.failure_summary is not None
+            and failure_at is not None
+            and (latest_failure_at is None or failure_at > latest_failure_at)
+        ):
+            latest_failure_at = failure_at
+            failure_summary = instance.failure_summary
+            resume_recommended = instance.resume_recommended
     return {
         "running_instances": running_instances,
         "last_progress_at": last_progress_at,
         "last_event_summary": last_event_summary,
+        "failure_summary": failure_summary,
+        "resume_recommended": resume_recommended,
     }
+
+
+def _validation_warning_text(report) -> str | None:
+    if not report.warnings:
+        return None
+    return " | ".join(issue.message for issue in report.warnings)
+
+
+def _redirect_with_warning(*, url: str, warning: str | None) -> RedirectResponse:
+    if warning is None:
+        return RedirectResponse(url=url, status_code=303)
+    separator = "&" if "?" in url else "?"
+    return RedirectResponse(
+        url=f"{url}{separator}warning={quote(warning)}",
+        status_code=303,
+    )
 
 
 def _task_from_form(

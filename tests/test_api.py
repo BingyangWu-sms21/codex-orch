@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi.testclient import TestClient
 
 from codex_orch.api import create_app
-from codex_orch.domain import TaskSpec, TaskStatus
+from codex_orch.domain import (
+    NodeExecutionFailureKind,
+    NodeExecutionTerminationReason,
+    TaskSpec,
+    TaskStatus,
+)
+from codex_orch.runner import NodeExecutionRequest, NodeExecutionResult
 from codex_orch.scheduler import RunService
 from codex_orch.store import ProjectStore
 from tests.helpers import build_test_store
@@ -114,3 +122,57 @@ def test_runs_page_and_run_detail_render_instance_runtime(tmp_path) -> None:
     detail = client.get(f"/runs/{run.id}")
     assert detail.status_code == 200
     assert "Instances" in detail.text
+
+
+def test_tasks_page_renders_warning_flash(tmp_path) -> None:
+    store = build_test_store(tmp_path)
+    app = create_app(store.paths.root, global_root=store.global_paths.root)
+    client = TestClient(app)
+
+    response = client.get("/tasks?warning=be-careful")
+
+    assert response.status_code == 200
+    assert "be-careful" in response.text
+
+
+def test_run_detail_renders_failure_metadata(tmp_path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+
+    class RecoverableFailureRunner:
+        async def run(self, request: NodeExecutionRequest) -> NodeExecutionResult:
+            return NodeExecutionResult(
+                success=False,
+                return_code=1,
+                final_message="",
+                error="stream disconnected before completion",
+                termination_reason=NodeExecutionTerminationReason.NONZERO_EXIT,
+                failure_kind=NodeExecutionFailureKind.EXTERNAL_PROTOCOL,
+                failure_summary="stream disconnected before completion",
+                resume_recommended=True,
+            )
+
+    run = asyncio.run(
+        RunService(store, RecoverableFailureRunner()).start_run(
+            roots=["worker"],
+            labels=[],
+            user_inputs=None,
+        )
+    )
+    app = create_app(store.paths.root, global_root=store.global_paths.root)
+    client = TestClient(app)
+
+    detail = client.get(f"/runs/{run.id}")
+
+    assert detail.status_code == 200
+    assert "external_protocol" in detail.text
+    assert "stream disconnected before completion" in detail.text
+    assert "resume recommended" in detail.text

@@ -70,6 +70,16 @@ def parse_json_input_override(raw_value: str, *, field_name: str) -> JsonValue:
     return ensure_json_value(parsed, field_name=field_name)
 
 
+def referenced_input_template_keys(raw_value: str) -> tuple[str, ...]:
+    keys: list[str] = []
+    for match in _INPUT_TEMPLATE_RE.finditer(raw_value):
+        input_key = match.group(1).strip()
+        if not input_key:
+            raise ValueError("path template contains an empty inputs binding")
+        keys.append(input_key)
+    return tuple(keys)
+
+
 def render_input_template(
     raw_value: str,
     *,

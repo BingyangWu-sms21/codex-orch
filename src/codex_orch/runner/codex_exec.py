@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from codex_orch.domain import (
+    NodeExecutionFailureKind,
     NodeExecutionRuntime,
     NodeExecutionTerminationReason,
 )
@@ -23,6 +25,13 @@ def _utc_now_iso() -> str:
 class _RuntimeClockState:
     started_at_monotonic: float
     last_progress_at_monotonic: float
+
+
+@dataclass(frozen=True)
+class _FailureInfo:
+    kind: NodeExecutionFailureKind
+    summary: str
+    resume_recommended: bool
 
 
 class _RuntimeTracker:
@@ -107,11 +116,17 @@ class _RuntimeTracker:
         *,
         return_code: int,
         termination_reason: NodeExecutionTerminationReason,
+        failure_kind: NodeExecutionFailureKind | None = None,
+        failure_summary: str | None = None,
+        resume_recommended: bool = False,
     ) -> None:
         async with self._lock:
             self._runtime.return_code = return_code
             self._runtime.finished_at = _utc_now_iso()
             self._runtime.termination_reason = termination_reason
+            self._runtime.failure_kind = failure_kind
+            self._runtime.failure_summary = failure_summary
+            self._runtime.resume_recommended = resume_recommended
             self._write_unlocked()
 
     async def clock_state(self) -> _RuntimeClockState:
@@ -210,12 +225,15 @@ class CodexExecRunner:
                 stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError as exc:
+            summary = str(exc)
             return NodeExecutionResult(
                 success=False,
                 return_code=127,
                 final_message="",
                 session_id=request.resume_session_id,
-                error=str(exc),
+                error=summary,
+                failure_kind=NodeExecutionFailureKind.RUNNER_INVOCATION,
+                failure_summary=summary,
             )
 
         events_path = request.attempt_dir / "events.jsonl"
@@ -254,15 +272,23 @@ class CodexExecRunner:
         return_code = await process.wait()
         await stdin_task
         watchdog_reason = await watchdog_task
-        final_message, session_id = await stdout_task
+        final_message, session_id, stdout_output = await stdout_task
         stderr_output = await stderr_task
         termination_reason = self._resolve_termination_reason(
             return_code,
             watchdog_reason,
         )
+        failure = self._classify_failure(
+            stdout_output=stdout_output,
+            stderr_output=stderr_output,
+            termination_reason=termination_reason,
+        )
         await runtime_tracker.finish(
             return_code=return_code,
             termination_reason=termination_reason,
+            failure_kind=None if failure is None else failure.kind,
+            failure_summary=None if failure is None else failure.summary,
+            resume_recommended=False if failure is None else failure.resume_recommended,
         )
 
         resolved_session_id = session_id or request.resume_session_id
@@ -281,8 +307,15 @@ class CodexExecRunner:
             return_code=return_code,
             final_message=final_message,
             session_id=resolved_session_id,
-            error=self._build_error(stderr_output, termination_reason),
+            error=(
+                self._build_error(stderr_output, termination_reason)
+                if failure is None
+                else failure.summary
+            ),
             termination_reason=termination_reason,
+            failure_kind=None if failure is None else failure.kind,
+            failure_summary=None if failure is None else failure.summary,
+            resume_recommended=False if failure is None else failure.resume_recommended,
         )
 
     def _build_command(self, request: NodeExecutionRequest) -> list[str]:
@@ -404,20 +437,22 @@ class CodexExecRunner:
         process: asyncio.subprocess.Process,
         path: Path,
         runtime_tracker: _RuntimeTracker,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, str]:
         if process.stdout is None:
-            return "", None
+            return "", None, ""
 
         final_message = ""
         session_id: str | None = None
+        chunks: list[str] = []
         with path.open("w", encoding="utf-8") as handle:
             async for text in _iter_stream_lines(process.stdout):
                 handle.write(text)
                 handle.flush()
                 await runtime_tracker.note_stdout(text)
+                chunks.append(text)
                 final_message = self._extract_agent_message(text, final_message)
                 session_id = self._extract_session_id(text, session_id)
-        return final_message, session_id
+        return final_message, session_id, "".join(chunks)
 
     async def _capture_stderr(
         self,
@@ -527,6 +562,135 @@ class CodexExecRunner:
         if termination_reason is NodeExecutionTerminationReason.TERMINATED:
             return stderr_output.strip() or "codex exec terminated"
         return stderr_output.strip() or "codex exec failed"
+
+    def _classify_failure(
+        self,
+        *,
+        stdout_output: str,
+        stderr_output: str,
+        termination_reason: NodeExecutionTerminationReason,
+    ) -> _FailureInfo | None:
+        if termination_reason is NodeExecutionTerminationReason.COMPLETED:
+            return None
+
+        messages = self._failure_messages(stdout_output, stderr_output)
+        message_blob = "\n".join(messages).lower()
+        summary = (
+            self._matching_failure_summary(
+                messages,
+                pattern=r"Invalid schema for response_format|invalid_json_schema",
+            )
+            if "invalid schema for response_format" in message_blob
+            or "invalid_json_schema" in message_blob
+            else None
+        )
+        if summary is not None:
+            return _FailureInfo(
+                kind=NodeExecutionFailureKind.OUTPUT_SCHEMA,
+                summary=summary,
+                resume_recommended=False,
+            )
+
+        summary = self._matching_failure_summary(
+            messages,
+            pattern=r"401 Unauthorized|Invalid API key|unauthorized",
+        )
+        if summary is not None:
+            return _FailureInfo(
+                kind=NodeExecutionFailureKind.EXTERNAL_AUTH,
+                summary=summary,
+                resume_recommended=True,
+            )
+
+        summary = self._matching_failure_summary(
+            messages,
+            pattern=(
+                r"dns error|failed to lookup address information|client error \(Connect\)"
+                r"|Failed to fetch|Request failed after|Name or service not known"
+            ),
+        )
+        if summary is not None:
+            return _FailureInfo(
+                kind=NodeExecutionFailureKind.EXTERNAL_NETWORK,
+                summary=summary,
+                resume_recommended=True,
+            )
+
+        summary = self._matching_failure_summary(
+            messages,
+            pattern=r"stream disconnected before completion|stream closed before response\.completed",
+        )
+        if summary is not None:
+            return _FailureInfo(
+                kind=NodeExecutionFailureKind.EXTERNAL_PROTOCOL,
+                summary=summary,
+                resume_recommended=True,
+            )
+
+        summary = self._normalize_failure_summary(
+            messages[-1] if messages else self._build_error(stderr_output, termination_reason)
+        )
+        if termination_reason is NodeExecutionTerminationReason.NONZERO_EXIT:
+            return _FailureInfo(
+                kind=NodeExecutionFailureKind.TASK_RUNTIME,
+                summary=summary,
+                resume_recommended=False,
+            )
+        return _FailureInfo(
+            kind=NodeExecutionFailureKind.UNKNOWN,
+            summary=summary,
+            resume_recommended=False,
+        )
+
+    def _failure_messages(
+        self,
+        stdout_output: str,
+        stderr_output: str,
+    ) -> list[str]:
+        messages: list[str] = []
+        for raw_line in stdout_output.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") == "error":
+                message = payload.get("message")
+                if isinstance(message, str) and message.strip():
+                    messages.append(message.strip())
+                continue
+            if payload.get("type") != "turn.failed":
+                continue
+            error = payload.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message.strip():
+                    messages.append(message.strip())
+            elif isinstance(error, str) and error.strip():
+                messages.append(error.strip())
+        if stderr_output.strip():
+            messages.append(stderr_output.strip())
+        return messages
+
+    def _matching_failure_summary(
+        self,
+        messages: list[str],
+        *,
+        pattern: str,
+    ) -> str | None:
+        regex = re.compile(pattern, re.IGNORECASE)
+        for message in reversed(messages):
+            if regex.search(message):
+                return self._normalize_failure_summary(message)
+        return None
+
+    def _normalize_failure_summary(self, raw: str | None) -> str:
+        if raw is None or not raw.strip():
+            return "codex exec failed"
+        collapsed = " ".join(raw.strip().split())
+        return _truncate(collapsed, 240)
 
     def _extract_agent_message(self, raw_line: str, current: str) -> str:
         stripped = raw_line.strip()

@@ -13,6 +13,7 @@ from codex_orch.domain.assistant import (
     RequestPriority,
 )
 from codex_orch.domain.models import (
+    NodeExecutionFailureKind,
     TaskControlMode,
     NodeExecutionTerminationReason,
     ProjectSpec,
@@ -352,6 +353,9 @@ class RunInstanceState(BaseModel):
     session_id: str | None = None
     blocking_interrupts: list[str] = Field(default_factory=list)
     termination_reason: NodeExecutionTerminationReason | None = None
+    failure_kind: NodeExecutionFailureKind | None = None
+    failure_summary: str | None = None
+    resume_recommended: bool = False
     started_at: str | None = None
     finished_at: str | None = None
 
@@ -370,6 +374,15 @@ class RunInstanceState(BaseModel):
                     raise ValueError(f"{mapping_name} keys must not be empty")
                 if not value.strip():
                     raise ValueError(f"{mapping_name} values must not be empty")
+        if self.failure_summary is not None and not self.failure_summary.strip():
+            raise ValueError("failure_summary must not be blank")
+        if self.status is RunInstanceStatus.DONE:
+            if self.error is not None:
+                raise ValueError("done instances may not define error")
+            if self.failure_kind is not None or self.failure_summary is not None:
+                raise ValueError(
+                    "done instances may not define failure_kind or failure_summary"
+                )
         return self
 
 

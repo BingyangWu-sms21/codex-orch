@@ -10,6 +10,7 @@ from codex_orch.assistant import AssistantRoleRouter
 from codex_orch.domain import (
     InterruptAudience,
     InterruptReplyKind,
+    NodeExecutionFailureKind,
     NodeExecutionRuntime,
     NodeExecutionTerminationReason,
     ProjectSpec,
@@ -249,6 +250,109 @@ def _instances_for_task(run, task_id: str):
         [instance for instance in run.instances.values() if instance.task_id == task_id],
         key=lambda instance: instance.instance_id,
     )
+
+
+def test_resume_run_requeues_recoverable_failed_instance_and_reopens_skipped_descendants(
+    tmp_path: Path,
+) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="source",
+            title="Source",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "source", "kind": "order", "consume": []}],
+            publish=["final.md"],
+        )
+    )
+
+    class RecoverableFailureRunner(FakeRunner):
+        async def run(self, request: NodeExecutionRequest) -> NodeExecutionResult:
+            self.prompts[request.task.id] = request.prompt
+            self.requests[request.task.id] = request
+            if request.task.id == "source" and request.attempt_no == 1:
+                return NodeExecutionResult(
+                    success=False,
+                    return_code=1,
+                    final_message="",
+                    session_id=f"session-{request.instance_id}",
+                    error="stream disconnected before completion",
+                    termination_reason=NodeExecutionTerminationReason.NONZERO_EXIT,
+                    failure_kind=NodeExecutionFailureKind.EXTERNAL_PROTOCOL,
+                    failure_summary="stream disconnected before completion",
+                    resume_recommended=True,
+                )
+            (request.attempt_dir / "final.md").write_text(
+                f"{request.task.id} complete\n",
+                encoding="utf-8",
+            )
+            return NodeExecutionResult(
+                success=True,
+                return_code=0,
+                final_message=f"{request.task.id} complete",
+                session_id=f"session-{request.instance_id}",
+            )
+
+    service = RunService(store, RecoverableFailureRunner())
+    run = asyncio.run(
+        service.start_run(
+            roots=["worker"],
+            labels=[],
+            user_inputs=None,
+        )
+    )
+
+    source = _instance_for_task(run, "source")
+    worker = _instance_for_task(run, "worker")
+    assert run.status is RunStatus.FAILED
+    assert source.status is RunInstanceStatus.FAILED
+    assert source.resume_recommended is True
+    assert worker.status is RunInstanceStatus.SKIPPED
+
+    resumed = asyncio.run(service.resume_run(run.id))
+    source_after = _instance_for_task(resumed, "source")
+    worker_after = _instance_for_task(resumed, "worker")
+
+    assert resumed.status is RunStatus.DONE
+    assert source_after.instance_id == source.instance_id
+    assert source_after.status is RunInstanceStatus.DONE
+    assert source_after.attempt == 2
+    assert worker_after.status is RunInstanceStatus.DONE
+    assert worker_after.attempt == 1
+
+
+def test_run_execution_does_not_mutate_task_pool_status(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+
+    run = asyncio.run(
+        RunService(store, FakeRunner()).start_run(
+            roots=["worker"],
+            labels=[],
+            user_inputs=None,
+        )
+    )
+
+    assert run.status is RunStatus.DONE
+    assert store.get_task("worker").status is TaskStatus.READY
 
 
 def test_run_service_materializes_context_dependencies(tmp_path: Path) -> None:

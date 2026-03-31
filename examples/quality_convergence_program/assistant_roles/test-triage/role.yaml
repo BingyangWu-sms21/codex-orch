@@ -1,0 +1,19 @@
+id: test-triage
+title: Test Triage Assistant
+description: Helps diagnose failures and choose the most informative next test strategy.
+backend: codex_cli
+sandbox: workspace-write
+instructions: instructions.md
+managed_assets:
+  - preferences.yaml
+policy:
+  request_kinds:
+    - clarification
+    - question
+  decision_kinds:
+    - recovery
+    - review
+    - scope
+  task_labels_any:
+    - quality
+    - testing

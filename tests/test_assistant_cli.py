@@ -11,6 +11,7 @@ from codex_orch.domain import (
     InterruptAudience,
     InterruptReplyKind,
     DecisionKind,
+    ProjectSpec,
     RequestKind,
     RequestPriority,
     TaskSpec,
@@ -211,6 +212,130 @@ def test_project_init_preserves_existing_assistant_operating_model(tmp_path) -> 
 
     assert result.exit_code == 0
     assert operating_model_path.read_text(encoding="utf-8") == "custom operating model\n"
+
+
+def test_project_validate_cli_rejects_incompatible_output_schema(tmp_path) -> None:
+    store = build_test_store(tmp_path)
+    schema_dir = store.paths.root / "schemas"
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    (schema_dir / "bad-result.schema.json").write_text(
+        json.dumps(
+            {
+                "type": "object",
+                "required": ["summary"],
+                "properties": {
+                    "summary": {"type": "string"},
+                    "details": {"type": "string"},
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            result_schema="schemas/bad-result.schema.json",
+            publish=["final.md", "result.json"],
+        )
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["project", "validate", str(store.paths.root), "--json"],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["blocking"] is False
+    assert payload["warnings"]
+    assert any("missing details" in issue["message"] for issue in payload["warnings"])
+
+
+def test_project_validate_cli_rejects_path_bound_input_with_whitespace(tmp_path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_project(
+        ProjectSpec(
+            name="test-program",
+            workspace="${inputs.brief}",
+            default_agent="default",
+            default_sandbox="read-only",
+            user_inputs={"brief": "inputs/brief.md"},
+            max_concurrency=2,
+        )
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["project", "validate", str(store.paths.root), "--json"],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["blocking"] is True
+    assert any(
+        "leading or trailing whitespace" in issue["message"]
+        for issue in payload["errors"]
+    )
+
+
+def test_run_start_cli_allows_output_schema_warnings(tmp_path) -> None:
+    store = build_test_store(tmp_path)
+    schema_dir = store.paths.root / "schemas"
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    (schema_dir / "warn-result.schema.json").write_text(
+        json.dumps(
+            {
+                "type": "object",
+                "required": ["summary"],
+                "properties": {
+                    "summary": {"type": "string"},
+                    "details": {"type": "string"},
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            result_schema="schemas/warn-result.schema.json",
+            publish=["final.md", "result.json"],
+        )
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "start",
+            str(store.paths.root),
+            "--root",
+            "worker",
+            "--no-wait",
+        ],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip()
+    assert "missing details" in (result.stdout + getattr(result, "stderr", ""))
 
 
 def test_interrupt_recommend_cli_returns_role_and_policy(tmp_path) -> None:

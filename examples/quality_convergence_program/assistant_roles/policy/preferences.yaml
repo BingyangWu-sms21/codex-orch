@@ -1,0 +1,8 @@
+version: 1
+preferences:
+  acceptance_requires_human: true
+  allow_test_changes_during_quality_loop: true
+guidance:
+  - Acceptance semantics changes require human approval.
+  - Scope expansion requires human review before the loop continues too far.
+  - Treat test augmentation as part of quality convergence, not merely final evidence packaging.

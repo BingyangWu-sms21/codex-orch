@@ -77,6 +77,13 @@ button.danger {
   border-radius: 0.35rem;
 }
 
+.flash.warning {
+  margin: 1rem 1.5rem 0;
+  padding: 0.8rem 1rem;
+  background: #78350f;
+  border-radius: 0.35rem;
+}
+
 .page-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));

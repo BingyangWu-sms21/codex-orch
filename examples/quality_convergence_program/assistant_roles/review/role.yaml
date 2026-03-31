@@ -1,0 +1,18 @@
+id: review
+title: Quality Review Assistant
+description: Reviews the breadth of changes and whether the available evidence is strong enough to stop the loop.
+backend: codex_cli
+sandbox: workspace-write
+instructions: instructions.md
+managed_assets:
+  - preferences.yaml
+policy:
+  request_kinds:
+    - clarification
+    - approval
+  decision_kinds:
+    - review
+    - sequencing
+  task_labels_any:
+    - quality
+    - testing

@@ -75,7 +75,6 @@ def write_assistant_role(
     )
     store.get_assistant_role_workspace_dir(role_id)
 
-
 def sample_task(task_id: str, *, title: str, agent: str = "default") -> TaskSpec:
     return TaskSpec(
         id=task_id,
@@ -84,3 +83,9 @@ def sample_task(task_id: str, *, title: str, agent: str = "default") -> TaskSpec
         status=TaskStatus.READY,
         publish=["final.md"],
     )
+
+
+def instance_for_task(run, task_id: str):
+    matches = [instance for instance in run.instances.values() if instance.task_id == task_id]
+    assert len(matches) == 1
+    return matches[0]

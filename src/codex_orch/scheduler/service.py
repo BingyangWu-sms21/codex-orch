@@ -19,6 +19,7 @@ from codex_orch.domain import (
     InterruptReplyKind,
     InterruptStatus,
     LoopAction,
+    NodeExecutionFailureKind,
     NodeExecutionRuntime,
     NodeExecutionTerminationReason,
     ProjectSpec,
@@ -33,7 +34,6 @@ from codex_orch.domain import (
     TaskControlMode,
     TaskKind,
     TaskSpec,
-    TaskStatus,
 )
 from codex_orch.input_values import JsonValue, render_input_template
 from codex_orch.runner import NodeExecutionRequest, NodeExecutionResult, TaskRunner
@@ -232,7 +232,9 @@ class RunService:
                 instance.waiting_reason = None
                 instance.finished_at = finished_at
                 instance.termination_reason = NodeExecutionTerminationReason.TERMINATED
-                self._set_task_pool_status(instance.task_id, TaskStatus.FAILED)
+                instance.failure_kind = NodeExecutionFailureKind.UNKNOWN
+                instance.failure_summary = "run aborted by user"
+                instance.resume_recommended = False
             run.status = RunStatus.FAILED
             self.store.save_run(run)
             return run
@@ -244,6 +246,13 @@ class RunService:
             for instance in run.instances.values()
         ):
             return run
+        lock = self._run_lock(run_id)
+        async with lock:
+            run = self.store.get_run(run_id)
+            if self._requeue_recoverable_instances(run):
+                self._refresh_runnable_instances(run)
+                self._finalize_run_state(run)
+                self.store.save_run(run)
         return await self.run_snapshot(run_id)
 
     async def run_snapshot(self, run_id: str) -> RunRecord:
@@ -328,10 +337,13 @@ class RunService:
             instance.status = RunInstanceStatus.RUNNING
             instance.waiting_reason = None
             instance.error = None
+            instance.failure_kind = None
+            instance.failure_summary = None
+            instance.resume_recommended = False
             instance.attempt = next_attempt
             instance.termination_reason = None
             instance.started_at = datetime.now(UTC).isoformat()
-            self._set_task_pool_status(instance.task_id, TaskStatus.RUNNING)
+            instance.finished_at = None
             self.store.append_event(
                 run.id,
                 "attempt_started",
@@ -363,6 +375,9 @@ class RunService:
             task = run.tasks[instance.task_id]
             instance.finished_at = datetime.now(UTC).isoformat()
             instance.termination_reason = self._result_termination_reason(result)
+            instance.failure_kind = result.failure_kind
+            instance.failure_summary = result.failure_summary
+            instance.resume_recommended = result.resume_recommended
             if result.session_id is not None:
                 instance.session_id = result.session_id
 
@@ -374,7 +389,6 @@ class RunService:
                 instance.status = RunInstanceStatus.WAITING
                 instance.waiting_reason = RunInstanceWaitReason.INTERRUPTS_PENDING
                 instance.error = "interrupt replies are still pending"
-                self._set_task_pool_status(instance.task_id, TaskStatus.BLOCKED)
                 self.store.append_event(
                     run.id,
                     "instance_waiting",
@@ -396,16 +410,24 @@ class RunService:
                         instance.attempt,
                     )
                 except ValueError as exc:
-                    instance.status = RunInstanceStatus.FAILED
-                    instance.waiting_reason = None
-                    instance.error = str(exc)
                     self.store.delete_instance_result(run.id, instance_id)
-                    self._set_task_pool_status(instance.task_id, TaskStatus.FAILED)
+                    self._mark_instance_failed(
+                        run,
+                        instance_id,
+                        error=str(exc),
+                        termination_reason=NodeExecutionTerminationReason.NONZERO_EXIT,
+                        finished_at=instance.finished_at or datetime.now(UTC).isoformat(),
+                        failure_kind=NodeExecutionFailureKind.TASK_RUNTIME,
+                        failure_summary=str(exc),
+                        resume_recommended=False,
+                    )
                 else:
                     instance.status = RunInstanceStatus.DONE
                     instance.waiting_reason = None
                     instance.error = None
-                    self._set_task_pool_status(instance.task_id, TaskStatus.DONE)
+                    instance.failure_kind = None
+                    instance.failure_summary = None
+                    instance.resume_recommended = False
                     self.store.append_event(
                         run.id,
                         "instance_done",
@@ -413,16 +435,16 @@ class RunService:
                         payload={"task_id": instance.task_id},
                     )
             else:
-                instance.status = RunInstanceStatus.FAILED
-                instance.waiting_reason = None
-                instance.error = result.error
                 self.store.delete_instance_result(run.id, instance_id)
-                self._set_task_pool_status(instance.task_id, TaskStatus.FAILED)
-                self.store.append_event(
-                    run.id,
-                    "instance_failed",
-                    instance_id=instance_id,
-                    payload={"error": result.error},
+                self._mark_instance_failed(
+                    run,
+                    instance_id,
+                    error=result.error or "codex exec failed",
+                    termination_reason=instance.termination_reason,
+                    finished_at=instance.finished_at or datetime.now(UTC).isoformat(),
+                    failure_kind=result.failure_kind,
+                    failure_summary=result.failure_summary,
+                    resume_recommended=result.resume_recommended,
                 )
 
             self.store.append_event(
@@ -433,6 +455,13 @@ class RunService:
                     "attempt": instance.attempt,
                     "termination_reason": instance.termination_reason.value,
                     "success": result.success,
+                    "failure_kind": (
+                        None
+                        if instance.failure_kind is None
+                        else instance.failure_kind.value
+                    ),
+                    "failure_summary": instance.failure_summary,
+                    "resume_recommended": instance.resume_recommended,
                 },
             )
             self.store.save_run(run)
@@ -565,6 +594,9 @@ class RunService:
                 instance.status = RunInstanceStatus.RUNNABLE
                 instance.waiting_reason = None
                 instance.error = None
+                instance.failure_kind = None
+                instance.failure_summary = None
+                instance.resume_recommended = False
                 self.store.append_event(
                     run.id,
                     "instance_resumed",
@@ -572,17 +604,28 @@ class RunService:
                     payload={"task_id": instance.task_id},
                 )
                 continue
+            if (
+                instance.status is RunInstanceStatus.SKIPPED
+                and instance.error == "upstream dependency failed"
+            ):
+                if self._dependency_failed(run, instance):
+                    continue
+                instance.status = RunInstanceStatus.PENDING
+                instance.waiting_reason = None
+                instance.error = None
             if instance.status is not RunInstanceStatus.PENDING:
                 continue
             if self._dependency_failed(run, instance):
                 instance.status = RunInstanceStatus.SKIPPED
                 instance.waiting_reason = None
                 instance.error = "upstream dependency failed"
-                self._set_task_pool_status(instance.task_id, TaskStatus.BLOCKED)
                 continue
             if self._dependencies_satisfied(run, instance, task):
                 instance.status = RunInstanceStatus.RUNNABLE
                 instance.waiting_reason = None
+                instance.failure_kind = None
+                instance.failure_summary = None
+                instance.resume_recommended = False
                 self.store.append_event(
                     run.id,
                     "instance_runnable",
@@ -1040,6 +1083,9 @@ class RunService:
         error: str,
         termination_reason: NodeExecutionTerminationReason,
         finished_at: str,
+        failure_kind: NodeExecutionFailureKind | None = None,
+        failure_summary: str | None = None,
+        resume_recommended: bool = False,
     ) -> None:
         instance = run.instances[instance_id]
         instance.status = RunInstanceStatus.FAILED
@@ -1047,12 +1093,24 @@ class RunService:
         instance.error = error
         instance.finished_at = finished_at
         instance.termination_reason = termination_reason
-        self._set_task_pool_status(instance.task_id, TaskStatus.FAILED)
+        instance.failure_kind = (
+            NodeExecutionFailureKind.UNKNOWN
+            if failure_kind is None
+            else failure_kind
+        )
+        instance.failure_summary = failure_summary or error
+        instance.resume_recommended = resume_recommended
         self.store.append_event(
             run.id,
             "instance_failed",
             instance_id=instance_id,
-            payload={"error": error, "termination_reason": termination_reason.value},
+            payload={
+                "error": error,
+                "termination_reason": termination_reason.value,
+                "failure_kind": instance.failure_kind.value,
+                "failure_summary": instance.failure_summary,
+                "resume_recommended": instance.resume_recommended,
+            },
         )
 
     def _reconcile_finished_runtime(
@@ -1066,13 +1124,15 @@ class RunService:
         termination_reason = self._resolve_runtime_termination_reason(runtime)
         instance.finished_at = runtime.finished_at
         instance.termination_reason = termination_reason
+        instance.failure_kind = runtime.failure_kind
+        instance.failure_summary = runtime.failure_summary
+        instance.resume_recommended = runtime.resume_recommended
         if termination_reason is NodeExecutionTerminationReason.COMPLETED:
             blocking_interrupts = self._refresh_instance_interrupts(run.id, instance)
             if blocking_interrupts:
                 instance.status = RunInstanceStatus.WAITING
                 instance.waiting_reason = RunInstanceWaitReason.INTERRUPTS_PENDING
                 instance.error = "interrupt replies are still pending"
-                self._set_task_pool_status(instance.task_id, TaskStatus.BLOCKED)
                 return
             try:
                 self._materialize_instance_result(
@@ -1095,20 +1155,28 @@ class RunService:
                     error=str(exc),
                     termination_reason=NodeExecutionTerminationReason.NONZERO_EXIT,
                     finished_at=runtime.finished_at or datetime.now(UTC).isoformat(),
+                    failure_kind=NodeExecutionFailureKind.TASK_RUNTIME,
+                    failure_summary=str(exc),
+                    resume_recommended=False,
                 )
             else:
                 instance.status = RunInstanceStatus.DONE
                 instance.waiting_reason = None
                 instance.error = None
-                self._set_task_pool_status(instance.task_id, TaskStatus.DONE)
+                instance.failure_kind = None
+                instance.failure_summary = None
+                instance.resume_recommended = False
             return
         self.store.delete_instance_result(run.id, instance_id)
         self._mark_instance_failed(
             run,
             instance_id,
-            error=self._termination_reason_message(termination_reason),
+            error=runtime.failure_summary or self._termination_reason_message(termination_reason),
             termination_reason=termination_reason,
             finished_at=runtime.finished_at or datetime.now(UTC).isoformat(),
+            failure_kind=runtime.failure_kind,
+            failure_summary=runtime.failure_summary,
+            resume_recommended=runtime.resume_recommended,
         )
 
     def _resolve_runtime_termination_reason(
@@ -1122,6 +1190,31 @@ class RunService:
         if runtime.return_code is not None and runtime.return_code < 0:
             return NodeExecutionTerminationReason.TERMINATED
         return NodeExecutionTerminationReason.NONZERO_EXIT
+
+    def _requeue_recoverable_instances(self, run: RunRecord) -> bool:
+        changed = False
+        for instance in run.instances.values():
+            if instance.status is not RunInstanceStatus.FAILED:
+                continue
+            if not instance.resume_recommended:
+                continue
+            instance.status = RunInstanceStatus.RUNNABLE
+            instance.waiting_reason = None
+            instance.error = None
+            instance.started_at = None
+            instance.finished_at = None
+            instance.termination_reason = None
+            instance.failure_kind = None
+            instance.failure_summary = None
+            instance.resume_recommended = False
+            self.store.append_event(
+                run.id,
+                "instance_requeued",
+                instance_id=instance.instance_id,
+                payload={"task_id": instance.task_id, "from_status": "failed"},
+            )
+            changed = True
+        return changed
 
     def _result_termination_reason(
         self,
@@ -1708,11 +1801,6 @@ class RunService:
             seen.add(resolved_root)
             resolved_roots.append(resolved_root)
         return resolved_roots
-
-    def _set_task_pool_status(self, task_id: str, status: TaskStatus) -> None:
-        task = self.store.get_task(task_id)
-        updated = task.model_copy(update={"status": status})
-        self.store.save_task(updated)
 
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         lock = self._run_locks.get(run_id)
