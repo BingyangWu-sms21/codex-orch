@@ -49,9 +49,12 @@ codex-orch run show . <run-id> --json
 ```bash
 codex-orch run start . --root <task-id>
 codex-orch run resume . <run-id>
+codex-orch run retry-instance . <run-id> <instance-id>
 codex-orch run reconcile . <run-id> --json
 codex-orch run abort . <run-id> --json
 ```
+
+`run resume` retries instances where `resume_recommended=true`. If it prints a warning listing skipped instances, fix the root cause first, then use `run retry-instance` to force-retry the specific failed instance.
 
 ## Inbox control
 

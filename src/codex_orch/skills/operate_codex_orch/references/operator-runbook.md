@@ -82,6 +82,7 @@ Common failure patterns:
 - published artifact missing: inspect attempt prompt, outputs, and instance `published/`
 - reply schema mismatch: assistant reply may fail validation and the interrupt remains unresolved
 - human handoff blocked by policy: task `interaction_policy` may disallow human fallback
+- output_schema rejection: a task `result_schema` uses a construct the OpenAI structured-outputs API rejects (e.g. `const` without `type`); `run resume` will print a warning listing the skipped instance — fix the schema, then use `run retry-instance`
 
 ## Stuck run checklist
 
@@ -91,3 +92,14 @@ Common failure patterns:
 4. Inspect the latest attempt's `runtime.json`, `events.jsonl`, and `stderr.log`.
 5. Inspect `.runs/<run-id>/proposals/` if the assistant suggested authoring changes.
 6. Decide whether to reply, resume, edit the repo manually, or abort the run.
+
+### Instance failed with `resume_recommended=false`
+
+`run resume` skips these instances and prints a warning. To recover:
+
+1. Run `codex-orch project validate . --json` — if `blocking: true`, fix the reported schema errors first.
+2. Force-retry the instance after fixing the root cause:
+
+```bash
+codex-orch run retry-instance . <run-id> <instance-id>
+```
