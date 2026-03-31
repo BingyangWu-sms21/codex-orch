@@ -20,6 +20,7 @@ class OutputSchemaCompatibilityWarning:
     code: str
     object_path: str
     message: str
+    severity: str = "warning"
 
 
 def load_json_schema(path: Path) -> JsonValue:
@@ -271,6 +272,7 @@ def _collect_output_schema_compatibility_warnings(
                 code="output_schema.const_missing_type",
                 object_path=object_path,
                 message="schemas using `const` should declare an explicit `type`",
+                severity="error",
             )
         )
     if "enum" in node and "type" not in node:
@@ -279,6 +281,7 @@ def _collect_output_schema_compatibility_warnings(
                 code="output_schema.enum_missing_type",
                 object_path=object_path,
                 message="schemas using `enum` should declare an explicit `type`",
+                severity="error",
             )
         )
 

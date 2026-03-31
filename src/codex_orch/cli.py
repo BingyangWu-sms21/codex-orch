@@ -30,6 +30,7 @@ from codex_orch.domain import (
     TaskSpec,
     TaskStatus,
 )
+from codex_orch.domain.runtime import RunInstanceStatus
 from codex_orch.input_values import JsonValue, parse_json_input_override
 from codex_orch.runner import CodexExecRunner
 from codex_orch.scheduler import RunService
@@ -554,6 +555,30 @@ def run_start(
 @run_app.command("resume")
 def run_resume(program_dir: Path, run_id: str) -> None:
     run = asyncio.run(_run_service(program_dir).resume_run(run_id))
+    typer.echo(run.id)
+    skipped = [
+        inst for inst in run.instances.values()
+        if inst.status is RunInstanceStatus.FAILED and not inst.resume_recommended
+    ]
+    if skipped:
+        typer.echo(
+            f"Warning: {len(skipped)} instance(s) were not retried (resume_recommended=False):",
+            err=True,
+        )
+        for inst in skipped:
+            typer.echo(
+                f"  {inst.instance_id} ({inst.task_id}): {inst.failure_kind}\n"
+                f"    → codex-orch run retry-instance {program_dir} {run_id} {inst.instance_id}",
+                err=True,
+            )
+
+
+@run_app.command("retry-instance")
+def run_retry_instance(program_dir: Path, run_id: str, instance_id: str) -> None:
+    """Force retry a failed instance regardless of resume_recommended."""
+    run = asyncio.run(
+        _run_service(program_dir).force_retry_instance(run_id, instance_id)
+    )
     typer.echo(run.id)
 
 

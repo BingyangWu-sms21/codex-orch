@@ -255,6 +255,35 @@ class RunService:
                 self.store.save_run(run)
         return await self.run_snapshot(run_id)
 
+    async def force_retry_instance(
+        self, run_id: str, instance_id: str
+    ) -> RunRecord:
+        run = self.store.get_run(run_id)
+        instance = run.instances.get(instance_id)
+        if instance is None:
+            raise ValueError(f"Instance {instance_id!r} not found in run {run_id!r}")
+        if instance.status is not RunInstanceStatus.FAILED:
+            raise ValueError(
+                f"Instance {instance_id!r} has status {instance.status!r}, expected 'failed'"
+            )
+        instance.status = RunInstanceStatus.RUNNABLE
+        instance.waiting_reason = None
+        instance.error = None
+        instance.started_at = None
+        instance.finished_at = None
+        instance.termination_reason = None
+        instance.failure_kind = None
+        instance.failure_summary = None
+        instance.resume_recommended = False
+        self.store.append_event(
+            run.id,
+            "instance_requeued",
+            instance_id=instance.instance_id,
+            payload={"task_id": instance.task_id, "from_status": "failed", "forced": True},
+        )
+        self.store.save_run(run)
+        return await self.resume_run(run_id)
+
     async def run_snapshot(self, run_id: str) -> RunRecord:
         while True:
             lock = self._run_lock(run_id)

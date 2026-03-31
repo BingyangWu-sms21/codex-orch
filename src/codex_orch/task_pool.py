@@ -350,10 +350,12 @@ class TaskPoolService:
                     )
                 )
                 continue
-            warnings.extend(
-                self._schema_warning_issue(task.id, task.result_schema, item)
-                for item in compatibility_warnings
-            )
+            for item in compatibility_warnings:
+                issue = self._schema_warning_issue(task.id, task.result_schema, item)
+                if issue.severity == "error":
+                    errors.append(issue)
+                else:
+                    warnings.append(issue)
         return errors, warnings
 
     def _validate_path_bound_inputs(
@@ -431,7 +433,7 @@ class TaskPoolService:
         warning: OutputSchemaCompatibilityWarning,
     ) -> ProgramValidationIssue:
         return ProgramValidationIssue(
-            severity="warning",
+            severity=warning.severity,
             code=warning.code,
             message=warning.message,
             location=(
