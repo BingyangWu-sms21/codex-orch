@@ -17,6 +17,7 @@ from codex_orch.domain import (
     ControlActionKind,
     ResolutionKind,
 )
+from codex_orch.input_values import ensure_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,9 @@ def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
                 "enum": [level.value for level in ConfidenceLevel],
             },
             "citations": {"type": "array", "items": {"type": "string"}},
+            "payload": {
+                "type": "object",
+            },
             "proposed_updates": {
                 "type": "array",
                 "items": {
@@ -120,6 +124,7 @@ def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
             "rationale",
             "confidence",
             "citations",
+            "payload",
             "proposed_updates",
             "proposed_control_actions",
         ],
@@ -160,6 +165,10 @@ class CodexCliAssistantBackend:
             rationale=payload["rationale"],
             confidence=ConfidenceLevel(payload["confidence"]),
             citations=tuple(payload.get("citations", [])),
+            payload=ensure_json_object(
+                payload.get("payload", {}),
+                field_name="assistant payload",
+            ),
             proposed_updates=_parse_proposed_updates(payload.get("proposed_updates", [])),
             proposed_control_actions=tuple(
                 ControlActionKind(raw)
@@ -325,6 +334,18 @@ class CodexCliAssistantBackend:
             or "{}",
             "```",
         ]
+        reply_schema_sections: list[str] = []
+        if request.reply_schema_path is not None:
+            schema_text = request.reply_schema_path.read_text(encoding="utf-8").strip()
+            reply_schema_sections = [
+                "# Reply Payload Schema",
+                f"Reply payload path: `{request.reply_schema_path}`",
+                (
+                    schema_text
+                    if schema_text
+                    else "(reply schema file exists but is empty)"
+                ),
+            ]
         sections = [
             "# Assistant Operating Model",
             shared_operating_model or "(assistant operating model missing content)",
@@ -342,6 +363,7 @@ class CodexCliAssistantBackend:
             "\n".join(accessible_paths),
             "# Assistant Request",
             request.assistant_request.question.strip(),
+            *reply_schema_sections,
             "# Artifact Context",
             "\n\n".join(artifact_sections)
             if artifact_sections
@@ -357,6 +379,11 @@ class CodexCliAssistantBackend:
                         else "Human handoff is not allowed for this task. Always return resolution_kind=auto_reply."
                     ),
                     "Keep citations grounded in the provided artifacts or stable repo/user guidance paths.",
+                    (
+                        "Set payload to a JSON object matching the reply payload schema above."
+                        if request.reply_schema_path is not None
+                        else "Set payload to a JSON object. Use `{}` when no structured payload is needed."
+                    ),
                     "Use proposed_updates for repository-facing update proposals about instructions, managed assets, or routing policy.",
                     "Keep proposed_control_actions empty unless a control-plane action is truly necessary.",
                     "Treat proposed_updates and proposed_control_actions as proposals only; codex-orch records them but does not execute them automatically.",

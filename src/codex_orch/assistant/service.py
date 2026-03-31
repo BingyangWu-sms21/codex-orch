@@ -124,6 +124,11 @@ class AssistantWorkerService:
                 artifacts=tuple(self._load_artifacts(record)),
                 allow_human_handoff=task.interaction_policy.allow_human,
                 shared_operating_model_path=shared_operating_model_path,
+                reply_schema_path=(
+                    None
+                    if record.interrupt.reply_schema is None
+                    else self.store.paths.root / record.interrupt.reply_schema
+                ),
             )
             backend = self._resolve_backend(role.spec.backend)
             result = backend.respond(backend_request)
@@ -146,7 +151,7 @@ class AssistantWorkerService:
                     audience=InterruptAudience.ASSISTANT,
                     reply_kind=InterruptReplyKind.ANSWER,
                     text=result.answer,
-                    payload={},
+                    payload=result.payload,
                     rationale=result.rationale,
                     confidence=result.confidence,
                     citations=list(result.citations),
@@ -164,7 +169,7 @@ class AssistantWorkerService:
                 audience=InterruptAudience.ASSISTANT,
                 reply_kind=InterruptReplyKind.HANDOFF_TO_HUMAN,
                 text=result.answer,
-                payload={},
+                payload=result.payload,
                 rationale=result.rationale,
                 confidence=result.confidence,
                 citations=list(result.citations),

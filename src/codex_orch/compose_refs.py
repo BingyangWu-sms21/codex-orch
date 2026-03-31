@@ -30,6 +30,8 @@ class ComposeRefKind(StrEnum):
     DEP_RESULT = "dep_result"
     DEP_ARTIFACT = "dep_artifact"
     INPUT = "input"
+    RUNTIME_REPLIES = "runtime_replies"
+    RUNTIME_LATEST_REPLY = "runtime_latest_reply"
 
 
 @dataclass(frozen=True)
@@ -88,7 +90,19 @@ def parse_compose_ref(raw_ref: str) -> ParsedComposeRef:
             input_key=input_key,
         )
 
+    if normalized == "runtime.replies":
+        return ParsedComposeRef(
+            raw=normalized,
+            kind=ComposeRefKind.RUNTIME_REPLIES,
+        )
+    if normalized == "runtime.latest_reply":
+        return ParsedComposeRef(
+            raw=normalized,
+            kind=ComposeRefKind.RUNTIME_LATEST_REPLY,
+        )
+
     raise ValueError(
         "compose.ref must start with deps.<scope>.result, "
-        "deps.<scope>.artifacts.<relative-path>, or inputs.<key>"
+        "deps.<scope>.artifacts.<relative-path>, inputs.<key>, "
+        "runtime.replies, or runtime.latest_reply"
     )

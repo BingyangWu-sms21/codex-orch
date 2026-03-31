@@ -6,6 +6,8 @@ from pathlib import PurePosixPath
 
 from pydantic import BaseModel, Field, model_validator
 
+from codex_orch.input_values import ensure_json_object
+
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -273,6 +275,7 @@ class AssistantResponse(BaseModel):
     rationale: str
     confidence: ConfidenceLevel = ConfidenceLevel.MEDIUM
     citations: list[str] = Field(default_factory=list)
+    payload: dict[str, object] = Field(default_factory=dict)
     proposed_updates: list[AssistantUpdateProposal] = Field(default_factory=list)
     proposed_control_actions: list[ControlActionKind] = Field(default_factory=list)
     created_at: str = Field(default_factory=_utc_now_iso)
@@ -285,6 +288,11 @@ class AssistantResponse(BaseModel):
             raise ValueError("answer must not be empty")
         if not self.rationale.strip():
             raise ValueError("rationale must not be empty")
+        object.__setattr__(
+            self,
+            "payload",
+            ensure_json_object(self.payload, field_name="payload"),
+        )
         return self
 
 

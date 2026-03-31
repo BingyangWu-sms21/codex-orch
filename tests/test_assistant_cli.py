@@ -134,6 +134,40 @@ def test_interrupt_cli_round_trip(tmp_path) -> None:
     assert record["reply"] is None
 
 
+def test_run_start_cli_accepts_json_input_override(tmp_path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            compose=[{"kind": "ref", "ref": "inputs.config"}],
+            publish=["final.md"],
+        )
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "start",
+            str(store.paths.root),
+            "--root",
+            "worker",
+            "--input-json",
+            'config={"limit":2,"enabled":true}',
+            "--no-wait",
+        ],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+
+    assert result.exit_code == 0
+    run = store.get_run(result.stdout.strip())
+    assert run.user_inputs["config"] == {"limit": 2, "enabled": True}
+
+
 def test_project_init_scaffolds_assistant_operating_model(tmp_path) -> None:
     program_dir = tmp_path / "program"
     workspace = tmp_path / "workspace"
@@ -296,6 +330,100 @@ def test_inbox_reply_cli_round_trip(tmp_path) -> None:
     record = store.find_interrupt(interrupt["interrupt_id"])
     assert record.reply is not None
     assert record.reply.text == "Delete it."
+
+
+def test_inbox_reply_cli_accepts_payload_and_validates_reply_schema(tmp_path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    schema_dir = store.paths.root / "schemas"
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    (schema_dir / "reply.json").write_text(
+        json.dumps(
+            {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": ["decision"],
+                "additionalProperties": False,
+                "properties": {
+                    "decision": {
+                        "type": "string",
+                        "enum": ["delete", "keep_wrapper"],
+                    }
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    instance = _instance_for_task(run, "worker")
+    interrupt = store.create_interrupt(
+        run_id=run.id,
+        instance_id=instance.instance_id,
+        audience=InterruptAudience.HUMAN,
+        blocking=True,
+        request_kind=RequestKind.CLARIFICATION,
+        question="Should I delete the wrapper?",
+        decision_kind=DecisionKind.POLICY,
+        options=["delete", "keep_wrapper"],
+        context_artifacts=[],
+        reply_schema="schemas/reply.json",
+        priority=RequestPriority.NORMAL,
+        metadata={},
+    )
+    runner = CliRunner()
+
+    bad_result = runner.invoke(
+        app,
+        [
+            "inbox",
+            "reply",
+            str(store.paths.root),
+            interrupt.interrupt_id,
+            "--text",
+            "Delete it.",
+            "--payload-json",
+            "{}",
+            "--json",
+        ],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+    assert bad_result.exit_code != 0
+
+    reply_result = runner.invoke(
+        app,
+        [
+            "inbox",
+            "reply",
+            str(store.paths.root),
+            interrupt.interrupt_id,
+            "--text",
+            "Delete it.",
+            "--payload-json",
+            '{"decision":"delete"}',
+            "--json",
+        ],
+        env={"CODEX_ORCH_GLOBAL_ROOT": str(store.global_paths.root)},
+    )
+
+    assert reply_result.exit_code == 0
+    payload = json.loads(reply_result.stdout)
+    assert payload["payload"] == {"decision": "delete"}
 
 
 def test_assistant_doc_install_cli_writes_program_copy(tmp_path) -> None:

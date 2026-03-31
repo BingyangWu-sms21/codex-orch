@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from codex_orch.compose_refs import ComposeRefKind, parse_compose_ref
-from codex_orch.domain import ComposeStepKind, RunInstanceState, RunRecord
+from codex_orch.domain import (
+    ComposeStepKind,
+    InterruptStatus,
+    RunInstanceState,
+    RunRecord,
+)
+from codex_orch.input_values import JsonValue
 from codex_orch.prompt_context import (
     StagedPromptFile,
     ensure_staged_compose_program_file,
@@ -76,12 +83,37 @@ class PromptComposer:
             if resolved_input is None:
                 raise ValueError(f"missing run input {parsed.input_key}")
             safe_key = self._safe_ref_segment(parsed.input_key)
-            return ensure_staged_generated_text(
+            return self._stage_json_value(
                 node_dir=node_dir,
                 source_kind="compose_input_ref",
                 source_reference=ref,
-                staged_relative_path=f"context/refs/inputs/{safe_key}.txt",
-                text=resolved_input,
+                staged_relative_prefix=f"context/refs/inputs/{safe_key}",
+                value=resolved_input,
+            )
+        if parsed.kind is ComposeRefKind.RUNTIME_REPLIES:
+            replies = self._resolved_runtime_replies(
+                run_id=run.id,
+                instance_id=instance.instance_id,
+            )
+            return self._stage_json_value(
+                node_dir=node_dir,
+                source_kind="compose_runtime_ref",
+                source_reference=ref,
+                staged_relative_prefix="context/refs/runtime/replies",
+                value=replies,
+            )
+        if parsed.kind is ComposeRefKind.RUNTIME_LATEST_REPLY:
+            replies = self._resolved_runtime_replies(
+                run_id=run.id,
+                instance_id=instance.instance_id,
+            )
+            latest_reply: JsonValue = replies[-1] if replies else None
+            return self._stage_json_value(
+                node_dir=node_dir,
+                source_kind="compose_runtime_ref",
+                source_reference=ref,
+                staged_relative_prefix="context/refs/runtime/latest_reply",
+                value=latest_reply,
             )
 
         assert parsed.scope is not None
@@ -196,8 +228,65 @@ class PromptComposer:
         run: RunRecord,
         input_scope_id: str,
         input_key: str,
-    ) -> str | None:
+    ) -> JsonValue | None:
         input_scope = run.input_scopes[input_scope_id]
         if input_key in input_scope.values:
             return input_scope.values[input_key]
         return run.user_inputs.get(input_key)
+
+    def _stage_json_value(
+        self,
+        *,
+        node_dir: Path,
+        source_kind: str,
+        source_reference: str,
+        staged_relative_prefix: str,
+        value: JsonValue,
+    ) -> StagedPromptFile:
+        if isinstance(value, str):
+            return ensure_staged_generated_text(
+                node_dir=node_dir,
+                source_kind=source_kind,
+                source_reference=source_reference,
+                staged_relative_path=f"{staged_relative_prefix}.txt",
+                text=value,
+            )
+        payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
+        return ensure_staged_generated_text(
+            node_dir=node_dir,
+            source_kind=source_kind,
+            source_reference=source_reference,
+            staged_relative_path=f"{staged_relative_prefix}.json",
+            text=payload,
+        )
+
+    def _resolved_runtime_replies(
+        self,
+        *,
+        run_id: str,
+        instance_id: str,
+    ) -> list[dict[str, object]]:
+        records = [
+            record
+            for record in self.store.list_instance_interrupts(run_id, instance_id)
+            if record.interrupt.status is InterruptStatus.RESOLVED and record.reply is not None
+        ]
+        records.sort(
+            key=lambda record: (
+                record.reply.created_at if record.reply is not None else "",
+                record.interrupt.created_at,
+                record.interrupt.interrupt_id,
+            )
+        )
+        return [
+            {
+                "run_id": record.run_id,
+                "instance_id": record.instance_id,
+                "task_id": record.task_id,
+                "interrupt": record.interrupt.model_dump(mode="json"),
+                "reply": None
+                if record.reply is None
+                else record.reply.model_dump(mode="json"),
+            }
+            for record in records
+        ]

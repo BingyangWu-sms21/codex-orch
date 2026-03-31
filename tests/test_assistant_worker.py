@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from codex_orch.assistant import (
     AssistantBackendResult,
     AssistantRoleRouter,
@@ -162,6 +164,350 @@ def test_assistant_worker_auto_reply_resolves_interrupt_and_resumes_run(tmp_path
     assert records[0].reply.reply_kind is InterruptReplyKind.ANSWER
     assert "Delete it." in runner.prompts["worker"]
     assert backend.requests[0].instance_id == instance.instance_id
+
+
+def test_assistant_worker_validates_structured_payload_against_reply_schema(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    schema_dir = store.paths.root / "schemas"
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    (schema_dir / "reply.json").write_text(
+        """{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["decision"],
+  "additionalProperties": false,
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["delete", "keep_wrapper"]
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    instance = _instance_for_task(run, "worker")
+    recommendation, resolution = AssistantRoleRouter(store).resolve_assistant_target(
+        run_id=run.id,
+        task_id="worker",
+        request_kind=RequestKind.CLARIFICATION,
+        decision_kind=DecisionKind.POLICY,
+        requested_target_role_id=None,
+    )
+    interrupt = store.create_interrupt(
+        run_id=run.id,
+        instance_id=instance.instance_id,
+        audience=InterruptAudience.ASSISTANT,
+        blocking=True,
+        request_kind=RequestKind.CLARIFICATION,
+        question="Can I delete the wrapper?",
+        decision_kind=DecisionKind.POLICY,
+        options=["delete", "keep_wrapper"],
+        context_artifacts=[],
+        reply_schema="schemas/reply.json",
+        priority=RequestPriority.NORMAL,
+        requested_target_role_id=resolution.requested_target_role_id,
+        recommended_target_role_id=recommendation.recommended_target_role_id,
+        resolved_target_role_id=resolution.resolved_target_role_id,
+        target_resolution_reason=resolution.target_resolution_reason,
+        metadata={},
+    )
+
+    worker = AssistantWorkerService(
+        store,
+        backend=StubBackend(
+            AssistantBackendResult(
+                resolution_kind=ResolutionKind.AUTO_REPLY,
+                answer="Delete it.",
+                rationale="The wrapper is stale.",
+                payload={"decision": "delete"},
+            )
+        ),
+        run_service=RunService(store, FakeRunner()),
+    )
+
+    stats = worker.run_once()
+    record = store.find_interrupt(interrupt.interrupt_id)
+
+    assert stats.auto_replied == 1
+    assert record.reply is not None
+    assert record.reply.payload == {"decision": "delete"}
+
+
+def test_assistant_worker_resolves_relative_refs_in_reply_schema(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    schema_dir = store.paths.root / "schemas"
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    (schema_dir / "defs.json").write_text(
+        """{
+  "$defs": {
+    "decision": {
+      "type": "string",
+      "enum": ["delete", "keep_wrapper"]
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    (schema_dir / "reply.json").write_text(
+        """{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["decision"],
+  "additionalProperties": false,
+  "properties": {
+    "decision": {
+      "$ref": "defs.json#/$defs/decision"
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    instance = _instance_for_task(run, "worker")
+    recommendation, resolution = AssistantRoleRouter(store).resolve_assistant_target(
+        run_id=run.id,
+        task_id="worker",
+        request_kind=RequestKind.CLARIFICATION,
+        decision_kind=DecisionKind.POLICY,
+        requested_target_role_id=None,
+    )
+    interrupt = store.create_interrupt(
+        run_id=run.id,
+        instance_id=instance.instance_id,
+        audience=InterruptAudience.ASSISTANT,
+        blocking=True,
+        request_kind=RequestKind.CLARIFICATION,
+        question="Can I delete the wrapper?",
+        decision_kind=DecisionKind.POLICY,
+        options=["delete", "keep_wrapper"],
+        context_artifacts=[],
+        reply_schema="schemas/reply.json",
+        priority=RequestPriority.NORMAL,
+        requested_target_role_id=resolution.requested_target_role_id,
+        recommended_target_role_id=recommendation.recommended_target_role_id,
+        resolved_target_role_id=resolution.resolved_target_role_id,
+        target_resolution_reason=resolution.target_resolution_reason,
+        metadata={},
+    )
+
+    worker = AssistantWorkerService(
+        store,
+        backend=StubBackend(
+            AssistantBackendResult(
+                resolution_kind=ResolutionKind.AUTO_REPLY,
+                answer="Delete it.",
+                rationale="The wrapper is stale.",
+                payload={"decision": "delete"},
+            )
+        ),
+        run_service=RunService(store, FakeRunner()),
+    )
+
+    stats = worker.run_once()
+    record = store.find_interrupt(interrupt.interrupt_id)
+
+    assert stats.auto_replied == 1
+    assert record.reply is not None
+    assert record.reply.payload == {"decision": "delete"}
+
+
+def test_save_interrupt_reply_reports_relative_ref_schema_mismatch_as_value_error(
+    tmp_path: Path,
+) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    schema_dir = store.paths.root / "schemas"
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    (schema_dir / "defs.json").write_text(
+        """{
+  "$defs": {
+    "decision": {
+      "type": "string",
+      "enum": ["delete", "keep_wrapper"]
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    (schema_dir / "reply.json").write_text(
+        """{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["decision"],
+  "additionalProperties": false,
+  "properties": {
+    "decision": {
+      "$ref": "defs.json#/$defs/decision"
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    instance = _instance_for_task(run, "worker")
+    recommendation, resolution = AssistantRoleRouter(store).resolve_assistant_target(
+        run_id=run.id,
+        task_id="worker",
+        request_kind=RequestKind.CLARIFICATION,
+        decision_kind=DecisionKind.POLICY,
+        requested_target_role_id=None,
+    )
+    interrupt = store.create_interrupt(
+        run_id=run.id,
+        instance_id=instance.instance_id,
+        audience=InterruptAudience.ASSISTANT,
+        blocking=True,
+        request_kind=RequestKind.CLARIFICATION,
+        question="Can I delete the wrapper?",
+        decision_kind=DecisionKind.POLICY,
+        options=["delete", "keep_wrapper"],
+        context_artifacts=[],
+        reply_schema="schemas/reply.json",
+        priority=RequestPriority.NORMAL,
+        requested_target_role_id=resolution.requested_target_role_id,
+        recommended_target_role_id=recommendation.recommended_target_role_id,
+        resolved_target_role_id=resolution.resolved_target_role_id,
+        target_resolution_reason=resolution.target_resolution_reason,
+        metadata={},
+    )
+
+    with pytest.raises(ValueError, match="does not match schema"):
+        store.save_interrupt_reply(
+            interrupt.interrupt_id,
+            audience=InterruptAudience.ASSISTANT,
+            reply_kind=InterruptReplyKind.ANSWER,
+            text="Archive it.",
+            payload={"decision": "archive"},
+        )
+
+
+def test_assistant_worker_fails_when_structured_payload_violates_reply_schema(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    schema_dir = store.paths.root / "schemas"
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    (schema_dir / "reply.json").write_text(
+        """{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["decision"],
+  "additionalProperties": false,
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["delete", "keep_wrapper"]
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    instance = _instance_for_task(run, "worker")
+    recommendation, resolution = AssistantRoleRouter(store).resolve_assistant_target(
+        run_id=run.id,
+        task_id="worker",
+        request_kind=RequestKind.CLARIFICATION,
+        decision_kind=DecisionKind.POLICY,
+        requested_target_role_id=None,
+    )
+    interrupt = store.create_interrupt(
+        run_id=run.id,
+        instance_id=instance.instance_id,
+        audience=InterruptAudience.ASSISTANT,
+        blocking=True,
+        request_kind=RequestKind.CLARIFICATION,
+        question="Can I delete the wrapper?",
+        decision_kind=DecisionKind.POLICY,
+        options=["delete", "keep_wrapper"],
+        context_artifacts=[],
+        reply_schema="schemas/reply.json",
+        priority=RequestPriority.NORMAL,
+        requested_target_role_id=resolution.requested_target_role_id,
+        recommended_target_role_id=recommendation.recommended_target_role_id,
+        resolved_target_role_id=resolution.resolved_target_role_id,
+        target_resolution_reason=resolution.target_resolution_reason,
+        metadata={},
+    )
+
+    worker = AssistantWorkerService(
+        store,
+        backend=StubBackend(
+            AssistantBackendResult(
+                resolution_kind=ResolutionKind.AUTO_REPLY,
+                answer="Delete it.",
+                rationale="The wrapper is stale.",
+                payload={},
+            )
+        ),
+        run_service=RunService(store, FakeRunner()),
+    )
+
+    stats = worker.run_once()
+    record = store.find_interrupt(interrupt.interrupt_id)
+
+    assert stats.failed == 1
+    assert record.reply is None
 
 
 def test_assistant_worker_records_valid_proposals(tmp_path: Path) -> None:

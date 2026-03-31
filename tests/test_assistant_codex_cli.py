@@ -70,6 +70,12 @@ def test_assistant_backend_exposes_program_and_run_instances_context(tmp_path: P
     artifact_path = store.paths.root / "context" / "policy.md"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_text("Prefer deleting wrappers.\n", encoding="utf-8")
+    reply_schema_path = store.paths.root / "schemas" / "reply.json"
+    reply_schema_path.parent.mkdir(parents=True, exist_ok=True)
+    reply_schema_path.write_text(
+        '{"type":"object","required":["decision"],"properties":{"decision":{"type":"string"}}}\n',
+        encoding="utf-8",
+    )
 
     run = RunService(store, FakeRunner()).create_snapshot(
         roots=["worker"],
@@ -103,6 +109,7 @@ def test_assistant_backend_exposes_program_and_run_instances_context(tmp_path: P
         artifacts=(artifact,),
         allow_human_handoff=True,
         shared_operating_model_path=store.get_assistant_operating_model_path(),
+        reply_schema_path=reply_schema_path,
     )
 
     prompt = CodexCliAssistantBackend()._build_prompt(backend_request)
@@ -114,6 +121,8 @@ def test_assistant_backend_exposes_program_and_run_instances_context(tmp_path: P
     assert "naming: explicit" in prompt
     assert "Assistant Operating Model" in prompt
     assert "Role Instructions" in prompt
+    assert "Reply Payload Schema" in prompt
+    assert str(reply_schema_path) in prompt
 
 
 def test_assistant_backend_formats_large_and_binary_artifacts(tmp_path: Path) -> None:
@@ -164,6 +173,7 @@ def test_assistant_backend_schema_blocks_handoff_when_human_is_disallowed() -> N
     schema = _assistant_output_schema(allow_human_handoff=False)
 
     assert schema["properties"]["resolution_kind"]["enum"] == ["auto_reply"]
+    assert schema["properties"]["payload"]["type"] == "object"
     assert "proposed_updates" in schema["properties"]
 
 

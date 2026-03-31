@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -13,6 +13,7 @@ from codex_orch.domain import (
     ResolutionKind,
     TaskSpec,
 )
+from codex_orch.input_values import JsonObject
 from codex_orch.prompt_context import StagedPromptFile as AssistantArtifactContext
 from codex_orch.store import ResolvedAssistantRole
 
@@ -28,6 +29,7 @@ class AssistantBackendRequest:
     artifacts: tuple[AssistantArtifactContext, ...]
     allow_human_handoff: bool
     shared_operating_model_path: Path
+    reply_schema_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,7 @@ class AssistantBackendResult:
     rationale: str
     confidence: ConfidenceLevel = ConfidenceLevel.MEDIUM
     citations: tuple[str, ...] = ()
+    payload: JsonObject = field(default_factory=dict)
     proposed_updates: tuple[AssistantUpdateProposal, ...] = ()
     proposed_control_actions: tuple[ControlActionKind, ...] = ()
 

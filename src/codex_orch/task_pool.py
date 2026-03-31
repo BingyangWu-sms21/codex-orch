@@ -224,7 +224,11 @@ class TaskPoolService:
                 if step.kind is not ComposeStepKind.REF or step.ref is None:
                     continue
                 parsed = parse_compose_ref(step.ref)
-                if parsed.kind is ComposeRefKind.INPUT:
+                if parsed.kind in {
+                    ComposeRefKind.INPUT,
+                    ComposeRefKind.RUNTIME_REPLIES,
+                    ComposeRefKind.RUNTIME_LATEST_REPLY,
+                }:
                     continue
                 assert parsed.scope is not None
                 dependency = dependencies_by_scope.get(parsed.scope)

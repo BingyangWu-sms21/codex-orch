@@ -29,11 +29,13 @@ from codex_orch.domain import (
     RunInstanceWaitReason,
     RunRecord,
     RunStatus,
+    RunTaskPathTemplateState,
     TaskControlMode,
     TaskKind,
     TaskSpec,
     TaskStatus,
 )
+from codex_orch.input_values import JsonValue, render_input_template
 from codex_orch.runner import NodeExecutionRequest, NodeExecutionResult, TaskRunner
 from codex_orch.scheduler.composer import PromptComposer
 from codex_orch.store import ProjectStore
@@ -53,14 +55,15 @@ class RunService:
         *,
         roots: list[str],
         labels: list[str],
-        user_inputs: dict[str, str] | None = None,
+        user_inputs: dict[str, JsonValue] | None = None,
     ) -> RunRecord:
         self.task_pool.validate_graph()
-        project = self.store.load_project()
+        raw_project = self.store.load_project()
         selected = self.task_pool.select_subgraph(roots=roots, labels=labels)
         merged_inputs = self.store.load_default_user_inputs()
         if user_inputs is not None:
             merged_inputs.update(user_inputs)
+        project = self._materialize_project(raw_project, merged_inputs)
 
         tasks = self.store.load_task_map()
         resolved_roots = set(roots)
@@ -73,7 +76,7 @@ class RunService:
             input_scope_id=self._new_input_scope_id(),
         )
         materialized_tasks = {
-            task_id: self._materialize_task(project, task)
+            task_id: self._materialize_task(project, task, merged_inputs)
             for task_id, task in selected.items()
         }
         run = RunRecord(
@@ -81,7 +84,15 @@ class RunService:
             roots=sorted(resolved_roots),
             user_inputs=merged_inputs,
             project=project,
+            project_workspace_template=raw_project.workspace,
             tasks=materialized_tasks,
+            task_path_templates={
+                task_id: RunTaskPathTemplateState(
+                    workspace=task.workspace,
+                    extra_writable_roots=list(task.extra_writable_roots),
+                )
+                for task_id, task in selected.items()
+            },
             input_scopes={base_input_scope.input_scope_id: base_input_scope},
             instances={},
         )
@@ -113,7 +124,7 @@ class RunService:
         *,
         roots: list[str],
         labels: list[str],
-        user_inputs: dict[str, str] | None = None,
+        user_inputs: dict[str, JsonValue] | None = None,
     ) -> RunRecord:
         run = self.create_snapshot(
             roots=roots,
@@ -275,15 +286,30 @@ class RunService:
         async with lock:
             run = self.store.get_run(run_id)
             instance = run.instances[instance_id]
-            task = run.tasks[instance.task_id]
             if instance.status is not RunInstanceStatus.RUNNABLE:
                 return
+            project = self._materialize_project_for_input_scope(
+                run,
+                instance.input_scope_id,
+            )
+            task = self._materialize_task_for_input_scope(
+                run,
+                instance.task_id,
+                instance.input_scope_id,
+                project=project,
+            )
             next_attempt = instance.attempt + 1
             attempt_dir = self.store.get_attempt_dir(run_id, instance_id, next_attempt)
             self._materialize_attempt_context(task, attempt_dir)
-            prompt = self._build_attempt_prompt(run, instance, attempt_dir)
-            project_workspace_dir = self._resolve_project_workspace_dir(run.project)
-            workspace_dir = self._resolve_task_workspace_dir(run.project, task)
+            prompt = self._build_attempt_prompt(
+                run,
+                instance,
+                attempt_dir,
+                project=project,
+                task=task,
+            )
+            project_workspace_dir = self._resolve_project_workspace_dir(project)
+            workspace_dir = self._resolve_task_workspace_dir(project, task)
             extra_writable_roots = tuple(
                 Path(root)
                 for root in self._resolve_task_extra_writable_roots(
@@ -324,7 +350,7 @@ class RunService:
                 instance_dir=self.store.get_instance_dir(run.id, instance_id),
                 attempt_dir=attempt_dir,
                 resume_session_id=instance.session_id,
-                project=run.project,
+                project=project,
                 task=task,
                 prompt=full_prompt,
             )
@@ -416,19 +442,44 @@ class RunService:
         run: RunRecord,
         instance: RunInstanceState,
         attempt_dir: Path,
+        *,
+        project: ProjectSpec | None = None,
+        task: TaskSpec | None = None,
     ) -> str:
-        task = run.tasks[instance.task_id]
+        effective_project = (
+            self._materialize_project_for_input_scope(run, instance.input_scope_id)
+            if project is None
+            else project
+        )
+        effective_task = (
+            self._materialize_task_for_input_scope(
+                run,
+                instance.task_id,
+                instance.input_scope_id,
+                project=effective_project,
+            )
+            if task is None
+            else task
+        )
         if instance.session_id is None:
             return self._execution_contract_appendix(
-                task=task,
+                task=effective_task,
                 attempt_dir=attempt_dir,
-                project_workspace_dir=self._resolve_project_workspace_dir(run.project),
-                workspace_dir=self._resolve_task_workspace_dir(run.project, task),
+                project_workspace_dir=self._resolve_project_workspace_dir(
+                    effective_project
+                ),
+                workspace_dir=self._resolve_task_workspace_dir(
+                    effective_project,
+                    effective_task,
+                ),
                 extra_writable_roots=tuple(
                     Path(root)
                     for root in self._resolve_task_extra_writable_roots(
-                        task,
-                        self._resolve_task_workspace_dir(run.project, task),
+                        effective_task,
+                        self._resolve_task_workspace_dir(
+                            effective_project,
+                            effective_task,
+                        ),
                     )
                 ),
             )
@@ -1268,14 +1319,139 @@ class RunService:
                 f"controller task {task.id} emitted invalid control: {exc}"
             ) from exc
 
-    def _materialize_task(self, project: ProjectSpec, task: TaskSpec) -> TaskSpec:
+    def _materialize_project(
+        self,
+        project: ProjectSpec,
+        user_inputs: dict[str, JsonValue],
+    ) -> ProjectSpec:
+        workspace = render_input_template(
+            project.workspace,
+            inputs=user_inputs,
+            field_name="project.workspace",
+        )
+        if not workspace.strip():
+            raise ValueError("project.workspace must not resolve to an empty path")
+        workspace_dir = Path(workspace).resolve()
+        if not workspace_dir.exists():
+            raise ValueError(f"project workspace does not exist: {workspace_dir}")
+        if not workspace_dir.is_dir():
+            raise ValueError(f"project workspace is not a directory: {workspace_dir}")
+        if project.workspace == str(workspace_dir):
+            return project
+        return project.model_copy(update={"workspace": str(workspace_dir)})
+
+    def _inputs_for_input_scope(
+        self,
+        run: RunRecord,
+        input_scope_id: str,
+    ) -> dict[str, JsonValue]:
+        input_scope = run.input_scopes[input_scope_id]
+        return {
+            **run.user_inputs,
+            **input_scope.values,
+        }
+
+    def _project_workspace_template(self, run: RunRecord) -> str:
+        if run.project_workspace_template is not None:
+            return run.project_workspace_template
+        return run.project.workspace
+
+    def _task_path_template(
+        self,
+        run: RunRecord,
+        task_id: str,
+    ) -> RunTaskPathTemplateState:
+        template = run.task_path_templates.get(task_id)
+        if template is not None:
+            return template
+        task = run.tasks[task_id]
+        return RunTaskPathTemplateState(
+            workspace=task.workspace,
+            extra_writable_roots=list(task.extra_writable_roots),
+        )
+
+    def _materialize_project_for_input_scope(
+        self,
+        run: RunRecord,
+        input_scope_id: str,
+    ) -> ProjectSpec:
+        raw_workspace = self._project_workspace_template(run)
+        raw_project = run.project.model_copy(update={"workspace": raw_workspace})
+        return self._materialize_project(
+            raw_project,
+            self._inputs_for_input_scope(run, input_scope_id),
+        )
+
+    def _materialize_task_for_input_scope(
+        self,
+        run: RunRecord,
+        task_id: str,
+        input_scope_id: str,
+        *,
+        project: ProjectSpec | None = None,
+    ) -> TaskSpec:
+        effective_project = (
+            self._materialize_project_for_input_scope(run, input_scope_id)
+            if project is None
+            else project
+        )
+        task = run.tasks[task_id]
+        path_template = self._task_path_template(run, task_id)
+        raw_task = task.model_copy(
+            update={
+                "workspace": path_template.workspace,
+                "extra_writable_roots": list(path_template.extra_writable_roots),
+            }
+        )
+        return self._materialize_task(
+            effective_project,
+            raw_task,
+            self._inputs_for_input_scope(run, input_scope_id),
+        )
+
+    def _materialize_task(
+        self,
+        project: ProjectSpec,
+        task: TaskSpec,
+        user_inputs: dict[str, JsonValue],
+    ) -> TaskSpec:
         effective_sandbox = task.sandbox or project.default_sandbox
         updates: dict[str, object] = {}
         if task.sandbox is None:
             updates["sandbox"] = project.default_sandbox
         if task.model is None and project.default_model is not None:
             updates["model"] = project.default_model
-        workspace_dir = self._resolve_task_workspace_dir(project, task)
+        materialized_workspace = (
+            None
+            if task.workspace is None
+            else render_input_template(
+                task.workspace,
+                inputs=user_inputs,
+                field_name=f"task {task.id} workspace",
+            )
+        )
+        if materialized_workspace is not None and not materialized_workspace.strip():
+            raise ValueError(f"task {task.id} workspace must not resolve to an empty path")
+        materialized_extra_writable_roots = [
+            render_input_template(
+                raw_root,
+                inputs=user_inputs,
+                field_name=f"task {task.id} extra_writable_roots",
+            )
+            for raw_root in task.extra_writable_roots
+        ]
+        for resolved_root in materialized_extra_writable_roots:
+            if not resolved_root.strip():
+                raise ValueError(
+                    f"task {task.id} extra_writable_roots must not resolve to an empty path"
+                )
+        materialized_task = task.model_copy(
+            update={
+                "workspace": materialized_workspace,
+                "extra_writable_roots": materialized_extra_writable_roots,
+            }
+        )
+        workspace_dir = self._resolve_task_workspace_dir(project, materialized_task)
         if not workspace_dir.exists():
             raise ValueError(
                 f"task {task.id} workspace does not exist: {workspace_dir}"
@@ -1287,7 +1463,10 @@ class RunService:
         workspace = str(workspace_dir)
         if task.workspace != workspace:
             updates["workspace"] = workspace
-        extra_writable_roots = self._resolve_task_extra_writable_roots(task, workspace_dir)
+        extra_writable_roots = self._resolve_task_extra_writable_roots(
+            materialized_task,
+            workspace_dir,
+        )
         if effective_sandbox == "read-only" and extra_writable_roots:
             raise ValueError(
                 f"task {task.id} cannot use extra writable roots with read-only sandbox"
@@ -1460,7 +1639,7 @@ class RunService:
                     [
                         '- Set `control.kind = "loop"`.',
                         '- Set `control.action` to `"continue"` or `"stop"`.',
-                        '- When continuing, include string-valued `control.next_inputs` for the next iteration input scope.',
+                        "- When continuing, include JSON-valued `control.next_inputs` for the next iteration input scope.",
                     ]
                 )
             sections.append("\n".join(controller_lines))

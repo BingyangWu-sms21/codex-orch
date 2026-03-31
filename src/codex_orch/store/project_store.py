@@ -29,6 +29,8 @@ from codex_orch.domain import (
     RunRecord,
     TaskSpec,
 )
+from codex_orch.input_values import JsonValue, load_input_file_value
+from codex_orch.schema_utils import validate_json_schema
 from codex_orch.store.layout import (
     GlobalPaths,
     ProgramPaths,
@@ -287,12 +289,12 @@ class ProjectStore:
             resolved[role.spec.id] = role
         return resolved
 
-    def load_default_user_inputs(self) -> dict[str, str]:
+    def load_default_user_inputs(self) -> dict[str, JsonValue]:
         project = self.load_project()
-        inputs: dict[str, str] = {}
+        inputs: dict[str, JsonValue] = {}
         for key, relative_path in project.user_inputs.items():
             input_path = self.paths.root / relative_path
-            inputs[key] = input_path.read_text(encoding="utf-8")
+            inputs[key] = load_input_file_value(input_path)
         return inputs
 
     def save_run(self, run: RunRecord) -> None:
@@ -647,6 +649,15 @@ class ProjectStore:
             confidence=confidence,
             citations=[] if citations is None else citations,
         )
+        if (
+            record.interrupt.reply_schema is not None
+            and reply.reply_kind is InterruptReplyKind.ANSWER
+        ):
+            validate_json_schema(
+                reply.payload,
+                schema_path=self.paths.root / record.interrupt.reply_schema,
+                field_name=f"reply payload for interrupt {interrupt_id}",
+            )
         _write_json(
             self.get_reply_path(record.run_id, interrupt_id),
             reply.model_dump(mode="json"),

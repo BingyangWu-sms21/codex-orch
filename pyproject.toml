@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
     "jinja2>=3.1.6",
+    "jsonschema>=4.26.0",
     "prefect>=3.6.22",
     "pydantic>=2.11.0",
     "python-multipart>=0.0.20",

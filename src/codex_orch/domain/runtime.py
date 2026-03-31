@@ -20,6 +20,7 @@ from codex_orch.domain.models import (
     RunStatus,
     TaskSpec,
 )
+from codex_orch.input_values import ensure_json_object, ensure_json_value
 
 
 def _utc_now_iso() -> str:
@@ -202,6 +203,11 @@ class InterruptReply(BaseModel):
             raise ValueError("text must not be empty")
         if self.rationale is not None and not self.rationale.strip():
             raise ValueError("rationale must not be blank")
+        object.__setattr__(
+            self,
+            "payload",
+            ensure_json_object(self.payload, field_name="payload"),
+        )
         return self
 
 
@@ -211,7 +217,7 @@ class ControlEnvelope(BaseModel):
     kind: ControlEnvelopeKind
     labels: list[str] = Field(default_factory=list)
     action: LoopAction | None = None
-    next_inputs: dict[str, str] = Field(default_factory=dict)
+    next_inputs: dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_control(self) -> ControlEnvelope:
@@ -232,14 +238,15 @@ class ControlEnvelope(BaseModel):
             raise ValueError("loop control may not define labels")
         if self.action is None:
             raise ValueError("loop control must define action")
-        normalized_inputs: dict[str, str] = {}
+        normalized_inputs: dict[str, object] = {}
         for key, value in self.next_inputs.items():
             normalized_key = key.strip()
             if not normalized_key:
                 raise ValueError("loop next_inputs keys must not be blank")
-            if not isinstance(value, str):
-                raise ValueError("loop next_inputs values must be strings")
-            normalized_inputs[normalized_key] = value
+            normalized_inputs[normalized_key] = ensure_json_value(
+                value,
+                field_name=f"loop next_inputs.{normalized_key}",
+            )
         if self.action is LoopAction.CONTINUE:
             if not normalized_inputs:
                 raise ValueError("loop continue must define next_inputs")
@@ -273,7 +280,7 @@ class RunInputScopeState(BaseModel):
     input_scope_id: str
     parent_input_scope_id: str | None = None
     seed_task_ids: list[str] = Field(default_factory=list)
-    values: dict[str, str] = Field(default_factory=dict)
+    values: dict[str, object] = Field(default_factory=dict)
     created_by_instance_id: str | None = None
     created_at: str = Field(default_factory=_utc_now_iso)
 
@@ -293,16 +300,41 @@ class RunInputScopeState(BaseModel):
             normalized_seed_task_ids.append(normalized_task_id)
         if len(set(normalized_seed_task_ids)) != len(normalized_seed_task_ids):
             raise ValueError("seed_task_ids must be unique per input scope")
-        normalized_values: dict[str, str] = {}
+        normalized_values: dict[str, object] = {}
         for key, value in self.values.items():
             normalized_key = key.strip()
             if not normalized_key:
                 raise ValueError("input scope values keys must not be blank")
-            if not isinstance(value, str):
-                raise ValueError("input scope values must be strings")
-            normalized_values[normalized_key] = value
+            normalized_values[normalized_key] = ensure_json_value(
+                value,
+                field_name=f"input scope values.{normalized_key}",
+            )
         object.__setattr__(self, "seed_task_ids", normalized_seed_task_ids)
         object.__setattr__(self, "values", normalized_values)
+        return self
+
+
+class RunTaskPathTemplateState(BaseModel):
+    workspace: str | None = None
+    extra_writable_roots: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_task_path_templates(self) -> RunTaskPathTemplateState:
+        if self.workspace is not None and not self.workspace.strip():
+            raise ValueError("task path template workspace must not be blank")
+        normalized_extra_writable_roots: list[str] = []
+        for raw_root in self.extra_writable_roots:
+            normalized_root = raw_root.strip()
+            if not normalized_root:
+                raise ValueError(
+                    "task path template extra_writable_roots must not contain blanks"
+                )
+            normalized_extra_writable_roots.append(normalized_root)
+        object.__setattr__(
+            self,
+            "extra_writable_roots",
+            normalized_extra_writable_roots,
+        )
         return self
 
 
@@ -347,9 +379,11 @@ class RunRecord(BaseModel):
     created_at: str = Field(default_factory=_utc_now_iso)
     updated_at: str = Field(default_factory=_utc_now_iso)
     status: RunStatus = RunStatus.PENDING
-    user_inputs: dict[str, str] = Field(default_factory=dict)
+    user_inputs: dict[str, object] = Field(default_factory=dict)
     project: ProjectSpec
+    project_workspace_template: str | None = None
     tasks: dict[str, TaskSpec]
+    task_path_templates: dict[str, RunTaskPathTemplateState] = Field(default_factory=dict)
     input_scopes: dict[str, RunInputScopeState]
     instances: dict[str, RunInstanceState]
 
@@ -363,6 +397,18 @@ class RunRecord(BaseModel):
             raise ValueError("tasks must not be empty")
         if not self.input_scopes:
             raise ValueError("input_scopes must not be empty")
+        normalized_user_inputs: dict[str, object] = {}
+        for key, value in self.user_inputs.items():
+            normalized_key = key.strip()
+            if not normalized_key:
+                raise ValueError("user_inputs keys must not be blank")
+            normalized_user_inputs[normalized_key] = ensure_json_value(
+                value,
+                field_name=f"user_inputs.{normalized_key}",
+            )
+        object.__setattr__(self, "user_inputs", normalized_user_inputs)
+        if self.project_workspace_template is not None and not self.project_workspace_template.strip():
+            raise ValueError("project_workspace_template must not be blank")
         for input_scope_id, input_scope in self.input_scopes.items():
             if input_scope.input_scope_id != input_scope_id:
                 raise ValueError("run input scope snapshot keys must match scope ids")
@@ -383,6 +429,13 @@ class RunRecord(BaseModel):
         for task_id, task in self.tasks.items():
             if task.id != task_id:
                 raise ValueError("run task snapshot keys must match task ids")
+        for task_id in self.task_path_templates:
+            if not task_id.strip():
+                raise ValueError("task_path_templates keys must not be blank")
+            if task_id not in self.tasks:
+                raise ValueError(
+                    f"task_path_templates references missing task {task_id}"
+                )
         for instance in self.instances.values():
             if instance.task_id not in self.tasks:
                 raise ValueError(

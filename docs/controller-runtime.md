@@ -155,7 +155,7 @@ Reference rules:
   this instance
 - `deps.<scope>.artifacts.<path>` reads declared published artifacts from the
   resolved upstream instance
-- `inputs.<key>` reads run or loop-provided inputs
+- `inputs.<key>` reads run or loop-provided JSON values
 - `channels.<name>` reads a declared global channel
 
 If a dependency declares `as`, that alias becomes the scope key. Otherwise the
@@ -189,7 +189,7 @@ Rules:
   `control.routes`
 - `control.kind=loop` carries `action=continue|stop`
 - `control.next_inputs` is only valid when `control.kind=loop` and
-  `action=continue`
+  `action=continue`, and it carries JSON values
 - controller outputs are materialized into workflow state before scheduling
 
 The scheduler must fail the controller instance when:
@@ -232,7 +232,8 @@ Loops use the same controller contract as branching.
   controller's configured `continue_targets` as next-iteration seeds.
 - `loop.action == stop` activates `stop_targets`, if any, in the current input
   scope.
-- `next_inputs` becomes the next iteration's `inputs` namespace.
+- `next_inputs` becomes the next iteration's `inputs` namespace as typed JSON
+  values.
 
 Loop invariants:
 

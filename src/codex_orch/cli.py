@@ -30,6 +30,7 @@ from codex_orch.domain import (
     TaskSpec,
     TaskStatus,
 )
+from codex_orch.input_values import JsonValue, parse_json_input_override
 from codex_orch.runner import CodexExecRunner
 from codex_orch.scheduler import RunService
 from codex_orch.skills import (
@@ -120,14 +121,68 @@ def _print_json(payload: object) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
 
 
-def _parse_key_values(values: list[str]) -> dict[str, str]:
+def _parse_key_value_entry(entry: str, *, option_name: str) -> tuple[str, str]:
+    if "=" not in entry:
+        raise typer.BadParameter(f"expected key=value for {option_name}, got {entry}")
+    key, value = entry.split("=", maxsplit=1)
+    normalized_key = key.strip()
+    if not normalized_key:
+        raise typer.BadParameter(f"{option_name} key must not be empty")
+    return normalized_key, value.strip()
+
+
+def _parse_key_values(values: list[str], *, option_name: str = "--input") -> dict[str, str]:
     parsed: dict[str, str] = {}
     for entry in values:
-        if "=" not in entry:
-            raise typer.BadParameter(f"expected key=value, got {entry}")
-        key, value = entry.split("=", maxsplit=1)
-        parsed[key.strip()] = value.strip()
+        key, value = _parse_key_value_entry(entry, option_name=option_name)
+        parsed[key] = value
     return parsed
+
+
+def _parse_json_key_values(values: list[str]) -> dict[str, JsonValue]:
+    parsed: dict[str, JsonValue] = {}
+    for entry in values:
+        key, raw_value = _parse_key_value_entry(entry, option_name="--input-json")
+        try:
+            parsed[key] = parse_json_input_override(
+                raw_value,
+                field_name=f"--input-json {key}",
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    return parsed
+
+
+def _parse_json_file_key_values(values: list[str]) -> dict[str, JsonValue]:
+    parsed: dict[str, JsonValue] = {}
+    for entry in values:
+        key, raw_path = _parse_key_value_entry(entry, option_name="--input-json-file")
+        path = Path(raw_path)
+        try:
+            parsed[key] = parse_json_input_override(
+                path.read_text(encoding="utf-8"),
+                field_name=f"--input-json-file {key}",
+            )
+        except OSError as exc:
+            raise typer.BadParameter(
+                f"--input-json-file {key} could not read {path}: {exc}"
+            ) from exc
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    return parsed
+
+
+def _parse_user_input_overrides(
+    *,
+    string_values: list[str],
+    json_values: list[str],
+    json_file_values: list[str],
+) -> dict[str, JsonValue]:
+    merged: dict[str, JsonValue] = {}
+    merged.update(_parse_key_values(string_values, option_name="--input"))
+    merged.update(_parse_json_key_values(json_values))
+    merged.update(_parse_json_file_key_values(json_file_values))
+    return merged
 
 
 def _resolve_program_dir(program_dir: Path | None) -> Path:
@@ -410,25 +465,34 @@ def run_start(
     root: list[str] | None = typer.Option(None),
     label: list[str] | None = typer.Option(None),
     input_value: list[str] | None = typer.Option(None, "--input"),
+    input_json: list[str] | None = typer.Option(None, "--input-json"),
+    input_json_file: list[str] | None = typer.Option(None, "--input-json-file"),
     wait: bool = True,
 ) -> None:
     service = _run_service(program_dir)
     root_values = [] if root is None else root
     label_values = [] if label is None else label
     input_values = [] if input_value is None else input_value
+    input_json_values = [] if input_json is None else input_json
+    input_json_file_values = [] if input_json_file is None else input_json_file
+    user_inputs = _parse_user_input_overrides(
+        string_values=input_values,
+        json_values=input_json_values,
+        json_file_values=input_json_file_values,
+    )
     if wait:
         run = asyncio.run(
             service.start_run(
                 roots=root_values,
                 labels=label_values,
-                user_inputs=_parse_key_values(input_values),
+                user_inputs=user_inputs,
             )
         )
     else:
         run = service.create_snapshot(
             roots=root_values,
             labels=label_values,
-            user_inputs=_parse_key_values(input_values),
+            user_inputs=user_inputs,
         )
     typer.echo(run.id)
 
@@ -717,6 +781,8 @@ def inbox_reply(
     rationale: str | None = typer.Option(None, "--rationale"),
     confidence: ConfidenceLevel | None = typer.Option(None, "--confidence"),
     citation: list[str] | None = typer.Option(None, "--citation"),
+    payload_json: str | None = typer.Option(None, "--payload-json"),
+    payload_file: Path | None = typer.Option(None, "--payload-file"),
     resume: bool = False,
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
@@ -724,18 +790,50 @@ def inbox_reply(
     router = AssistantRoleRouter(store)
     record = store.find_interrupt(interrupt_id)
     body = _read_text_input(text, text_file, field="text")
+    if payload_json is not None and payload_file is not None:
+        raise typer.BadParameter("--payload-json and --payload-file are mutually exclusive")
+    reply_payload: dict[str, object] | None = None
+    if payload_json is not None:
+        try:
+            parsed_payload = parse_json_input_override(
+                payload_json,
+                field_name="--payload-json",
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        if not isinstance(parsed_payload, dict):
+            raise typer.BadParameter("--payload-json must be a JSON object")
+        reply_payload = parsed_payload
+    elif payload_file is not None:
+        try:
+            parsed_payload = parse_json_input_override(
+                payload_file.read_text(encoding="utf-8"),
+                field_name="--payload-file",
+            )
+        except OSError as exc:
+            raise typer.BadParameter(
+                f"--payload-file could not read {payload_file}: {exc}"
+            ) from exc
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        if not isinstance(parsed_payload, dict):
+            raise typer.BadParameter("--payload-file must contain a JSON object")
+        reply_payload = parsed_payload
     if record.interrupt.audience is InterruptAudience.HUMAN and reply_kind is not InterruptReplyKind.ANSWER:
         raise typer.BadParameter("human inbox replies must use reply-kind=answer")
-    reply = store.save_interrupt_reply(
-        interrupt_id,
-        audience=record.interrupt.audience,
-        reply_kind=reply_kind,
-        text=body,
-        payload={},
-        rationale=rationale,
-        confidence=confidence,
-        citations=[] if citation is None else citation,
-    )
+    try:
+        reply = store.save_interrupt_reply(
+            interrupt_id,
+            audience=record.interrupt.audience,
+            reply_kind=reply_kind,
+            text=body,
+            payload=reply_payload,
+            rationale=rationale,
+            confidence=confidence,
+            citations=[] if citation is None else citation,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if (
         record.interrupt.audience is InterruptAudience.ASSISTANT
         and reply_kind is InterruptReplyKind.HANDOFF_TO_HUMAN

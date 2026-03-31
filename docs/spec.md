@@ -46,6 +46,8 @@ Execution boundary fields on each task:
 - `extra_writable_roots`: optional extra writable directories for writable
   sandboxes. Relative values are resolved against the task's effective
   workspace.
+- `project.workspace`, `task.workspace`, and `extra_writable_roots` may use
+  `${inputs.<key>}` template bindings. Bound values must resolve to strings.
 
 Dependencies live on the target task in `depends_on`. There are two dependency
 kinds:
@@ -67,6 +69,16 @@ Task additions in the current runtime:
 - `deps.<scope>.result`
 - `deps.<scope>.artifacts.<relative-path>`
 - `inputs.<key>`
+- `runtime.replies`
+- `runtime.latest_reply`
+
+`inputs.<key>` stages:
+
+- `<key>.txt` for string values
+- `<key>.json` for structured JSON values
+
+`runtime.replies` and `runtime.latest_reply` stage JSON files for the current
+instance's resolved-but-not-yet-applied replies.
 
 Artifact refs still require an explicit `context` dependency and the referenced
 artifact path must be listed in the matching `consume` list.
@@ -93,6 +105,13 @@ Run state is split into six areas:
 - `proposals/*.json`: recorded assistant update proposals
 - `inbox/interrupts/*.json` and `inbox/replies/*.json`: external interaction
   envelopes
+
+Run inputs and loop-carried input scope values are typed JSON values. Default
+input files are parsed by extension:
+
+- `.json` -> JSON
+- `.yaml` / `.yml` -> YAML converted to JSON-compatible values
+- other files -> raw text string
 
 ## Instance directories
 
@@ -229,6 +248,9 @@ Reply fields include:
 - `payload`
 - optional `rationale`, `confidence`, and `citations`
 
+When `reply_schema` is set on the interrupt, `reply.payload` is validated
+against that JSON Schema for `reply_kind=answer`.
+
 Assistant replies may also carry structured `proposed_updates[]`. Valid
 proposals are recorded under `.runs/<run-id>/proposals/` and invalid proposals
 are dropped with corresponding runtime events. Proposal records are manual
@@ -249,6 +271,8 @@ Run status still exposes `waiting`, but instance state now records
 - once all blocking interrupts are resolved, the instance becomes runnable again
 - resolved replies are injected only into that instance's next
   `codex exec resume` prompt
+- resolved replies are also available through `compose.ref runtime.replies` and
+  `compose.ref runtime.latest_reply` on that same resumed instance
 - before rescheduling work, `resume_run()` first reconciles stale `running`
   instances using the active attempt `runtime.json`
 
@@ -274,6 +298,7 @@ Current controller output rules:
 - route controllers emit `control.kind: route` plus `control.labels[]`
 - loop controllers emit `control.kind: loop` plus `control.action`
 - `control.next_inputs` is only valid for `loop.action=continue`
+- `control.next_inputs` accepts JSON values, not only strings
 - assistant/human replies are never scheduler inputs directly; a controller must
   first consume them and then emit materialized control
 

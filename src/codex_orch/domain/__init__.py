@@ -66,6 +66,7 @@ from codex_orch.domain.runtime import (
     RunInstanceStatus,
     RunInstanceWaitReason,
     RunRecord,
+    RunTaskPathTemplateState,
 )
 
 __all__ = [
@@ -122,6 +123,7 @@ __all__ = [
     "RunInstanceStatus",
     "RunInstanceWaitReason",
     "RunRecord",
+    "RunTaskPathTemplateState",
     "RunStatus",
     "TaskControlSpec",
     "TaskControlMode",

@@ -12,6 +12,7 @@ from codex_orch.domain import (
     InterruptReplyKind,
     NodeExecutionRuntime,
     NodeExecutionTerminationReason,
+    ProjectSpec,
     RequestKind,
     RequestPriority,
     RunInstanceStatus,
@@ -321,6 +322,236 @@ def test_run_service_materializes_context_dependencies(tmp_path: Path) -> None:
     assert "Read this file directly if you need its contents" in published
     assert staged_dep == "analysis result\n"
     assert staged_input == "brief input\n"
+
+
+def test_create_snapshot_materializes_dynamic_project_and_task_paths(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    dynamic_root = tmp_path / "dynamic-root"
+    task_workspace = dynamic_root / "repos" / "demo"
+    extra_root = task_workspace / "logs" / "demo"
+    extra_root.mkdir(parents=True, exist_ok=True)
+    (store.paths.inputs_dir / "workspace_root.txt").write_text(
+        str(dynamic_root),
+        encoding="utf-8",
+    )
+    (store.paths.inputs_dir / "slug.txt").write_text("demo", encoding="utf-8")
+    store.save_project(
+        ProjectSpec(
+            name="dynamic-program",
+            workspace="${inputs.workspace_root}",
+            default_agent="default",
+            default_sandbox="workspace-write",
+            user_inputs={
+                "workspace_root": "inputs/workspace_root.txt",
+                "slug": "inputs/slug.txt",
+            },
+            max_concurrency=2,
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            workspace="repos/${inputs.slug}",
+            extra_writable_roots=["logs/${inputs.slug}"],
+            publish=["final.md"],
+        )
+    )
+
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+
+    assert run.project.workspace == str(dynamic_root.resolve())
+    assert run.tasks["worker"].workspace == str(task_workspace.resolve())
+    assert run.tasks["worker"].extra_writable_roots == [str(extra_root.resolve())]
+    assert run.project_workspace_template == "${inputs.workspace_root}"
+    assert run.task_path_templates["worker"].workspace == "repos/${inputs.slug}"
+    assert run.task_path_templates["worker"].extra_writable_roots == [
+        "logs/${inputs.slug}"
+    ]
+
+
+def test_loop_continue_recomputes_dynamic_paths_for_new_input_scope(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    workspace_root_a = tmp_path / "workspace-a"
+    workspace_root_b = tmp_path / "workspace-b"
+    for workspace_root, slug in (
+        (workspace_root_a, "a"),
+        (workspace_root_b, "b"),
+    ):
+        (workspace_root / "repos" / slug / "logs" / slug).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+    store.save_project(
+        ProjectSpec(
+            name="dynamic-loop",
+            workspace="${inputs.workspace_root}",
+            default_agent="default",
+            default_sandbox="workspace-write",
+            max_concurrency=1,
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="plan_iteration",
+            title="Plan Iteration",
+            agent="worker",
+            status=TaskStatus.READY,
+            workspace="repos/${inputs.slug}",
+            extra_writable_roots=["logs/${inputs.slug}"],
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="loop_gate",
+            title="Loop Gate",
+            agent="worker",
+            kind="controller",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "plan_iteration", "kind": "order", "consume": []}],
+            compose=[{"kind": "ref", "ref": "inputs.slug"}],
+            control={
+                "mode": "loop",
+                "continue_targets": ["plan_iteration"],
+                "stop_targets": ["publish_summary"],
+            },
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="publish_summary",
+            title="Publish Summary",
+            agent="worker",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "loop_gate", "kind": "order", "consume": []}],
+            publish=["final.md"],
+        )
+    )
+
+    class DynamicPathLoopRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.plan_requests: list[NodeExecutionRequest] = []
+
+        async def run(self, request: NodeExecutionRequest) -> NodeExecutionResult:
+            if request.task.id == "plan_iteration":
+                self.plan_requests.append(request)
+            if request.task.id == "loop_gate":
+                slug = self._read_text(
+                    request.attempt_dir / "context" / "refs" / "inputs" / "slug.txt"
+                )
+                if slug == "a":
+                    return self._complete_with_json(
+                        request,
+                        {
+                            "result": {"slug": slug},
+                            "control": {
+                                "kind": "loop",
+                                "action": "continue",
+                                "next_inputs": {
+                                    "workspace_root": str(workspace_root_b),
+                                    "slug": "b",
+                                },
+                            },
+                        },
+                    )
+                return self._complete_with_json(
+                    request,
+                    {
+                        "result": {"slug": slug},
+                        "control": {
+                            "kind": "loop",
+                            "action": "stop",
+                        },
+                    },
+                )
+            return await super().run(request)
+
+    runner = DynamicPathLoopRunner()
+    run = asyncio.run(
+        RunService(store, runner).start_run(
+            roots=["publish_summary"],
+            labels=[],
+            user_inputs={
+                "workspace_root": str(workspace_root_a),
+                "slug": "a",
+            },
+        )
+    )
+
+    assert run.status is RunStatus.DONE
+    assert len(runner.plan_requests) == 2
+    assert runner.plan_requests[0].project_workspace_dir == workspace_root_a.resolve()
+    assert runner.plan_requests[0].workspace_dir == (
+        workspace_root_a / "repos" / "a"
+    ).resolve()
+    assert runner.plan_requests[0].extra_writable_roots == (
+        (workspace_root_a / "repos" / "a" / "logs" / "a").resolve(),
+    )
+    assert runner.plan_requests[1].project_workspace_dir == workspace_root_b.resolve()
+    assert runner.plan_requests[1].workspace_dir == (
+        workspace_root_b / "repos" / "b"
+    ).resolve()
+    assert runner.plan_requests[1].extra_writable_roots == (
+        (workspace_root_b / "repos" / "b" / "logs" / "b").resolve(),
+    )
+
+
+def test_input_ref_stages_structured_default_input_as_json(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    (store.paths.inputs_dir / "config.yaml").write_text(
+        "answer: 7\nnested:\n  ok: true\n",
+        encoding="utf-8",
+    )
+    store.save_project(
+        store.load_project().model_copy(
+            update={
+                "user_inputs": {
+                    "brief": "inputs/brief.md",
+                    "config": "inputs/config.yaml",
+                }
+            }
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="inspect_input",
+            title="Inspect Input",
+            agent="default",
+            status=TaskStatus.READY,
+            compose=[{"kind": "ref", "ref": "inputs.config"}],
+            publish=["final.md"],
+        )
+    )
+
+    runner = FakeRunner()
+    asyncio.run(
+        RunService(store, runner).start_run(
+            roots=["inspect_input"],
+            labels=[],
+            user_inputs=None,
+        )
+    )
+
+    staged_path = (
+        runner.requests["inspect_input"].attempt_dir
+        / "context"
+        / "refs"
+        / "inputs"
+        / "config.json"
+    )
+    assert json.loads(staged_path.read_text(encoding="utf-8")) == {
+        "answer": 7,
+        "nested": {"ok": True},
+    }
 
 
 def test_run_service_waits_for_blocking_interrupt_and_resumes_same_session(tmp_path: Path) -> None:
@@ -775,6 +1006,187 @@ def test_loop_continue_creates_new_input_scope_and_reuses_static_external_depend
     assert "loop_continued" in event_types
     assert "loop_stopped" in event_types
     assert event_types.count("input_scope_created") == 2
+
+
+def test_loop_continue_supports_structured_next_inputs(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="plan_iteration",
+            title="Plan Iteration",
+            agent="worker",
+            status=TaskStatus.READY,
+            compose=[{"kind": "ref", "ref": "inputs.state"}],
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="loop_gate",
+            title="Loop Gate",
+            agent="worker",
+            kind="controller",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "plan_iteration", "kind": "order", "consume": []}],
+            compose=[{"kind": "ref", "ref": "inputs.state"}],
+            control={
+                "mode": "loop",
+                "continue_targets": ["plan_iteration"],
+                "stop_targets": ["publish_summary"],
+            },
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="publish_summary",
+            title="Publish Summary",
+            agent="worker",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "loop_gate", "kind": "order", "consume": []}],
+            compose=[{"kind": "ref", "ref": "inputs.state"}],
+            publish=["final.md"],
+        )
+    )
+
+    class StructuredLoopRunner(FakeRunner):
+        async def run(self, request: NodeExecutionRequest) -> NodeExecutionResult:
+            self.prompts[request.task.id] = request.prompt
+            self.requests[request.task.id] = request
+            final_path = request.attempt_dir / "final.md"
+            if request.task.id == "loop_gate":
+                state = json.loads(
+                    (
+                        request.attempt_dir
+                        / "context"
+                        / "refs"
+                        / "inputs"
+                        / "state.json"
+                    ).read_text(encoding="utf-8")
+                )
+                remaining = list(state["remaining"])
+                history = list(state["history"])
+                if len(remaining) > 1:
+                    next_state = {
+                        "remaining": remaining[1:],
+                        "history": [*history, remaining[0]],
+                    }
+                    payload = {
+                        "result": {"state": next_state},
+                        "control": {
+                            "kind": "loop",
+                            "action": "continue",
+                            "next_inputs": {
+                                "state": next_state,
+                            },
+                        },
+                    }
+                else:
+                    payload = {
+                        "result": {"state": state},
+                        "control": {
+                            "kind": "loop",
+                            "action": "stop",
+                        },
+                    }
+                return self._complete_with_json(request, payload)
+            final_path.write_text(request.prompt, encoding="utf-8")
+            return NodeExecutionResult(
+                success=True,
+                return_code=0,
+                final_message=request.prompt,
+                session_id=f"session-{request.instance_id}",
+            )
+
+    runner = StructuredLoopRunner()
+    run = asyncio.run(
+        RunService(store, runner).start_run(
+            roots=["publish_summary"],
+            labels=[],
+            user_inputs={"state": {"remaining": [2, 1], "history": []}},
+        )
+    )
+
+    assert run.status is RunStatus.DONE
+    plan_instances = _instances_for_task(run, "plan_iteration")
+    assert len(plan_instances) == 2
+    plan_states = [
+        json.loads(
+            (
+                store.get_attempt_dir(run.id, instance.instance_id, 1)
+                / "context"
+                / "refs"
+                / "inputs"
+                / "state.json"
+            ).read_text(encoding="utf-8")
+        )
+        for instance in plan_instances
+    ]
+    assert {"remaining": [2, 1], "history": []} in plan_states
+    assert {"remaining": [1], "history": [2]} in plan_states
+    publish_summary = _instance_for_task(run, "publish_summary")
+    publish_attempt_dir = store.get_attempt_dir(run.id, publish_summary.instance_id, 1)
+    assert json.loads(
+        (
+            publish_attempt_dir
+            / "context"
+            / "refs"
+            / "inputs"
+            / "state.json"
+        ).read_text(encoding="utf-8")
+    ) == {"remaining": [1], "history": [2]}
+
+
+def test_runtime_reply_refs_stage_resolved_replies_for_resumed_attempt(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            compose=[
+                {"kind": "ref", "ref": "runtime.replies"},
+                {"kind": "ref", "ref": "runtime.latest_reply"},
+            ],
+            publish=["final.md"],
+        )
+    )
+
+    runner = FakeRunner(store)
+    service = RunService(store, runner)
+    run = asyncio.run(service.start_run(roots=["worker"], labels=[], user_inputs=None))
+    instance = _instance_for_task(run, "worker")
+    interrupt = store.list_instance_interrupts(run.id, instance.instance_id)[0]
+    store.save_interrupt_reply(
+        interrupt.interrupt.interrupt_id,
+        audience=InterruptAudience.ASSISTANT,
+        reply_kind=InterruptReplyKind.ANSWER,
+        text="Delete the wrapper.",
+        payload={"decision": "delete"},
+        rationale="The compatibility layer is stale.",
+    )
+
+    resumed = asyncio.run(service.resume_run(run.id))
+    resumed_instance = _instance_for_task(resumed, "worker")
+    attempt_dir = store.get_attempt_dir(resumed.id, resumed_instance.instance_id, 2)
+
+    replies = json.loads(
+        (
+            attempt_dir / "context" / "refs" / "runtime" / "replies.json"
+        ).read_text(encoding="utf-8")
+    )
+    latest_reply = json.loads(
+        (
+            attempt_dir / "context" / "refs" / "runtime" / "latest_reply.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert len(replies) == 1
+    assert replies[0]["reply"]["payload"] == {"decision": "delete"}
+    assert latest_reply["reply"]["payload"] == {"decision": "delete"}
+    assert "## Ref: runtime.replies" in runner.prompts["worker"]
 
 
 def test_control_envelope_rejects_unknown_keys() -> None:
