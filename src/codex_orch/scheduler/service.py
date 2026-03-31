@@ -1589,6 +1589,7 @@ class RunService:
         ]
         if not role_lines:
             role_lines = ["- no assistant roles are currently registered"]
+        registered_roles_text = "\n".join(role_lines)
         if task.interaction_policy.allowed_assistant_roles is None:
             allowed_roles_text = "all registered roles"
         elif allowed_roles:
@@ -1611,7 +1612,7 @@ class RunService:
 
                 ## Registered Assistant Roles
 
-                {"\n".join(role_lines)}
+                {registered_roles_text}
 
                 ## Get A Recommendation
 
