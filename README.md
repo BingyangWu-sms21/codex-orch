@@ -6,11 +6,11 @@ It keeps tasks, presets, runtime state, interrupts, and published outputs on
 disk instead of in a database. A run materializes a frozen task snapshot,
 creates seed runtime instances, and lets the built-in instance scheduler
 dynamically activate downstream instances from concrete dependency bindings and
-controller route selections.
+controller route or loop selections.
 
 The current implemented runtime is documented in [docs/spec.md](./docs/spec.md).
-The future controller-driven branching and loop runtime is documented in
-[docs/controller-runtime.md](./docs/controller-runtime.md). The future
+The remaining controller-runtime north star, especially channels and richer
+workflow state, is documented in [docs/controller-runtime.md](./docs/controller-runtime.md). The future
 assistant-role interaction control plane is documented in
 [docs/assistant-role-control-plane.md](./docs/assistant-role-control-plane.md).
 
@@ -19,9 +19,9 @@ assistant-role interaction control plane is documented in
 - File-backed task pool with CRUD operations
 - Two dependency kinds: `order` and `context`
 - `compose.ref` reads run inputs, materialized dependency results, and consumed dependency artifacts
-- `controller` tasks with route-driven branch activation
+- `controller` tasks with explicit route or loop control output
 - Global presets under `~/.codex-orch/` plus per-program presets
-- Run-centered task snapshot, instance runtime, materialized results, and event log
+- Run-centered task snapshot, input scopes, instance runtime, materialized results, and event log
 - Codex session-aware resume via `codex exec resume`
 - Runtime inbox with interrupt requests and replies for assistant and human interaction
 - Built-in assistant worker plus bundled `operate-codex-orch` operator skill
@@ -40,7 +40,7 @@ codex-orch/
 Key docs:
 
 - [docs/spec.md](./docs/spec.md): current implemented storage and execution model
-- [docs/controller-runtime.md](./docs/controller-runtime.md): north star for the remaining controller runtime work, especially loops and channels
+- [docs/controller-runtime.md](./docs/controller-runtime.md): north star for the remaining controller runtime work, especially channels and richer workflow state
 - [docs/assistant-role-control-plane.md](./docs/assistant-role-control-plane.md): target worker/assistant/human interaction control plane with named assistant roles and managed role-scoped preferences
 
 ## Program layout

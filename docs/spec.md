@@ -1,8 +1,8 @@
 # Current storage and execution spec
 
 This document describes the current implemented runtime. Controller-driven
-branching is now part of the runtime. For the remaining north-star controller
-work, especially loops and channels, see
+branching and tail-loop control are now part of the runtime. For the remaining
+north-star controller work, especially channels and richer workflow state, see
 [docs/controller-runtime.md](./controller-runtime.md). For the future
 assistant-role interaction control plane, see
 [docs/assistant-role-control-plane.md](./assistant-role-control-plane.md).
@@ -57,7 +57,9 @@ Task additions in the current runtime:
 
 - `kind: work | controller`, default `work`
 - `depends_on[].as`: optional dependency scope alias
-- `control.routes[]`: valid only on `controller` tasks
+- `control.mode = route | loop`: valid only on `controller` tasks
+- route controllers declare `control.routes[]`
+- loop controllers declare `control.continue_targets[]` and optional `control.stop_targets[]`
 - `compose.ref`: runtime state references with path-first staging
 
 `compose.ref` supports:
@@ -72,17 +74,19 @@ artifact path must be listed in the matching `consume` list.
 ## Run model
 
 When a run starts, `codex-orch` resolves a frozen task snapshot from the task
-pool, writes it under `.runs/<run-id>/`, creates seed runtime instances, and
-lets the scheduler create additional instances later as concrete dependency
-bindings and controller route selections become available.
+pool, writes it under `.runs/<run-id>/`, creates a base input scope plus seed
+runtime instances, and lets the scheduler create additional instances later as
+concrete dependency bindings, controller route selections, and loop-created
+input scopes become available.
 
 Task definitions inside the run are materialized and frozen for that run. Later
 edits to the task pool do not mutate the in-flight run.
 
-Run state is split into five areas:
+Run state is split into six areas:
 
-- `state/run.json`: run metadata plus frozen task ids and instance ids
+- `state/run.json`: run metadata plus frozen task ids, input scope ids, and instance ids
 - `state/tasks/<task-id>.json`: frozen task snapshot
+- `state/inputs/<input-scope-id>.json`: materialized input scope snapshots
 - `state/instances/<instance-id>.json`: instance state
 - `state/results/<instance-id>.json`: materialized structured results
 - `events/*.json`: append-only runtime events
@@ -248,20 +252,42 @@ Run status still exposes `waiting`, but instance state now records
 - before rescheduling work, `resume_run()` first reconciles stale `running`
   instances using the active attempt `runtime.json`
 
-## Controller branching
+## Controller control
 
-`controller` tasks must produce `result.json` with a top-level `control.labels`
-array. The scheduler materializes that result, records route decision events,
-and only then instantiates downstream route targets.
+`controller` tasks must produce `result.json` with a top-level `control`
+object. The scheduler materializes that result, records control events, and
+only then instantiates current-scope route/stop targets or next-scope continue
+seeds.
 
-Current controller rules:
+Current controller authoring rules:
 
-- branch targets must explicitly depend on the controller in `depends_on`
-- unselected branches do not get placeholder runtime instances
+- route controllers use `control.mode: route` plus `control.routes[]`
+- loop controllers use `control.mode: loop` plus `control.continue_targets[]`
+  and optional `control.stop_targets[]`
+- each dynamic target task may be owned by at most one controller control edge
+- route targets and loop stop targets must explicitly depend on the controller
+- loop continue targets are activation-only next-iteration seeds; they do not
+  depend on the controller
+
+Current controller output rules:
+
+- route controllers emit `control.kind: route` plus `control.labels[]`
+- loop controllers emit `control.kind: loop` plus `control.action`
+- `control.next_inputs` is only valid for `loop.action=continue`
+- assistant/human replies are never scheduler inputs directly; a controller must
+  first consume them and then emit materialized control
+
+Current activation rules:
+
+- route targets activate only for selected labels in the same input scope
+- loop `stop` targets activate in the same input scope
+- loop `continue` creates a fresh input scope and instantiates only that
+  scope's configured continue seed tasks
+- unselected routes do not get placeholder runtime instances
 - repeated activation of the same logical task is deduped by concrete
-  `dependency_instances`
-- different dependency bindings may produce multiple instances of the same
-  logical task in one run
+  `dependency_instances + input_scope_id`
+- different dependency bindings or different input scopes may produce multiple
+  instances of the same logical task in one run
 
 ## Timeout and recovery semantics
 

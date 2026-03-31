@@ -10,6 +10,7 @@ from codex_orch.domain import (
     DependencyEdge,
     DependencyKind,
     PresetSpec,
+    TaskControlMode,
     TaskKind,
     TaskSpec,
     TaskStatus,
@@ -135,8 +136,12 @@ class TaskPoolService:
             selected[task_id] = task
             stack.extend(dependency.task for dependency in task.depends_on)
             if task.kind is TaskKind.CONTROLLER and task.control is not None:
-                for route in task.control.routes:
-                    stack.extend(route.targets)
+                if task.control.mode is TaskControlMode.ROUTE:
+                    for route in task.control.routes:
+                        stack.extend(route.targets)
+                else:
+                    stack.extend(task.control.continue_targets)
+                    stack.extend(task.control.stop_targets)
         return selected
 
     def routed_targets(self, tasks: dict[str, TaskSpec]) -> dict[str, str]:
@@ -144,8 +149,12 @@ class TaskPoolService:
         for task in tasks.values():
             if task.kind is not TaskKind.CONTROLLER or task.control is None:
                 continue
-            for route in task.control.routes:
-                for target in route.targets:
+            if task.control.mode is TaskControlMode.ROUTE:
+                for route in task.control.routes:
+                    for target in route.targets:
+                        targets[target] = task.id
+            else:
+                for target in (*task.control.continue_targets, *task.control.stop_targets):
                     targets[target] = task.id
         return targets
 
@@ -241,22 +250,76 @@ class TaskPoolService:
             if task.kind is not TaskKind.CONTROLLER:
                 continue
             assert task.control is not None
-            for route in task.control.routes:
-                for target_task_id in route.targets:
-                    if target_task_id not in tasks:
-                        raise ValueError(
-                            f"controller task {task.id} routes to missing task {target_task_id}"
-                        )
-                    target_task = tasks[target_task_id]
-                    if target_task_id in routed_targets:
-                        raise ValueError(
-                            f"task {target_task_id} is targeted by more than one controller route"
-                        )
-                    routed_targets[target_task_id] = task.id
-                    if task.id not in {dependency.task for dependency in target_task.depends_on}:
-                        raise ValueError(
-                            f"controller route {task.id} -> {target_task_id} requires {target_task_id} to depend_on {task.id}"
-                        )
+            if task.control.mode is TaskControlMode.ROUTE:
+                for route in task.control.routes:
+                    for target_task_id in route.targets:
+                        if target_task_id not in tasks:
+                            raise ValueError(
+                                f"controller task {task.id} routes to missing task {target_task_id}"
+                            )
+                        target_task = tasks[target_task_id]
+                        if target_task_id in routed_targets:
+                            raise ValueError(
+                                f"task {target_task_id} is targeted by more than one controller control edge"
+                            )
+                        routed_targets[target_task_id] = task.id
+                        if task.id not in {
+                            dependency.task for dependency in target_task.depends_on
+                        }:
+                            raise ValueError(
+                                f"controller route {task.id} -> {target_task_id} requires {target_task_id} to depend_on {task.id}"
+                            )
+                continue
+
+            controller_ancestors = self._collect_ancestors(tasks, task.id)
+            for target_task_id in task.control.stop_targets:
+                if target_task_id not in tasks:
+                    raise ValueError(
+                        f"loop controller task {task.id} stop target {target_task_id} is missing"
+                    )
+                target_task = tasks[target_task_id]
+                if target_task_id in routed_targets:
+                    raise ValueError(
+                        f"task {target_task_id} is targeted by more than one controller control edge"
+                    )
+                routed_targets[target_task_id] = task.id
+                if task.id not in {dependency.task for dependency in target_task.depends_on}:
+                    raise ValueError(
+                        f"loop stop target {task.id} -> {target_task_id} requires {target_task_id} to depend_on {task.id}"
+                    )
+
+            for target_task_id in task.control.continue_targets:
+                if target_task_id not in tasks:
+                    raise ValueError(
+                        f"loop controller task {task.id} continue target {target_task_id} is missing"
+                    )
+                if target_task_id in routed_targets:
+                    raise ValueError(
+                        f"task {target_task_id} is targeted by more than one controller control edge"
+                    )
+                if target_task_id not in controller_ancestors:
+                    raise ValueError(
+                        f"loop continue target {target_task_id} must be an ancestor of controller {task.id}"
+                    )
+                routed_targets[target_task_id] = task.id
+
+    def _collect_ancestors(
+        self,
+        tasks: dict[str, TaskSpec],
+        task_id: str,
+    ) -> set[str]:
+        ancestors: set[str] = set()
+        stack = [task_id]
+        while stack:
+            current = stack.pop()
+            for dependency in tasks[current].depends_on:
+                if dependency.task not in tasks:
+                    continue
+                if dependency.task in ancestors:
+                    continue
+                ancestors.add(dependency.task)
+                stack.append(dependency.task)
+        return ancestors
 
     def _validate_cycles(self, tasks: dict[str, TaskSpec]) -> None:
         visited: set[str] = set()

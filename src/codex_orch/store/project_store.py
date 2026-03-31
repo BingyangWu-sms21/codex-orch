@@ -24,6 +24,7 @@ from codex_orch.domain import (
     PresetSpec,
     ProjectSpec,
     RunEvent,
+    RunInputScopeState,
     RunInstanceState,
     RunRecord,
     TaskSpec,
@@ -299,8 +300,9 @@ class ProjectStore:
         _write_json(
             self.get_run_state_path(run.id),
             {
-                **run.model_dump(mode="json", exclude={"instances", "tasks"}),
+                **run.model_dump(mode="json", exclude={"instances", "tasks", "input_scopes"}),
                 "task_ids": sorted(run.tasks),
+                "input_scope_ids": sorted(run.input_scopes),
                 "instance_ids": sorted(run.instances),
             },
         )
@@ -308,6 +310,11 @@ class ProjectStore:
             _write_json(
                 self.get_run_task_path(run.id, task_id),
                 task.model_dump(mode="json", by_alias=True),
+            )
+        for input_scope_id, input_scope in run.input_scopes.items():
+            _write_json(
+                self.get_input_scope_state_path(run.id, input_scope_id),
+                input_scope.model_dump(mode="json"),
             )
         for instance_id, instance in run.instances.items():
             _write_json(
@@ -329,6 +336,9 @@ class ProjectStore:
         task_ids = summary.pop("task_ids", None)
         if not isinstance(task_ids, list):
             raise ValueError("run state task_ids must be a list")
+        input_scope_ids = summary.pop("input_scope_ids", None)
+        if not isinstance(input_scope_ids, list):
+            raise ValueError("run state input_scope_ids must be a list")
         instance_ids = summary.pop("instance_ids", [])
         if not isinstance(instance_ids, list):
             raise ValueError("run state instance_ids must be a list")
@@ -337,12 +347,24 @@ class ProjectStore:
             payload = _read_json(self.get_run_task_path(run_id, str(task_id)))
             task = TaskSpec.model_validate(payload)
             tasks[task.id] = task
+        input_scopes: dict[str, RunInputScopeState] = {}
+        for input_scope_id in input_scope_ids:
+            payload = _read_json(self.get_input_scope_state_path(run_id, str(input_scope_id)))
+            input_scope = RunInputScopeState.model_validate(payload)
+            input_scopes[input_scope.input_scope_id] = input_scope
         instances: dict[str, RunInstanceState] = {}
         for instance_id in instance_ids:
             payload = _read_json(self.get_instance_state_path(run_id, str(instance_id)))
             instance = RunInstanceState.model_validate(payload)
             instances[instance.instance_id] = instance
-        return RunRecord.model_validate({**summary, "tasks": tasks, "instances": instances})
+        return RunRecord.model_validate(
+            {
+                **summary,
+                "tasks": tasks,
+                "input_scopes": input_scopes,
+                "instances": instances,
+            }
+        )
 
     def get_run_dir(self, run_id: str) -> Path:
         run_dir = self.paths.runs_dir / run_id
@@ -391,6 +413,14 @@ class ProjectStore:
         path = self.get_result_state_path(run_id, instance_id)
         if path.exists():
             path.unlink()
+
+    def get_input_scopes_state_dir(self, run_id: str) -> Path:
+        path = self.get_run_state_dir(run_id) / "inputs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_input_scope_state_path(self, run_id: str, input_scope_id: str) -> Path:
+        return self.get_input_scopes_state_dir(run_id) / f"{input_scope_id}.json"
 
     def get_instance_state_path(self, run_id: str, instance_id: str) -> Path:
         return self.get_instances_state_dir(run_id) / f"{instance_id}.json"

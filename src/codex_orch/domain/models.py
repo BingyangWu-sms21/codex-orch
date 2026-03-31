@@ -29,6 +29,11 @@ class TaskKind(StrEnum):
     CONTROLLER = "controller"
 
 
+class TaskControlMode(StrEnum):
+    ROUTE = "route"
+    LOOP = "loop"
+
+
 class DependencyKind(StrEnum):
     CONTEXT = "context"
     ORDER = "order"
@@ -185,15 +190,54 @@ class ControllerRouteSpec(BaseModel):
 
 
 class TaskControlSpec(BaseModel):
-    routes: list[ControllerRouteSpec]
+    mode: TaskControlMode
+    routes: list[ControllerRouteSpec] = Field(default_factory=list)
+    continue_targets: list[str] = Field(default_factory=list)
+    stop_targets: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_control(self) -> TaskControlSpec:
-        if not self.routes:
-            raise ValueError("controller tasks must declare at least one route")
-        labels = [route.label for route in self.routes]
-        if len(set(labels)) != len(labels):
-            raise ValueError("controller route labels must be unique per task")
+        if self.mode is TaskControlMode.ROUTE:
+            if not self.routes:
+                raise ValueError("route controllers must declare at least one route")
+            if self.continue_targets or self.stop_targets:
+                raise ValueError(
+                    "route controllers may not declare continue_targets or stop_targets"
+                )
+            labels = [route.label for route in self.routes]
+            if len(set(labels)) != len(labels):
+                raise ValueError("controller route labels must be unique per task")
+            return self
+        if self.routes:
+            raise ValueError("loop controllers may not declare routes")
+        normalized_continue_targets = [
+            _validate_path_reference(
+                target,
+                field_name="control.continue_targets",
+            )
+            for target in self.continue_targets
+        ]
+        if not normalized_continue_targets:
+            raise ValueError("loop controllers must declare at least one continue target")
+        normalized_stop_targets = [
+            _validate_path_reference(
+                target,
+                field_name="control.stop_targets",
+            )
+            for target in self.stop_targets
+        ]
+        if len(set(normalized_continue_targets)) != len(normalized_continue_targets):
+            raise ValueError("loop continue targets must be unique per task")
+        if len(set(normalized_stop_targets)) != len(normalized_stop_targets):
+            raise ValueError("loop stop targets must be unique per task")
+        overlap = sorted(set(normalized_continue_targets) & set(normalized_stop_targets))
+        if overlap:
+            raise ValueError(
+                "loop continue and stop targets must not overlap: "
+                + ", ".join(overlap)
+            )
+        object.__setattr__(self, "continue_targets", normalized_continue_targets)
+        object.__setattr__(self, "stop_targets", normalized_stop_targets)
         return self
 
 

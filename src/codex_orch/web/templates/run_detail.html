@@ -24,6 +24,7 @@
       <tr>
         <th>Instance</th>
         <th>Task</th>
+        <th>Input scope</th>
         <th>Status</th>
         <th>Waiting reason</th>
         <th>Attempt</th>
@@ -45,6 +46,7 @@
       <tr>
         <td>{{ instance_id }}</td>
         <td>{{ instance.task_id }}</td>
+        <td>{{ instance.input_scope_id }}</td>
         <td>{{ instance.status.value }}</td>
         <td>{% if instance.waiting_reason %}{{ instance.waiting_reason.value }}{% else %}-{% endif %}</td>
         <td>{{ instance.attempt }}</td>

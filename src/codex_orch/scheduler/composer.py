@@ -68,7 +68,12 @@ class PromptComposer:
         parsed = parse_compose_ref(ref)
         if parsed.kind is ComposeRefKind.INPUT:
             assert parsed.input_key is not None
-            if parsed.input_key not in run.user_inputs:
+            resolved_input = self._resolve_input_value(
+                run=run,
+                input_scope_id=instance.input_scope_id,
+                input_key=parsed.input_key,
+            )
+            if resolved_input is None:
                 raise ValueError(f"missing run input {parsed.input_key}")
             safe_key = self._safe_ref_segment(parsed.input_key)
             return ensure_staged_generated_text(
@@ -76,7 +81,7 @@ class PromptComposer:
                 source_kind="compose_input_ref",
                 source_reference=ref,
                 staged_relative_path=f"context/refs/inputs/{safe_key}.txt",
-                text=run.user_inputs[parsed.input_key],
+                text=resolved_input,
             )
 
         assert parsed.scope is not None
@@ -184,3 +189,15 @@ class PromptComposer:
 
     def _safe_ref_segment(self, raw: str) -> str:
         return raw.replace("/", "__")
+
+    def _resolve_input_value(
+        self,
+        *,
+        run: RunRecord,
+        input_scope_id: str,
+        input_key: str,
+    ) -> str | None:
+        input_scope = run.input_scopes[input_scope_id]
+        if input_key in input_scope.values:
+            return input_scope.values[input_key]
+        return run.user_inputs.get(input_key)

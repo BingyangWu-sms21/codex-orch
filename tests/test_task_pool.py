@@ -307,7 +307,10 @@ def test_validate_graph_rejects_route_target_without_controller_dependency(tmp_p
             agent="default",
             kind="controller",
             status=TaskStatus.READY,
-            control={"routes": [{"label": "done", "targets": ["publish"]}]},
+            control={
+                "mode": "route",
+                "routes": [{"label": "done", "targets": ["publish"]}],
+            },
             publish=["final.md"],
         )
     )
@@ -322,4 +325,116 @@ def test_validate_graph_rejects_route_target_without_controller_dependency(tmp_p
     )
 
     with pytest.raises(ValueError, match="requires publish to depend_on gate"):
+        TaskPoolService(store).validate_graph()
+
+
+def test_validate_graph_rejects_continue_target_that_is_not_controller_ancestor(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="seed",
+            title="Seed",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="loop_gate",
+            title="Loop Gate",
+            agent="default",
+            kind="controller",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "seed", "kind": "order", "consume": []}],
+            control={
+                "mode": "loop",
+                "continue_targets": ["publish"],
+                "stop_targets": ["stop_task"],
+            },
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="publish",
+            title="Publish",
+            agent="default",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "loop_gate", "kind": "order", "consume": []}],
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="stop_task",
+            title="Stop Task",
+            agent="default",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "loop_gate", "kind": "order", "consume": []}],
+            publish=["final.md"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="must be an ancestor of controller loop_gate"):
+        TaskPoolService(store).validate_graph()
+
+
+def test_validate_graph_rejects_task_targeted_by_multiple_controller_control_edges(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="seed",
+            title="Seed",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="route_gate",
+            title="Route Gate",
+            agent="default",
+            kind="controller",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "seed", "kind": "order", "consume": []}],
+            control={
+                "mode": "route",
+                "routes": [{"label": "done", "targets": ["publish"]}],
+            },
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="loop_gate",
+            title="Loop Gate",
+            agent="default",
+            kind="controller",
+            status=TaskStatus.READY,
+            depends_on=[{"task": "seed", "kind": "order", "consume": []}],
+            control={
+                "mode": "loop",
+                "continue_targets": ["seed"],
+                "stop_targets": ["publish"],
+            },
+            publish=["final.md"],
+        )
+    )
+    store.save_task(
+        TaskSpec(
+            id="publish",
+            title="Publish",
+            agent="default",
+            status=TaskStatus.READY,
+            depends_on=[
+                {"task": "route_gate", "kind": "order", "consume": []},
+                {"task": "loop_gate", "kind": "order", "consume": []},
+            ],
+            publish=["final.md"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="targeted by more than one controller control edge"):
         TaskPoolService(store).validate_graph()

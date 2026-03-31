@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from codex_orch.domain.assistant import (
     ConfidenceLevel,
@@ -13,6 +13,7 @@ from codex_orch.domain.assistant import (
     RequestPriority,
 )
 from codex_orch.domain.models import (
+    TaskControlMode,
     NodeExecutionTerminationReason,
     ProjectSpec,
     PublishedArtifact,
@@ -65,6 +66,16 @@ class InterruptStatus(StrEnum):
 class InterruptReplyKind(StrEnum):
     ANSWER = "answer"
     HANDOFF_TO_HUMAN = "handoff_to_human"
+
+
+class ControlEnvelopeKind(StrEnum):
+    ROUTE = "route"
+    LOOP = "loop"
+
+
+class LoopAction(StrEnum):
+    CONTINUE = "continue"
+    STOP = "stop"
 
 
 class RunEvent(BaseModel):
@@ -194,9 +205,111 @@ class InterruptReply(BaseModel):
         return self
 
 
+class ControlEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: ControlEnvelopeKind
+    labels: list[str] = Field(default_factory=list)
+    action: LoopAction | None = None
+    next_inputs: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_control(self) -> ControlEnvelope:
+        if self.kind is ControlEnvelopeKind.ROUTE:
+            if self.action is not None or self.next_inputs:
+                raise ValueError(
+                    "route control may only define kind and labels"
+                )
+            normalized_labels: list[str] = []
+            for label in self.labels:
+                if not label.strip():
+                    raise ValueError("route control labels must not be blank")
+                normalized_labels.append(label)
+            object.__setattr__(self, "labels", normalized_labels)
+            return self
+
+        if self.labels:
+            raise ValueError("loop control may not define labels")
+        if self.action is None:
+            raise ValueError("loop control must define action")
+        normalized_inputs: dict[str, str] = {}
+        for key, value in self.next_inputs.items():
+            normalized_key = key.strip()
+            if not normalized_key:
+                raise ValueError("loop next_inputs keys must not be blank")
+            if not isinstance(value, str):
+                raise ValueError("loop next_inputs values must be strings")
+            normalized_inputs[normalized_key] = value
+        if self.action is LoopAction.CONTINUE:
+            if not normalized_inputs:
+                raise ValueError("loop continue must define next_inputs")
+        elif normalized_inputs:
+            raise ValueError("loop stop may not define next_inputs")
+        object.__setattr__(self, "next_inputs", normalized_inputs)
+        return self
+
+    def validate_against_task(self, task: TaskSpec) -> ControlEnvelope:
+        if task.kind.value != "controller" or task.control is None:
+            raise ValueError(f"task {task.id} is not a controller")
+        if self.kind.value != task.control.mode.value:
+            raise ValueError(
+                f"controller task {task.id} emitted control.kind={self.kind.value} "
+                f"but task.control.mode={task.control.mode.value}"
+            )
+        if self.kind is ControlEnvelopeKind.ROUTE:
+            assert task.control.mode is TaskControlMode.ROUTE
+            declared_labels = {route.label for route in task.control.routes}
+            undeclared = sorted(label for label in set(self.labels) if label not in declared_labels)
+            if undeclared:
+                raise ValueError(
+                    f"controller task {task.id} emitted undeclared labels: {', '.join(undeclared)}"
+                )
+        else:
+            assert task.control.mode is TaskControlMode.LOOP
+        return self
+
+
+class RunInputScopeState(BaseModel):
+    input_scope_id: str
+    parent_input_scope_id: str | None = None
+    seed_task_ids: list[str] = Field(default_factory=list)
+    values: dict[str, str] = Field(default_factory=dict)
+    created_by_instance_id: str | None = None
+    created_at: str = Field(default_factory=_utc_now_iso)
+
+    @model_validator(mode="after")
+    def validate_input_scope(self) -> RunInputScopeState:
+        if not self.input_scope_id.strip():
+            raise ValueError("input_scope_id must not be empty")
+        if self.parent_input_scope_id is not None and not self.parent_input_scope_id.strip():
+            raise ValueError("parent_input_scope_id must not be blank")
+        if self.created_by_instance_id is not None and not self.created_by_instance_id.strip():
+            raise ValueError("created_by_instance_id must not be blank")
+        normalized_seed_task_ids: list[str] = []
+        for task_id in self.seed_task_ids:
+            normalized_task_id = task_id.strip()
+            if not normalized_task_id:
+                raise ValueError("seed_task_ids must not contain blanks")
+            normalized_seed_task_ids.append(normalized_task_id)
+        if len(set(normalized_seed_task_ids)) != len(normalized_seed_task_ids):
+            raise ValueError("seed_task_ids must be unique per input scope")
+        normalized_values: dict[str, str] = {}
+        for key, value in self.values.items():
+            normalized_key = key.strip()
+            if not normalized_key:
+                raise ValueError("input scope values keys must not be blank")
+            if not isinstance(value, str):
+                raise ValueError("input scope values must be strings")
+            normalized_values[normalized_key] = value
+        object.__setattr__(self, "seed_task_ids", normalized_seed_task_ids)
+        object.__setattr__(self, "values", normalized_values)
+        return self
+
+
 class RunInstanceState(BaseModel):
     instance_id: str
     task_id: str
+    input_scope_id: str
     dependency_instances: dict[str, str] = Field(default_factory=dict)
     activation_bindings: dict[str, str] = Field(default_factory=dict)
     status: RunInstanceStatus = RunInstanceStatus.PENDING
@@ -216,6 +329,8 @@ class RunInstanceState(BaseModel):
             raise ValueError("instance_id must not be empty")
         if not self.task_id.strip():
             raise ValueError("task_id must not be empty")
+        if not self.input_scope_id.strip():
+            raise ValueError("input_scope_id must not be empty")
         for mapping_name in ("dependency_instances", "activation_bindings"):
             raw_mapping = getattr(self, mapping_name)
             for key, value in raw_mapping.items():
@@ -235,6 +350,7 @@ class RunRecord(BaseModel):
     user_inputs: dict[str, str] = Field(default_factory=dict)
     project: ProjectSpec
     tasks: dict[str, TaskSpec]
+    input_scopes: dict[str, RunInputScopeState]
     instances: dict[str, RunInstanceState]
 
     @model_validator(mode="after")
@@ -245,6 +361,25 @@ class RunRecord(BaseModel):
             raise ValueError("roots must not be empty")
         if not self.tasks:
             raise ValueError("tasks must not be empty")
+        if not self.input_scopes:
+            raise ValueError("input_scopes must not be empty")
+        for input_scope_id, input_scope in self.input_scopes.items():
+            if input_scope.input_scope_id != input_scope_id:
+                raise ValueError("run input scope snapshot keys must match scope ids")
+            if (
+                input_scope.parent_input_scope_id is not None
+                and input_scope.parent_input_scope_id not in self.input_scopes
+            ):
+                raise ValueError(
+                    f"input scope {input_scope_id} references missing parent {input_scope.parent_input_scope_id}"
+                )
+            if (
+                input_scope.created_by_instance_id is not None
+                and input_scope.created_by_instance_id not in self.instances
+            ):
+                raise ValueError(
+                    f"input scope {input_scope_id} references missing instance {input_scope.created_by_instance_id}"
+                )
         for task_id, task in self.tasks.items():
             if task.id != task_id:
                 raise ValueError("run task snapshot keys must match task ids")
@@ -252,5 +387,9 @@ class RunRecord(BaseModel):
             if instance.task_id not in self.tasks:
                 raise ValueError(
                     f"instance {instance.instance_id} references missing task {instance.task_id}"
+                )
+            if instance.input_scope_id not in self.input_scopes:
+                raise ValueError(
+                    f"instance {instance.instance_id} references missing input scope {instance.input_scope_id}"
                 )
         return self

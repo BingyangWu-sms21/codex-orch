@@ -1,10 +1,10 @@
 # Controller-Driven Runtime North Star
 
 This document defines the target runtime model for controller-driven branching
-and loops in `codex-orch`. Branching MVP is now implemented in the current
-runtime. This document remains future-facing for the remaining loop, channel,
-and richer workflow-state pieces. The current implemented runtime is documented
-in [docs/spec.md](./spec.md).
+and loops in `codex-orch`. The current runtime now implements explicit route
+and tail-loop controller modes plus run-level input scopes. This document
+remains future-facing for the remaining channel and richer workflow-state
+pieces. The current implemented runtime is documented in [docs/spec.md](./spec.md).
 
 For the future worker / assistant / human interaction control plane with named
 assistant roles and managed role-scoped preferences, see
@@ -17,23 +17,24 @@ filesystem-backed architecture.
 ## Why the current model is not enough
 
 Today's runtime already has a run-centered instance scheduler, attempt
-directories, interrupt/inbox channels, Codex session resume, controller route
-selection, and materialized per-instance results. That is sufficient for:
+directories, interrupt/inbox channels, Codex session resume, explicit
+controller route/loop control, run-level input scopes, and materialized
+per-instance results. That is sufficient for:
 
 - fixed `order` / `context` dependencies plus controller-driven branching
+- tail-controller loop continuation via next-iteration input scopes
 - published-artifact handoff and path-first result/artifact refs
 - pausing and resuming the same instance after assistant or human input
 
 It is not sufficient for:
 
-- loops that create multiple instances of the same logical task
-- richer routing based on declared channels and loop inputs
+- richer routing based on declared channels and shared workflow state
 - replay and reconciliation when routing decisions depend on side effects
 
 The core issue is no longer basic runtime persistence or resume mechanics. The
-gap is now higher-level control semantics beyond branching: loop lineage,
-declared channels, and richer workflow-state composition still need a more
-complete controller model.
+gap is now the remaining shared-state surface beyond the implemented route/loop
+MVP: declared channels, richer workflow-state composition, and eventual
+controller capabilities beyond the current explicit route-vs-loop split.
 
 ## Core Principles
 
@@ -105,7 +106,7 @@ program root.
 
 ### Task Additions
 
-Task definitions gain the following fields:
+Task definitions gain the following controller fields:
 
 ```yaml
 id: quality_gate
@@ -124,14 +125,12 @@ publish:
   - final.md
   - result.json
 control:
+  mode: route
   routes:
     - label: fix
       targets: [apply_fix]
     - label: done
       targets: [publish_summary]
-  loop:
-    continue_targets: [plan_iteration]
-    stop_targets: [publish_summary]
 ```
 
 New semantics:
@@ -140,9 +139,10 @@ New semantics:
 - `depends_on[].as` is optional; if omitted, `task` is the dependency scope key
 - `control` is valid only on `controller` nodes
 - `controller` nodes must publish `result.json`
-- `control.routes` maps emitted symbolic labels to downstream logical task ids
-- `control.loop` is optional and declares how the controller spawns the next
-  iteration or exits a loop
+- `control.mode=route` maps emitted symbolic labels to downstream logical task ids
+- `control.mode=loop` declares next-iteration continue seeds and same-iteration
+  stop targets
+- one controller instance emits exactly one control kind in the current runtime
 
 ### Dependency-Scoped References
 
@@ -174,19 +174,8 @@ for branching and loops.
     "summary": "integration tests failed"
   },
   "control": {
-    "labels": ["fix"],
-    "loop": {
-      "action": "continue",
-      "next_inputs": {
-        "attempt_budget": 2
-      }
-    },
-    "channel_writes": {
-      "review_summary": {
-        "status": "failing",
-        "reason": "integration tests failed"
-      }
-    }
+    "kind": "route",
+    "labels": ["fix"]
   }
 }
 ```
@@ -196,22 +185,20 @@ Rules:
 - controller `result.json` may carry arbitrary domain data under `result`
 - controller `result_schema`, when present, validates the full JSON document
 - `result.json.control` must conform to the built-in `ControlEnvelope` schema
-- `labels` is a set of symbolic route labels
-- labels are matched against `control.routes`
-- labels do not name downstream tasks directly
-- `loop.action` is `continue` or `stop`
-- `loop.next_inputs` is only valid when `loop.action == continue`
-- `channel_writes` may only write declared project channels
+- `control.kind=route` carries symbolic route labels matched against
+  `control.routes`
+- `control.kind=loop` carries `action=continue|stop`
+- `control.next_inputs` is only valid when `control.kind=loop` and
+  `action=continue`
 - controller outputs are materialized into workflow state before scheduling
 
 The scheduler must fail the controller instance when:
 
 - it emits a label that is not declared in `control.routes`
-- it writes to an undeclared channel
 - its `result.json` does not conform to `result_schema` or the built-in
   `ControlEnvelope` schema
-- it emits loop control incompatible with the controller's `control.loop`
-  configuration
+- it emits loop control incompatible with the controller's static
+  `control.mode=loop` configuration
 
 ## Branching Semantics
 
@@ -227,7 +214,7 @@ Routing algorithm:
 1. Resolve all upstream dependencies for the controller instance.
 2. Run the controller attempt(s) until it reaches `DONE` or `FAILED`.
 3. Materialize the controller result and `ControlEnvelope`.
-4. Activate all targets for every emitted label.
+4. Activate all targets for every emitted label in the same input scope.
 5. Record explicit route decision events for both selected and unselected
    labels.
 6. Do not create placeholder `SKIPPED` instances for unselected branches.
@@ -239,17 +226,21 @@ fake runtime instances.
 
 Loops use the same controller contract as branching.
 
-- A controller may both emit branch labels and emit loop control.
-- `loop.action == continue` creates a new iteration scope and instantiates
-  `control.loop.continue_targets`.
-- `loop.action == stop` activates `control.loop.stop_targets`, if any.
-- `loop.next_inputs` becomes the next iteration's `inputs` namespace.
+- In the current runtime, a controller is either `mode=route` or `mode=loop`,
+  not both.
+- `loop.action == continue` creates a new input scope and instantiates the
+  controller's configured `continue_targets` as next-iteration seeds.
+- `loop.action == stop` activates `stop_targets`, if any, in the current input
+  scope.
+- `next_inputs` becomes the next iteration's `inputs` namespace.
 
 Loop invariants:
 
 - every iteration creates new instance ids
-- dependency resolution is always against concrete upstream instances in the
-  current iteration lineage
+- instance identity includes concrete dependency bindings plus `input_scope_id`
+- same-iteration dependencies resolve against instances in the current input
+  scope when present, otherwise they may fall back to static base-scope
+  dependencies
 - author-facing references remain dependency-scoped even though the runtime is
   instance-based
 
@@ -341,8 +332,7 @@ Rules:
 - `state/` is the scheduler's read model
 - `inbox/` is actor input only
 - `instances/` stores attempt execution context and Codex session bindings
-- current node-local control-plane files become compatibility shims during
-  migration, not the long-term source of truth
+- node-local attempt files are execution context only, not scheduler truth
 
 ## Event Model
 
@@ -407,8 +397,9 @@ The north star intentionally breaks several current assumptions:
 - unselected branches are represented by route events, not `SKIPPED` runtime
   instances
 
-Compatibility work can stage this in phases, but the final runtime model should
-not preserve old control-plane shapes at the cost of clarity.
+The current runtime already took a hard cut to the explicit controller/input-
+scope model. Future work should continue that approach instead of preserving
+older control-plane shapes at the cost of clarity.
 
 ## Acceptance Scenarios
 

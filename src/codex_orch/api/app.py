@@ -493,6 +493,7 @@ def _compose_example() -> str:
 def _control_example() -> str:
     return yaml.safe_dump(
         {
+            "mode": "route",
             "routes": [
                 {
                     "label": "done",

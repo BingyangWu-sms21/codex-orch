@@ -13,18 +13,23 @@ from pathlib import Path
 from textwrap import dedent
 
 from codex_orch.domain import (
+    ControlEnvelope,
+    ControlEnvelopeKind,
     DependencyKind,
     InterruptReplyKind,
     InterruptStatus,
+    LoopAction,
     NodeExecutionRuntime,
     NodeExecutionTerminationReason,
     ProjectSpec,
     PublishedArtifact,
+    RunInputScopeState,
     RunInstanceState,
     RunInstanceStatus,
     RunInstanceWaitReason,
     RunRecord,
     RunStatus,
+    TaskControlMode,
     TaskKind,
     TaskSpec,
     TaskStatus,
@@ -64,6 +69,9 @@ class RunService:
                 task.id for task in tasks.values() if set(task.labels) & set(labels)
             )
         run_id = self._new_run_id()
+        base_input_scope = RunInputScopeState(
+            input_scope_id=self._new_input_scope_id(),
+        )
         materialized_tasks = {
             task_id: self._materialize_task(project, task)
             for task_id, task in selected.items()
@@ -74,12 +82,26 @@ class RunService:
             user_inputs=merged_inputs,
             project=project,
             tasks=materialized_tasks,
+            input_scopes={base_input_scope.input_scope_id: base_input_scope},
             instances={},
         )
         self.store.append_event(
             run.id,
             "run_created",
-            payload={"roots": run.roots, "task_ids": sorted(run.tasks)},
+            payload={
+                "roots": run.roots,
+                "task_ids": sorted(run.tasks),
+                "base_input_scope_id": base_input_scope.input_scope_id,
+            },
+        )
+        self.store.append_event(
+            run.id,
+            "input_scope_created",
+            payload={
+                "input_scope_id": base_input_scope.input_scope_id,
+                "seed_task_ids": [],
+                "created_by_instance_id": None,
+            },
         )
         self._sync_instances(run)
         self._refresh_runnable_instances(run)
@@ -550,44 +572,53 @@ class RunService:
     def _sync_instances(self, run: RunRecord) -> None:
         lineage_cache: dict[str, dict[str, str]] = {}
         while True:
-            created = False
+            created = self._sync_input_scopes(run)
             existing_keys = {
                 (
                     instance.task_id,
                     tuple(sorted(instance.dependency_instances.items())),
+                    instance.input_scope_id,
                 )
                 for instance in run.instances.values()
             }
-            for task_id in sorted(run.tasks):
-                task = run.tasks[task_id]
-                for dependency_instances, activation_bindings in self._candidate_instance_bindings(
-                    run,
-                    task,
-                    lineage_cache,
-                ):
-                    key = (task_id, tuple(sorted(dependency_instances.items())))
-                    if key in existing_keys:
-                        continue
-                    instance = RunInstanceState(
-                        instance_id=self._new_instance_id(task_id),
-                        task_id=task_id,
-                        dependency_instances=dependency_instances,
-                        activation_bindings=activation_bindings,
-                    )
-                    run.instances[instance.instance_id] = instance
-                    existing_keys.add(key)
-                    self.store.append_event(
-                        run.id,
-                        "instance_created",
-                        instance_id=instance.instance_id,
-                        payload={
-                            "task_id": task_id,
-                            "dependency_instances": dependency_instances,
-                            "activation_bindings": activation_bindings,
-                        },
-                    )
-                    lineage_cache.clear()
-                    created = True
+            for input_scope_id in sorted(run.input_scopes):
+                for task_id in sorted(run.tasks):
+                    task = run.tasks[task_id]
+                    for dependency_instances, activation_bindings in self._candidate_instance_bindings(
+                        run,
+                        task,
+                        input_scope_id,
+                        lineage_cache,
+                    ):
+                        key = (
+                            task_id,
+                            tuple(sorted(dependency_instances.items())),
+                            input_scope_id,
+                        )
+                        if key in existing_keys:
+                            continue
+                        instance = RunInstanceState(
+                            instance_id=self._new_instance_id(task_id),
+                            task_id=task_id,
+                            input_scope_id=input_scope_id,
+                            dependency_instances=dependency_instances,
+                            activation_bindings=activation_bindings,
+                        )
+                        run.instances[instance.instance_id] = instance
+                        existing_keys.add(key)
+                        self.store.append_event(
+                            run.id,
+                            "instance_created",
+                            instance_id=instance.instance_id,
+                            payload={
+                                "task_id": task_id,
+                                "input_scope_id": input_scope_id,
+                                "dependency_instances": dependency_instances,
+                                "activation_bindings": activation_bindings,
+                            },
+                        )
+                        lineage_cache.clear()
+                        created = True
             if not created:
                 return
 
@@ -595,19 +626,26 @@ class RunService:
         self,
         run: RunRecord,
         task: TaskSpec,
+        input_scope_id: str,
         lineage_cache: dict[str, dict[str, str]],
     ) -> list[tuple[dict[str, str], dict[str, str]]]:
+        input_scope = run.input_scopes[input_scope_id]
+        is_base_scope = input_scope_id == self._base_input_scope_id(run)
+        is_seed_task = task.id in input_scope.seed_task_ids
         if not task.depends_on:
-            return [({}, {})]
+            if is_base_scope or is_seed_task:
+                return [({}, {})]
+            return []
 
         dependency_candidates: list[list[RunInstanceState]] = []
-        routing_controller_id = self._task_route_controller_id(run.tasks, task.id)
+        control_owner = self._task_control_owner(run.tasks, task.id)
         for dependency in task.depends_on:
             candidates = self._dependency_candidate_instances(
                 run,
-                task,
                 dependency.task,
-                routing_controller_id=routing_controller_id,
+                input_scope_id=input_scope_id,
+                control_owner=control_owner,
+                target_task_id=task.id,
             )
             if not candidates:
                 return []
@@ -637,91 +675,255 @@ class RunService:
                     break
             if not valid:
                 continue
-            if routing_controller_id is not None:
-                controller_instance_id = dependency_instances.get(routing_controller_id)
+            if (
+                not is_base_scope
+                and not is_seed_task
+                and not any(candidate.input_scope_id == input_scope_id for candidate in combo)
+            ):
+                continue
+            if control_owner is not None:
+                controller_task_id, _ = control_owner
+                controller_instance_id = dependency_instances.get(controller_task_id)
                 if controller_instance_id is None:
                     continue
-                current = activation_bindings.get(routing_controller_id)
+                current = activation_bindings.get(controller_task_id)
                 if current is not None and current != controller_instance_id:
                     continue
-                activation_bindings[routing_controller_id] = controller_instance_id
+                activation_bindings[controller_task_id] = controller_instance_id
             bindings.append((dependency_instances, activation_bindings))
         return bindings
 
     def _dependency_candidate_instances(
         self,
         run: RunRecord,
-        task: TaskSpec,
         dependency_task_id: str,
         *,
-        routing_controller_id: str | None,
+        input_scope_id: str,
+        control_owner: tuple[str, str] | None,
+        target_task_id: str,
     ) -> list[RunInstanceState]:
-        candidates = sorted(
+        scoped_candidates = sorted(
             (
                 instance
                 for instance in run.instances.values()
                 if instance.task_id == dependency_task_id
+                and instance.input_scope_id == input_scope_id
             ),
             key=lambda instance: instance.instance_id,
         )
-        if routing_controller_id != dependency_task_id:
-            return candidates
+        if control_owner is not None and control_owner[0] == dependency_task_id:
+            if not scoped_candidates:
+                return []
+            if control_owner[1] == "route":
+                return [
+                    instance
+                    for instance in scoped_candidates
+                    if self._controller_instance_selects_route_target(
+                        run,
+                        instance,
+                        target_task_id,
+                    )
+                ]
+            return [
+                instance
+                for instance in scoped_candidates
+                if self._controller_instance_stops_to_target(
+                    run,
+                    instance,
+                    target_task_id,
+                )
+            ]
+        if scoped_candidates:
+            return scoped_candidates
+        base_input_scope_id = self._base_input_scope_id(run)
+        if input_scope_id == base_input_scope_id:
+            return []
+        if not self._input_scope_can_reuse_base_dependency(
+            run,
+            input_scope_id=input_scope_id,
+            dependency_task_id=dependency_task_id,
+        ):
+            return []
         return [
             instance
-            for instance in candidates
-            if self._controller_instance_selects_target(run, instance, task.id)
+            for instance in sorted(
+                (
+                    candidate
+                    for candidate in run.instances.values()
+                    if candidate.task_id == dependency_task_id
+                    and candidate.input_scope_id == base_input_scope_id
+                ),
+                key=lambda instance: instance.instance_id,
+            )
         ]
 
-    def _task_route_controller_id(
+    def _task_control_owner(
         self,
         tasks: dict[str, TaskSpec],
         task_id: str,
-    ) -> str | None:
+    ) -> tuple[str, str] | None:
         for candidate in tasks.values():
             if candidate.kind is not TaskKind.CONTROLLER or candidate.control is None:
                 continue
-            for route in candidate.control.routes:
-                if task_id in route.targets:
-                    return candidate.id
+            if candidate.control.mode is TaskControlMode.ROUTE:
+                for route in candidate.control.routes:
+                    if task_id in route.targets:
+                        return candidate.id, "route"
+                continue
+            if task_id in candidate.control.stop_targets:
+                return candidate.id, "stop"
         return None
 
-    def _controller_instance_selects_target(
+    def _input_scope_can_reuse_base_dependency(
+        self,
+        run: RunRecord,
+        *,
+        input_scope_id: str,
+        dependency_task_id: str,
+    ) -> bool:
+        input_scope = run.input_scopes[input_scope_id]
+        return any(
+            dependency_task_id in self._task_ancestors(run.tasks, seed_task_id)
+            for seed_task_id in input_scope.seed_task_ids
+        )
+
+    def _task_ancestors(
+        self,
+        tasks: dict[str, TaskSpec],
+        task_id: str,
+    ) -> set[str]:
+        ancestors: set[str] = set()
+        stack = [task_id]
+        while stack:
+            current = stack.pop()
+            for dependency in tasks[current].depends_on:
+                if dependency.task not in tasks or dependency.task in ancestors:
+                    continue
+                ancestors.add(dependency.task)
+                stack.append(dependency.task)
+        return ancestors
+
+    def _controller_instance_selects_route_target(
         self,
         run: RunRecord,
         instance: RunInstanceState,
         target_task_id: str,
     ) -> bool:
         task = run.tasks[instance.task_id]
-        if task.kind is not TaskKind.CONTROLLER or task.control is None:
+        if (
+            task.kind is not TaskKind.CONTROLLER
+            or task.control is None
+            or task.control.mode is not TaskControlMode.ROUTE
+        ):
             return False
-        labels = self._controller_labels_for_instance(run.id, instance.instance_id)
-        if labels is None:
+        control = self._controller_control_for_instance(run, instance.instance_id)
+        if control is None or control.kind is not ControlEnvelopeKind.ROUTE:
             return False
         for route in task.control.routes:
-            if route.label in labels and target_task_id in route.targets:
+            if route.label in control.labels and target_task_id in route.targets:
                 return True
         return False
 
-    def _controller_labels_for_instance(
+    def _controller_instance_stops_to_target(
         self,
-        run_id: str,
+        run: RunRecord,
+        instance: RunInstanceState,
+        target_task_id: str,
+    ) -> bool:
+        task = run.tasks[instance.task_id]
+        if (
+            task.kind is not TaskKind.CONTROLLER
+            or task.control is None
+            or task.control.mode is not TaskControlMode.LOOP
+        ):
+            return False
+        control = self._controller_control_for_instance(run, instance.instance_id)
+        if (
+            control is None
+            or control.kind is not ControlEnvelopeKind.LOOP
+            or control.action is not LoopAction.STOP
+        ):
+            return False
+        return target_task_id in task.control.stop_targets
+
+    def _controller_control_for_instance(
+        self,
+        run: RunRecord,
         instance_id: str,
-    ) -> set[str] | None:
-        payload = self.store.maybe_get_instance_result(run_id, instance_id)
+    ) -> ControlEnvelope | None:
+        payload = self.store.maybe_get_instance_result(run.id, instance_id)
         if not isinstance(payload, dict):
             return None
         control = payload.get("control")
         if not isinstance(control, dict):
             return None
-        labels = control.get("labels")
-        if not isinstance(labels, list):
+        task = run.tasks[run.instances[instance_id].task_id]
+        try:
+            return ControlEnvelope.model_validate(control).validate_against_task(task)
+        except ValueError:
             return None
-        normalized: set[str] = set()
-        for label in labels:
-            if not isinstance(label, str) or not label.strip():
-                return None
-            normalized.add(label)
-        return normalized
+
+    def _sync_input_scopes(self, run: RunRecord) -> bool:
+        created = False
+        existing_by_creator = {
+            input_scope.created_by_instance_id: input_scope.input_scope_id
+            for input_scope in run.input_scopes.values()
+            if input_scope.created_by_instance_id is not None
+        }
+        for instance in sorted(run.instances.values(), key=lambda candidate: candidate.instance_id):
+            if instance.status is not RunInstanceStatus.DONE:
+                continue
+            if instance.instance_id in existing_by_creator:
+                continue
+            task = run.tasks[instance.task_id]
+            if (
+                task.kind is not TaskKind.CONTROLLER
+                or task.control is None
+                or task.control.mode is not TaskControlMode.LOOP
+            ):
+                continue
+            control = self._controller_control_for_instance(run, instance.instance_id)
+            if (
+                control is None
+                or control.kind is not ControlEnvelopeKind.LOOP
+                or control.action is not LoopAction.CONTINUE
+            ):
+                continue
+            current_scope = run.input_scopes[instance.input_scope_id]
+            next_scope = RunInputScopeState(
+                input_scope_id=self._new_input_scope_id(),
+                parent_input_scope_id=current_scope.input_scope_id,
+                seed_task_ids=list(task.control.continue_targets),
+                values={
+                    **current_scope.values,
+                    **control.next_inputs,
+                },
+                created_by_instance_id=instance.instance_id,
+            )
+            run.input_scopes[next_scope.input_scope_id] = next_scope
+            existing_by_creator[instance.instance_id] = next_scope.input_scope_id
+            self.store.append_event(
+                run.id,
+                "input_scope_created",
+                instance_id=instance.instance_id,
+                payload={
+                    "input_scope_id": next_scope.input_scope_id,
+                    "parent_input_scope_id": current_scope.input_scope_id,
+                    "seed_task_ids": next_scope.seed_task_ids,
+                    "created_by_instance_id": instance.instance_id,
+                },
+            )
+            created = True
+        return created
+
+    def _base_input_scope_id(self, run: RunRecord) -> str:
+        for input_scope in run.input_scopes.values():
+            if (
+                input_scope.parent_input_scope_id is None
+                and input_scope.created_by_instance_id is None
+            ):
+                return input_scope.input_scope_id
+        raise ValueError("run is missing a base input scope")
 
     def _instance_lineage(
         self,
@@ -978,9 +1180,9 @@ class RunService:
         if payload is None:
             self.store.delete_instance_result(run_id, instance_id)
             return
-        labels: list[str] | None = None
+        control_envelope: ControlEnvelope | None = None
         if task.kind is TaskKind.CONTROLLER:
-            labels = self._validate_controller_result(task, payload)
+            control_envelope = self._validate_controller_result(task, payload)
         self.store.save_instance_result(run_id, instance_id, payload)
         self.store.append_event(
             run_id,
@@ -990,22 +1192,43 @@ class RunService:
         )
         if task.kind is not TaskKind.CONTROLLER:
             return
-        assert labels is not None
+        assert control_envelope is not None
         self.store.append_event(
             run_id,
             "control_emitted",
             instance_id=instance_id,
-            payload={"labels": labels},
+            payload={"kind": control_envelope.kind.value},
         )
         assert task.control is not None
-        label_set = set(labels)
-        for route in task.control.routes:
+        if control_envelope.kind is ControlEnvelopeKind.ROUTE:
+            assert task.control.mode is TaskControlMode.ROUTE
+            label_set = set(control_envelope.labels)
+            for route in task.control.routes:
+                self.store.append_event(
+                    run_id,
+                    "route_selected" if route.label in label_set else "route_unselected",
+                    instance_id=instance_id,
+                    payload={"label": route.label, "targets": route.targets},
+                )
+            return
+        assert task.control.mode is TaskControlMode.LOOP
+        if control_envelope.action is LoopAction.CONTINUE:
             self.store.append_event(
                 run_id,
-                "route_selected" if route.label in label_set else "route_unselected",
+                "loop_continued",
                 instance_id=instance_id,
-                payload={"label": route.label, "targets": route.targets},
+                payload={
+                    "continue_targets": task.control.continue_targets,
+                    "next_inputs": control_envelope.next_inputs,
+                },
             )
+            return
+        self.store.append_event(
+            run_id,
+            "loop_stopped",
+            instance_id=instance_id,
+            payload={"stop_targets": task.control.stop_targets},
+        )
 
     def _load_attempt_result_payload(
         self,
@@ -1031,35 +1254,19 @@ class RunService:
         self,
         task: TaskSpec,
         payload: object,
-    ) -> list[str]:
+    ) -> ControlEnvelope:
         if not isinstance(payload, dict):
             raise ValueError(f"controller task {task.id} result.json must be a JSON object")
         control = payload.get("control")
         if not isinstance(control, dict):
             raise ValueError(f"controller task {task.id} result.json must include control")
-        unsupported_keys = sorted(set(control) - {"labels"})
-        if unsupported_keys:
-            raise ValueError(
-                f"controller task {task.id} emitted unsupported control keys: {', '.join(unsupported_keys)}"
-            )
-        labels = control.get("labels")
-        if not isinstance(labels, list):
-            raise ValueError(f"controller task {task.id} control.labels must be a list")
-        normalized: list[str] = []
-        for label in labels:
-            if not isinstance(label, str) or not label.strip():
-                raise ValueError(
-                    f"controller task {task.id} control.labels must contain non-empty strings"
-                )
-            normalized.append(label)
         assert task.control is not None
-        declared_labels = {route.label for route in task.control.routes}
-        undeclared = sorted(label for label in set(normalized) if label not in declared_labels)
-        if undeclared:
+        try:
+            return ControlEnvelope.model_validate(control).validate_against_task(task)
+        except ValueError as exc:
             raise ValueError(
-                f"controller task {task.id} emitted undeclared labels: {', '.join(undeclared)}"
-            )
-        return normalized
+                f"controller task {task.id} emitted invalid control: {exc}"
+            ) from exc
 
     def _materialize_task(self, project: ProjectSpec, task: TaskSpec) -> TaskSpec:
         effective_sandbox = task.sandbox or project.default_sandbox
@@ -1234,16 +1441,29 @@ class RunService:
         if task.result_schema is not None:
             sections.append(f"### Result Schema\n- `{task.result_schema}`")
         if task.kind is TaskKind.CONTROLLER:
-            sections.append(
-                "\n".join(
+            assert task.control is not None
+            controller_lines = [
+                "### Controller Result Contract",
+                "- Your final response must be a JSON object saved as `result.json`.",
+                "- Use `control` as the only scheduler-facing control surface.",
+                "- You may base control on run inputs, dependency results/artifacts, runtime observations, and any replies applied on resume.",
+            ]
+            if task.control.mode is TaskControlMode.ROUTE:
+                controller_lines.extend(
                     [
-                        "### Controller Result Contract",
-                        "- Your final response must be a JSON object saved as `result.json`.",
-                        '- It must include a top-level `control` object with `labels: string[]`.',
-                        "- `control` may not contain loop or channel fields in this runtime.",
+                        '- Set `control.kind = "route"`.',
+                        "- Set `control.labels` to the symbolic labels that should activate downstream route targets.",
                     ]
                 )
-            )
+            else:
+                controller_lines.extend(
+                    [
+                        '- Set `control.kind = "loop"`.',
+                        '- Set `control.action` to `"continue"` or `"stop"`.',
+                        '- When continuing, include string-valued `control.next_inputs` for the next iteration input scope.',
+                    ]
+                )
+            sections.append("\n".join(controller_lines))
         sections.append(
             "\n".join(
                 [
@@ -1329,3 +1549,6 @@ class RunService:
 
     def _new_instance_id(self, task_id: str) -> str:
         return f"{task_id}-{uuid.uuid4().hex[:8]}"
+
+    def _new_input_scope_id(self) -> str:
+        return f"scope-{uuid.uuid4().hex[:8]}"
