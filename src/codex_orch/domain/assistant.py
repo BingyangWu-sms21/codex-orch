@@ -66,6 +66,7 @@ class AssistantUpdateKind(StrEnum):
     INSTRUCTION_UPDATE = "instruction_update"
     MANAGED_ASSET_UPDATE = "managed_asset_update"
     ROUTING_POLICY_UPDATE = "routing_policy_update"
+    PROGRAM_ASSET_UPDATE = "program_asset_update"
 
 
 class AssistantUpdateContentMode(StrEnum):
@@ -250,6 +251,22 @@ class AssistantUpdateProposal(BaseModel):
                 raise ValueError(
                     "managed_asset_update target may only set role_id and managed_asset_path"
                 )
+        elif self.kind is AssistantUpdateKind.PROGRAM_ASSET_UPDATE:
+            if self.target.managed_asset_path is None:
+                raise ValueError(
+                    "program_asset_update requires target.managed_asset_path"
+                )
+            if any(
+                value is not None
+                for value in (
+                    self.target.role_id,
+                    self.target.task_id,
+                    self.target.routing_section,
+                )
+            ):
+                raise ValueError(
+                    "program_asset_update target may only set managed_asset_path"
+                )
         else:
             if self.target.task_id is None or self.target.routing_section is None:
                 raise ValueError(
@@ -277,7 +294,6 @@ class AssistantResponse(BaseModel):
     citations: list[str] = Field(default_factory=list)
     payload: dict[str, object] = Field(default_factory=dict)
     proposed_updates: list[AssistantUpdateProposal] = Field(default_factory=list)
-    proposed_control_actions: list[ControlActionKind] = Field(default_factory=list)
     created_at: str = Field(default_factory=_utc_now_iso)
 
     @model_validator(mode="after")

@@ -737,3 +737,65 @@ def test_assistant_worker_fails_when_shared_operating_model_is_missing(tmp_path:
 
     stats = worker.run_once()
     assert stats.failed == 1
+
+
+def test_assistant_worker_records_program_asset_update_proposal(tmp_path: Path) -> None:
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+        )
+    )
+    run = RunService(store, FakeRunner()).create_snapshot(
+        roots=["worker"],
+        labels=[],
+        user_inputs=None,
+    )
+    instance = _instance_for_task(run, "worker")
+    _create_assistant_interrupt(
+        store,
+        run_id=run.id,
+        instance_id=instance.instance_id,
+        task_id="worker",
+    )
+
+    backend = StubBackend(
+        AssistantBackendResult(
+            resolution_kind=ResolutionKind.AUTO_REPLY,
+            answer="Added new finding.",
+            rationale="Scan detected a new issue.",
+            proposed_updates=(
+                AssistantUpdateProposal(
+                    kind=AssistantUpdateKind.PROGRAM_ASSET_UPDATE,
+                    summary="Add newly discovered finding",
+                    rationale="Scan found a new maintenance issue.",
+                    suggested_content_mode=AssistantUpdateContentMode.SNIPPET,
+                    suggested_content="findings:\n  - id: F-042\n    severity: medium\n",
+                    target=AssistantUpdateTarget(
+                        managed_asset_path="inputs/known_findings.yaml",
+                    ),
+                ),
+            ),
+        )
+    )
+    worker = AssistantWorkerService(
+        store,
+        backend=backend,
+        run_service=RunService(store, FakeRunner()),
+    )
+
+    stats = worker.run_once()
+    proposals = store.list_proposals(run_id=run.id)
+    events = store.list_events(run.id)
+
+    assert stats.auto_replied == 1
+    assert len(proposals) == 1
+    assert proposals[0].status is AssistantUpdateStatus.PROPOSED
+    assert proposals[0].proposal.kind is AssistantUpdateKind.PROGRAM_ASSET_UPDATE
+    assert str(proposals[0].target_file_path).endswith("inputs/known_findings.yaml")
+    assert any(event.event_type == "proposal_recorded" for event in events)

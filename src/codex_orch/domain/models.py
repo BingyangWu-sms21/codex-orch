@@ -10,6 +10,18 @@ from codex_orch.compose_refs import parse_compose_ref
 from codex_orch.domain.assistant import DecisionKind
 
 
+class RequiredDecisionAudience(StrEnum):
+    HUMAN = "human"
+    ASSISTANT = "assistant"
+    ANY = "any"
+
+
+class RequiredDecision(BaseModel):
+    decision_kind: DecisionKind
+    audience: RequiredDecisionAudience = RequiredDecisionAudience.HUMAN
+    description: str = ""
+
+
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -69,6 +81,7 @@ class NodeExecutionFailureKind(StrEnum):
     OUTPUT_SCHEMA = "output_schema"
     RUNNER_INVOCATION = "runner_invocation"
     TASK_RUNTIME = "task_runtime"
+    DECISION_OBLIGATION = "decision_obligation"
     UNKNOWN = "unknown"
 
 
@@ -310,6 +323,7 @@ class TaskSpec(BaseModel):
     control: TaskControlSpec | None = None
     assistant_hints: TaskAssistantHints = Field(default_factory=TaskAssistantHints)
     interaction_policy: TaskInteractionPolicy = Field(default_factory=TaskInteractionPolicy)
+    required_decisions: list[RequiredDecision] = Field(default_factory=list)
     model: str | None = None
     sandbox: str | None = None
     workspace: str | None = None

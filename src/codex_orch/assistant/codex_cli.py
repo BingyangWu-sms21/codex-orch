@@ -14,7 +14,6 @@ from codex_orch.assistant.base import AssistantBackendRequest, AssistantBackendR
 from codex_orch.domain import (
     AssistantUpdateProposal,
     ConfidenceLevel,
-    ControlActionKind,
     ResolutionKind,
 )
 from codex_orch.input_values import ensure_json_object
@@ -71,6 +70,7 @@ def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
                                 "instruction_update",
                                 "managed_asset_update",
                                 "routing_policy_update",
+                                "program_asset_update",
                             ],
                         },
                         "summary": {"type": "string", "minLength": 1},
@@ -110,13 +110,6 @@ def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
                     ],
                 },
             },
-            "proposed_control_actions": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": [kind.value for kind in ControlActionKind],
-                },
-            },
         },
         "required": [
             "resolution_kind",
@@ -126,7 +119,6 @@ def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
             "citations",
             "payload",
             "proposed_updates",
-            "proposed_control_actions",
         ],
     }
 
@@ -170,10 +162,6 @@ class CodexCliAssistantBackend:
                 field_name="assistant payload",
             ),
             proposed_updates=_parse_proposed_updates(payload.get("proposed_updates", [])),
-            proposed_control_actions=tuple(
-                ControlActionKind(raw)
-                for raw in payload.get("proposed_control_actions", [])
-            ),
         )
 
     def _build_command(
@@ -384,9 +372,8 @@ class CodexCliAssistantBackend:
                         if request.reply_schema_path is not None
                         else "Set payload to a JSON object. Use `{}` when no structured payload is needed."
                     ),
-                    "Use proposed_updates for repository-facing update proposals about instructions, managed assets, or routing policy.",
-                    "Keep proposed_control_actions empty unless a control-plane action is truly necessary.",
-                    "Treat proposed_updates and proposed_control_actions as proposals only; codex-orch records them but does not execute them automatically.",
+                    "Use proposed_updates for repository-facing update proposals about instructions, managed assets, routing policy, or program-owned assets such as inputs.",
+                    "Treat proposed_updates as proposals only; codex-orch records them but does not execute them automatically.",
                 ]
             ),
         ]

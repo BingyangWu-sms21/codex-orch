@@ -1,0 +1,18 @@
+id: drain_summary
+title: Summarize backlog drain results
+kind: work
+agent: default
+status: ready
+depends_on:
+  - task: drain_gate
+    as: gate
+    kind: order
+    consume: []
+compose:
+  - kind: file
+    path: prompts/drain_summary.md
+  - kind: ref
+    ref: inputs.accumulated_results
+publish:
+  - final.md
+  - result.json

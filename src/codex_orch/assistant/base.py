@@ -8,7 +8,6 @@ from codex_orch.domain import (
     AssistantRequest,
     AssistantUpdateProposal,
     ConfidenceLevel,
-    ControlActionKind,
     ProjectSpec,
     ResolutionKind,
     TaskSpec,
@@ -41,7 +40,6 @@ class AssistantBackendResult:
     citations: tuple[str, ...] = ()
     payload: JsonObject = field(default_factory=dict)
     proposed_updates: tuple[AssistantUpdateProposal, ...] = ()
-    proposed_control_actions: tuple[ControlActionKind, ...] = ()
 
 
 class AssistantBackend(Protocol):

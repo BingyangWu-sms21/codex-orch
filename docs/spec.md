@@ -63,6 +63,8 @@ Task additions in the current runtime:
 - route controllers declare `control.routes[]`
 - loop controllers declare `control.continue_targets[]` and optional `control.stop_targets[]`
 - `compose.ref`: runtime state references with path-first staging
+- `required_decisions`: optional list of decision obligations that the instance
+  must fulfill by creating matching blocking interrupts before completing
 
 `compose.ref` supports:
 
@@ -256,6 +258,15 @@ proposals are recorded under `.runs/<run-id>/proposals/` and invalid proposals
 are dropped with corresponding runtime events. Proposal records are manual
 operator input only and are never auto-applied by runtime automation.
 
+Supported proposal kinds:
+
+- `instruction_update`: update a role's instructions file
+- `managed_asset_update`: update a role's managed asset file
+- `routing_policy_update`: update a task's assistant hints or interaction policy
+- `program_asset_update`: update a program-owned asset such as `inputs/*.yaml`
+  or other repo-visible files; target path is program-relative and not scoped
+  to any assistant role
+
 Assistant replies with `reply_kind=handoff_to_human` are recorded on the
 assistant interrupt and then materialize a new human interrupt on the same
 instance, but only when the task's `interaction_policy.allow_human` is true.
@@ -344,3 +355,27 @@ Recovery entrypoints:
   access so prompts, logs, `final.md`, and `result.json` can be materialized
 - `extra_writable_roots` maps directly to Codex CLI `--add-dir`
 - full filesystem access should use `sandbox: danger-full-access`
+
+## Decision obligation semantics
+
+Tasks may declare `required_decisions`, a list of decision obligations. Each
+entry specifies a `decision_kind` and an `audience` (`human`, `assistant`, or
+`any`).
+
+When an instance completes successfully, the scheduler checks whether the
+instance created a blocking interrupt matching each required decision. If any
+required decision was never created, the instance is failed with
+`failure_kind=decision_obligation` instead of transitioning to `done`.
+
+This turns soft guidance like `ask_when` into an enforceable runtime contract.
+The worker prompt may still decide *when* to create the interrupt, but the
+engine guarantees that the interrupt was created before the task can succeed.
+
+Example task declaration:
+
+```yaml
+required_decisions:
+  - decision_kind: review
+    audience: human
+    description: "Repair plan must be reviewed by a human before proceeding"
+```

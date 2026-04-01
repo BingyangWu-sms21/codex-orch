@@ -1538,3 +1538,99 @@ def test_loop_route_descendants_do_not_reuse_base_scope_branch_instances(tmp_pat
     )
 
     assert all(instance.input_scope_id != next_scope_id for instance in join_instances)
+
+
+def test_required_decisions_fails_instance_when_obligation_not_met(tmp_path: Path) -> None:
+    """Instance should fail when required_decisions are declared but no matching interrupt was created."""
+    store = build_test_store(tmp_path)
+    store.save_task(
+        TaskSpec(
+            id="gated_task",
+            title="Gated Task",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+            required_decisions=[
+                {
+                    "decision_kind": "review",
+                    "audience": "human",
+                    "description": "Human review required",
+                },
+            ],
+        )
+    )
+
+    runner = FakeRunner()
+    service = RunService(store, runner)
+    run = asyncio.run(service.start_run(roots=["gated_task"], labels=[], user_inputs=None))
+
+    instance = _instance_for_task(run, "gated_task")
+    assert instance.status is RunInstanceStatus.FAILED
+    assert instance.failure_kind is NodeExecutionFailureKind.DECISION_OBLIGATION
+    assert "review" in (instance.failure_summary or "")
+    assert run.status is RunStatus.FAILED
+
+
+def test_required_decisions_passes_when_obligation_met(tmp_path: Path) -> None:
+    """Instance should succeed when required_decisions are met by a matching blocking interrupt."""
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+            required_decisions=[
+                {
+                    "decision_kind": "policy",
+                    "audience": "assistant",
+                    "description": "Policy decision required",
+                },
+            ],
+        )
+    )
+
+    runner = FakeRunner(store)
+    service = RunService(store, runner)
+    run = asyncio.run(service.start_run(roots=["worker"], labels=[], user_inputs=None))
+
+    # FakeRunner creates an assistant interrupt with decision_kind=policy for task "worker"
+    # The interrupt is blocking and audience=assistant, matching the obligation
+    instance = _instance_for_task(run, "worker")
+    # Instance should be waiting (interrupt unresolved) or done if auto-resolved
+    # With FakeRunner, the interrupt is created but not resolved, so instance waits
+    assert instance.status is RunInstanceStatus.WAITING
+    assert run.status is RunStatus.WAITING
+
+
+def test_required_decisions_any_audience_matches_either(tmp_path: Path) -> None:
+    """audience=any should match interrupts with either human or assistant audience."""
+    store = build_test_store(tmp_path)
+    write_assistant_role(store)
+    store.save_task(
+        TaskSpec(
+            id="worker",
+            title="Worker",
+            agent="default",
+            status=TaskStatus.READY,
+            publish=["final.md"],
+            required_decisions=[
+                {
+                    "decision_kind": "policy",
+                    "audience": "any",
+                    "description": "Any audience policy check",
+                },
+            ],
+        )
+    )
+
+    runner = FakeRunner(store)
+    service = RunService(store, runner)
+    run = asyncio.run(service.start_run(roots=["worker"], labels=[], user_inputs=None))
+
+    instance = _instance_for_task(run, "worker")
+    # FakeRunner creates assistant interrupt with decision_kind=policy → matches audience=any
+    assert instance.status is RunInstanceStatus.WAITING
+    assert run.status is RunStatus.WAITING

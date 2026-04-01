@@ -305,6 +305,11 @@ North-star flow:
 3. Human/operator reviews the proposal.
 4. If accepted, the managed role asset is edited manually in the repo.
 
+Proposals are not limited to assistant control-plane assets. The
+`program_asset_update` kind allows proposing changes to any program-owned
+file such as `inputs/*.yaml`, registries, or policy documents. The target
+path is program-relative and does not require a role scope.
+
 Explicit non-goals for this version:
 
 - runtime auto-approval

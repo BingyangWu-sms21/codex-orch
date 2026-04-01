@@ -1,0 +1,9 @@
+name: backlog-drain-program
+workspace: ${inputs.repo_workspace}
+description: Example program for backlog-drain convergence. Scans a codebase, builds a prioritized backlog, then iteratively processes items with verify and registry-update steps.
+default_agent: default
+default_sandbox: workspace-write
+max_concurrency: 2
+user_inputs:
+  repo_workspace: inputs/repo_workspace.txt
+  backlog_budget: inputs/backlog_budget.txt

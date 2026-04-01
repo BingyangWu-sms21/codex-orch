@@ -1,0 +1,14 @@
+id: scan_and_prioritize
+title: Scan codebase and build prioritized backlog
+kind: work
+agent: default
+status: ready
+compose:
+  - kind: file
+    path: prompts/scan_and_prioritize.md
+  - kind: ref
+    ref: inputs.backlog_budget
+publish:
+  - final.md
+  - result.json
+result_schema: schemas/scan_result.json

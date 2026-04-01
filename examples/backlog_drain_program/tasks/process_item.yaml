@@ -1,0 +1,26 @@
+id: process_item
+title: Implement and verify a single backlog item
+kind: work
+agent: default
+status: ready
+compose:
+  - kind: file
+    path: prompts/process_item.md
+  - kind: ref
+    ref: inputs.current_item
+  - kind: ref
+    ref: inputs.remaining_backlog
+publish:
+  - final.md
+  - result.json
+result_schema: schemas/process_result.json
+assistant_hints:
+  ask_when:
+    - approval_required
+    - ambiguous_product_direction
+interaction_policy:
+  allow_human: true
+required_decisions:
+  - decision_kind: review
+    audience: human
+    description: "Each repair must be reviewed by a human before the loop continues"

@@ -109,6 +109,9 @@ def _resolve_target_file_path(
                 f"managed_asset_update must target one of the current role's declared managed assets: {', '.join(sorted(declared_asset_map))}"
             )
         return target_asset_path
+    if proposal.kind is AssistantUpdateKind.PROGRAM_ASSET_UPDATE:
+        assert target.managed_asset_path is not None
+        return store.paths.root / target.managed_asset_path
     if target.task_id != task.id:
         raise ValueError(
             f"routing_policy_update may only target current requester task {task.id}"

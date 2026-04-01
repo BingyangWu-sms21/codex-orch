@@ -24,6 +24,7 @@ from codex_orch.domain import (
     NodeExecutionTerminationReason,
     ProjectSpec,
     PublishedArtifact,
+    RequiredDecisionAudience,
     RunInputScopeState,
     RunInstanceState,
     RunInstanceStatus,
@@ -451,18 +452,34 @@ class RunService:
                         resume_recommended=False,
                     )
                 else:
-                    instance.status = RunInstanceStatus.DONE
-                    instance.waiting_reason = None
-                    instance.error = None
-                    instance.failure_kind = None
-                    instance.failure_summary = None
-                    instance.resume_recommended = False
-                    self.store.append_event(
-                        run.id,
-                        "instance_done",
-                        instance_id=instance_id,
-                        payload={"task_id": instance.task_id},
+                    obligation_error = self._check_decision_obligations(
+                        run.id, instance_id, task,
                     )
+                    if obligation_error is not None:
+                        self.store.delete_instance_result(run.id, instance_id)
+                        self._mark_instance_failed(
+                            run,
+                            instance_id,
+                            error=obligation_error,
+                            termination_reason=NodeExecutionTerminationReason.COMPLETED,
+                            finished_at=instance.finished_at or datetime.now(UTC).isoformat(),
+                            failure_kind=NodeExecutionFailureKind.DECISION_OBLIGATION,
+                            failure_summary=obligation_error,
+                            resume_recommended=False,
+                        )
+                    else:
+                        instance.status = RunInstanceStatus.DONE
+                        instance.waiting_reason = None
+                        instance.error = None
+                        instance.failure_kind = None
+                        instance.failure_summary = None
+                        instance.resume_recommended = False
+                        self.store.append_event(
+                            run.id,
+                            "instance_done",
+                            instance_id=instance_id,
+                            payload={"task_id": instance.task_id},
+                        )
             else:
                 self.store.delete_instance_result(run.id, instance_id)
                 self._mark_instance_failed(
@@ -1142,6 +1159,45 @@ class RunService:
             },
         )
 
+    def _check_decision_obligations(
+        self,
+        run_id: str,
+        instance_id: str,
+        task: TaskSpec,
+    ) -> str | None:
+        if not task.required_decisions:
+            return None
+        interrupt_records = self.store.list_instance_interrupts(run_id, instance_id)
+        created_decisions: set[tuple[str, str]] = set()
+        for record in interrupt_records:
+            dk = record.interrupt.decision_kind
+            audience = record.interrupt.audience.value
+            if dk is not None and record.interrupt.blocking:
+                created_decisions.add((dk.value, audience))
+        missing: list[str] = []
+        for obligation in task.required_decisions:
+            matched = False
+            for dk_val, aud_val in created_decisions:
+                if dk_val != obligation.decision_kind.value:
+                    continue
+                if obligation.audience is RequiredDecisionAudience.ANY:
+                    matched = True
+                    break
+                if aud_val == obligation.audience.value:
+                    matched = True
+                    break
+            if not matched:
+                desc = obligation.description or obligation.decision_kind.value
+                missing.append(
+                    f"{obligation.decision_kind.value} ({obligation.audience.value}): {desc}"
+                )
+        if not missing:
+            return None
+        return (
+            f"task {task.id} requires blocking decisions that were never created: "
+            + "; ".join(missing)
+        )
+
     def _reconcile_finished_runtime(
         self,
         run: RunRecord,
@@ -1189,12 +1245,28 @@ class RunService:
                     resume_recommended=False,
                 )
             else:
-                instance.status = RunInstanceStatus.DONE
-                instance.waiting_reason = None
-                instance.error = None
-                instance.failure_kind = None
-                instance.failure_summary = None
-                instance.resume_recommended = False
+                obligation_error = self._check_decision_obligations(
+                    run.id, instance_id, task,
+                )
+                if obligation_error is not None:
+                    self.store.delete_instance_result(run.id, instance_id)
+                    self._mark_instance_failed(
+                        run,
+                        instance_id,
+                        error=obligation_error,
+                        termination_reason=NodeExecutionTerminationReason.COMPLETED,
+                        finished_at=runtime.finished_at or datetime.now(UTC).isoformat(),
+                        failure_kind=NodeExecutionFailureKind.DECISION_OBLIGATION,
+                        failure_summary=obligation_error,
+                        resume_recommended=False,
+                    )
+                else:
+                    instance.status = RunInstanceStatus.DONE
+                    instance.waiting_reason = None
+                    instance.error = None
+                    instance.failure_kind = None
+                    instance.failure_summary = None
+                    instance.resume_recommended = False
             return
         self.store.delete_instance_result(run.id, instance_id)
         self._mark_instance_failed(
