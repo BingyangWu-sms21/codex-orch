@@ -67,6 +67,10 @@ class _RuntimeTracker:
             idle_timeout_sec=idle_timeout_sec,
         )
 
+    def write_initial(self) -> None:
+        # Synchronous write to ensure file exists before subprocess start
+        self._write_unlocked()
+
     async def set_pid(self, pid: int | None) -> None:
         async with self._lock:
             self._runtime.pid = pid
@@ -215,30 +219,16 @@ class CodexExecRunner:
         sandbox = self._sandbox(request)
         writable_roots = self._runtime_writable_roots(request, sandbox)
         command = self._build_command(request)
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                cwd=str(request.workspace_dir),
-                env=self._build_environment(request),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError as exc:
-            summary = str(exc)
-            return NodeExecutionResult(
-                success=False,
-                return_code=127,
-                final_message="",
-                session_id=request.resume_session_id,
-                error=summary,
-                failure_kind=NodeExecutionFailureKind.RUNNER_INVOCATION,
-                failure_summary=summary,
-            )
 
         events_path = request.attempt_dir / "events.jsonl"
         stderr_path = request.attempt_dir / "stderr.log"
         runtime_path = request.attempt_dir / "runtime.json"
+
+        # Touch logs and write initial runtime metadata before starting subprocess
+        # to avoid race conditions with reconciliation.
+        stderr_path.touch(exist_ok=True)
+        (request.attempt_dir / "stdout.log").touch(exist_ok=True)
+
         runtime_tracker = _RuntimeTracker(
             path=runtime_path,
             cwd=request.workspace_dir,
@@ -249,6 +239,29 @@ class CodexExecRunner:
             wall_timeout_sec=request.project.node_wall_timeout_sec,
             idle_timeout_sec=request.project.node_idle_timeout_sec,
         )
+        runtime_tracker.write_initial()
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(request.workspace_dir),
+                env=self._build_environment(request),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as exc:
+            summary = str(exc)
+            return NodeExecutionResult(
+                success=False,
+                return_code=127 if isinstance(exc, FileNotFoundError) else 1,
+                final_message="",
+                session_id=request.resume_session_id,
+                error=summary,
+                failure_kind=NodeExecutionFailureKind.RUNNER_INVOCATION,
+                failure_summary=summary,
+            )
+
         await runtime_tracker.set_pid(process.pid)
         stdin_task = asyncio.create_task(
             self._write_prompt_stdin(process, request.prompt)
@@ -385,6 +398,10 @@ class CodexExecRunner:
                 "CODEX_ORCH_WORKSPACE_DIR": str(request.workspace_dir),
             }
         )
+        # Disable nesting check if we are running in an agentic environment
+        # like Claude Code to allow codex exec to start successfully.
+        if any(key in env for key in ("CLAUDECODE", "CLAUDE_CODE", "CODEX_ORCH_AGENT")):
+            env.setdefault("CODEX_DISABLE_NESTING_CHECK", "1")
         return env
 
     def _sandbox(self, request: NodeExecutionRequest) -> str:

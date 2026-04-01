@@ -148,6 +148,14 @@ class RunService:
                     instance.attempt,
                 )
                 if runtime is None:
+                    # Allow a grace period for new instances to write their initial runtime.json
+                    # if they were started very recently.
+                    if instance.started_at is not None:
+                        started_at = datetime.fromisoformat(instance.started_at)
+                        age_sec = (datetime.now(UTC) - started_at).total_seconds()
+                        if age_sec < 10:
+                            continue
+
                     self._mark_instance_failed(
                         run,
                         instance.instance_id,
