@@ -597,16 +597,12 @@ def test_loop_continue_recomputes_dynamic_paths_for_new_input_scope(tmp_path: Pa
     assert runner.plan_requests[0].workspace_dir == (
         workspace_root_a / "repos" / "a"
     ).resolve()
-    assert runner.plan_requests[0].extra_writable_roots == (
-        (workspace_root_a / "repos" / "a" / "logs" / "a").resolve(),
-    )
+    assert (workspace_root_a / "repos" / "a" / "logs" / "a").resolve() in runner.plan_requests[0].extra_writable_roots
     assert runner.plan_requests[1].project_workspace_dir == workspace_root_b.resolve()
     assert runner.plan_requests[1].workspace_dir == (
         workspace_root_b / "repos" / "b"
     ).resolve()
-    assert runner.plan_requests[1].extra_writable_roots == (
-        (workspace_root_b / "repos" / "b" / "logs" / "b").resolve(),
-    )
+    assert (workspace_root_b / "repos" / "b" / "logs" / "b").resolve() in runner.plan_requests[1].extra_writable_roots
 
 
 def test_input_ref_stages_structured_default_input_as_json(tmp_path: Path) -> None:

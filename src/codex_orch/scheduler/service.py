@@ -364,6 +364,13 @@ class RunService:
                     workspace_dir,
                 )
             )
+            inbox_dir = self.store.get_inbox_dir(run.id)
+            events_dir = self.store.get_events_dir(run.id)
+            extra_writable_roots = (
+                *extra_writable_roots,
+                inbox_dir,
+                events_dir,
+            )
             rendered_prompt = self.composer.render(
                 run=run,
                 instance=instance,
