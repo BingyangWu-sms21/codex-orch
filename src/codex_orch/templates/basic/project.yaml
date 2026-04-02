@@ -1,0 +1,6 @@
+name: my-program
+description: A basic codex-orch program
+default_agent: default
+default_sandbox: workspace-write
+max_concurrency: 2
+user_inputs: {}
