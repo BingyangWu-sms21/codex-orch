@@ -34,6 +34,10 @@ class PromptComposer:
     ) -> str:
         task = run.tasks[instance.task_id]
         sections: list[str] = []
+
+        if task.required_decisions:
+            sections.append(self._render_decision_obligations(task))
+
         for step in task.compose:
             if step.kind is ComposeStepKind.FILE and step.path is not None:
                 sections.append(
@@ -308,3 +312,37 @@ class PromptComposer:
             }
             for record in records
         ]
+
+    def _render_decision_obligations(self, task) -> str:
+        lines = [
+            "# REQUIRED: Decision Obligations",
+            "",
+            "This task declares `required_decisions`. You MUST create the following",
+            "blocking interrupts before completing this task. If you do not, the engine",
+            "will reject your work and mark the task as failed.",
+            "",
+        ]
+        for decision in task.required_decisions:
+            desc = decision.description or decision.decision_kind.value
+            lines.append(
+                f"- **{decision.decision_kind.value}** (audience: {decision.audience.value}): {desc}"
+            )
+        lines.append("")
+
+        guidance_path = (
+            self.store.paths.root / "runtime_guidance" / "decision_obligations.md"
+        )
+        if guidance_path.exists():
+            guidance = guidance_path.read_text(encoding="utf-8").strip()
+            lines.append("## How to Create Blocking Interrupts")
+            lines.append("")
+            lines.append(guidance)
+        else:
+            lines.extend([
+                "Use `codex-orch interrupt create` with `--blocking`, matching",
+                "`--decision-kind` and `--audience` for each obligation listed above.",
+                "See the interrupt helper doc in the attempt context directory for",
+                "full command syntax.",
+            ])
+
+        return "\n".join(lines)

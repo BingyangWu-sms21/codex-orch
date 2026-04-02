@@ -1,0 +1,11 @@
+id: scan_and_prioritize
+title: Scan and build prioritized backlog
+kind: work
+agent: default
+status: ready
+compose:
+  - kind: file
+    path: prompts/scan_and_prioritize.md
+publish:
+  - final.md
+  - result.json

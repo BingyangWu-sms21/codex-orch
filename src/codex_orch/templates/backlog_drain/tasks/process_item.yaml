@@ -1,0 +1,27 @@
+id: process_item
+title: Process one backlog item
+kind: work
+agent: default
+status: ready
+depends_on:
+  - task: scan_and_prioritize
+    as: scan
+    kind: context
+    consume:
+      - result.json
+compose:
+  - kind: file
+    path: prompts/process_item.md
+  - kind: ref
+    ref: deps.scan.result
+  - kind: ref
+    ref: inputs.current_candidate
+publish:
+  - final.md
+  - result.json
+interaction_policy:
+  allow_human: true
+required_decisions:
+  - decision_kind: review
+    audience: human
+    description: "Each item must be reviewed by a human before the loop continues"

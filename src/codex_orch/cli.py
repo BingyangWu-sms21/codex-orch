@@ -15,6 +15,7 @@ from codex_orch.assistant import (
     CodexCliAssistantBackend,
 )
 from codex_orch.assistant_docs import install_assistant_operating_model
+from codex_orch.templates_init import copy_template, list_templates
 from codex_orch.api.app import DEFAULT_WEB_PORT, serve
 from codex_orch.domain import (
     AssistantUpdateKind,
@@ -284,7 +285,26 @@ def project_init(
     default_agent: str = "default",
     default_sandbox: str = "workspace-write",
     max_concurrency: int = 2,
+    template: str = typer.Option("", help="Initialize from a template (basic, backlog_drain). Empty means no template."),
 ) -> None:
+    if template:
+        available = list_templates()
+        if template not in available:
+            typer.echo(
+                f"Error: template {template!r} not found. Available: {', '.join(available)}",
+                err=True,
+            )
+            raise typer.Exit(1)
+        copy_template(
+            template,
+            program_dir,
+            name=name,
+            workspace=str(workspace.resolve()),
+        )
+        if not (program_dir / "assistant_roles" / "_shared" / "operating-model.md").exists():
+            install_assistant_operating_model(program_dir, overwrite=False)
+        typer.echo(f"Initialized {template} program at {program_dir.resolve()}")
+        return
     store = _store(program_dir)
     project = ProjectSpec(
         name=name,

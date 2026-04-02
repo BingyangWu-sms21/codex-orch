@@ -1,0 +1,10 @@
+id: example_task
+title: Example task
+agent: default
+kind: work
+status: ready
+compose:
+  - kind: file
+    path: prompts/example_task.md
+publish:
+  - final.md

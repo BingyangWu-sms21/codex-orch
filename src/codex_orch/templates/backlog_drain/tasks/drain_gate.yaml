@@ -1,0 +1,38 @@
+id: drain_gate
+title: Pick next backlog item or stop
+kind: controller
+agent: default
+status: ready
+depends_on:
+  - task: scan_and_prioritize
+    as: scan
+    kind: context
+    consume:
+      - result.json
+  - task: process_item
+    as: last_processed
+    kind: context
+    consume:
+      - result.json
+compose:
+  - kind: file
+    path: prompts/drain_gate.md
+  - kind: ref
+    ref: deps.scan.result
+  - kind: ref
+    ref: deps.last_processed.result
+  - kind: ref
+    ref: inputs.remaining_candidates
+  - kind: ref
+    ref: inputs.accumulated_repairs
+  - kind: ref
+    ref: inputs.repair_budget
+publish:
+  - final.md
+  - result.json
+control:
+  mode: loop
+  continue_targets:
+    - process_item
+  stop_targets:
+    - drain_summary

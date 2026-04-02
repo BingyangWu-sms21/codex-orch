@@ -1,0 +1,11 @@
+name: "{{name}}"
+workspace: "{{workspace}}"
+description: "Backlog drain program: scan, prioritize, then iteratively process repair candidates with human review gates."
+default_agent: default
+default_sandbox: workspace-write
+max_concurrency: 2
+user_inputs:
+  repair_budget: inputs/repair_budget.txt
+  current_candidate: inputs/current_candidate.json
+  remaining_candidates: inputs/remaining_candidates.json
+  accumulated_repairs: inputs/accumulated_repairs.json
