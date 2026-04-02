@@ -75,13 +75,17 @@ class PromptComposer:
         parsed = parse_compose_ref(ref)
         if parsed.kind is ComposeRefKind.INPUT:
             assert parsed.input_key is not None
+            if not self._has_input_value(
+                run=run,
+                input_scope_id=instance.input_scope_id,
+                input_key=parsed.input_key,
+            ):
+                raise ValueError(f"missing run input {parsed.input_key}")
             resolved_input = self._resolve_input_value(
                 run=run,
                 input_scope_id=instance.input_scope_id,
                 input_key=parsed.input_key,
             )
-            if resolved_input is None:
-                raise ValueError(f"missing run input {parsed.input_key}")
             safe_key = self._safe_ref_segment(parsed.input_key)
             return self._stage_json_value(
                 node_dir=node_dir,
@@ -222,6 +226,18 @@ class PromptComposer:
     def _safe_ref_segment(self, raw: str) -> str:
         return raw.replace("/", "__")
 
+    def _has_input_value(
+        self,
+        *,
+        run: RunRecord,
+        input_scope_id: str,
+        input_key: str,
+    ) -> bool:
+        input_scope = run.input_scopes[input_scope_id]
+        if input_key in input_scope.values:
+            return True
+        return input_key in run.user_inputs
+
     def _resolve_input_value(
         self,
         *,
@@ -232,7 +248,9 @@ class PromptComposer:
         input_scope = run.input_scopes[input_scope_id]
         if input_key in input_scope.values:
             return input_scope.values[input_key]
-        return run.user_inputs.get(input_key)
+        if input_key in run.user_inputs:
+            return run.user_inputs[input_key]
+        return None
 
     def _stage_json_value(
         self,
