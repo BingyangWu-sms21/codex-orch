@@ -57,6 +57,9 @@ def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
             "citations": {"type": "array", "items": {"type": "string"}},
             "payload": {
                 "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+                "required": [],
             },
             "proposed_updates": {
                 "type": "array",
@@ -84,20 +87,24 @@ def _assistant_output_schema(*, allow_human_handoff: bool) -> dict[str, object]:
                             "type": "object",
                             "additionalProperties": False,
                             "properties": {
-                                "role_id": {"type": "string", "minLength": 1},
-                                "managed_asset_path": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                },
-                                "task_id": {"type": "string", "minLength": 1},
+                                "role_id": {"type": ["string", "null"]},
+                                "managed_asset_path": {"type": ["string", "null"]},
+                                "task_id": {"type": ["string", "null"]},
                                 "routing_section": {
-                                    "type": "string",
+                                    "type": ["string", "null"],
                                     "enum": [
                                         "assistant_hints",
                                         "interaction_policy",
+                                        None,
                                     ],
                                 },
                             },
+                            "required": [
+                                "role_id",
+                                "managed_asset_path",
+                                "task_id",
+                                "routing_section",
+                            ],
                         },
                     },
                     "required": [
